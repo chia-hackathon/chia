@@ -96,7 +96,7 @@ We will not pursue legal action against researchers who follow these guidelines.
 We recommend the following security best practices when using Chia:
 
 - Always use the latest stable version
-- Subscribe to security announcements [link to mailing list or notification channel]
+- Subscribe to security announcements [on our mailing list](https://groups.google.com/g/chialoops)
 - Review the [security advisories](https://github.com/ucb-bar/chia/security/advisories) regularly
 - Follow the principle of least privilege when configuring access
 - Keep dependencies up to date
