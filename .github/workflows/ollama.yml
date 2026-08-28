@@ -108,8 +108,12 @@ jobs:
           context: .
           push: true
           build-args: |
+            CHIA_REVISION=${{ github.sha }}
             OLLAMA_BASE=${{ matrix.ollama_base }}
           tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/ucb-bar/chia
           # Separate buildcache per variant so the NVIDIA and ROCm bases don't
           # clobber each other's layers.
           cache-from: type=registry,ref=${{ steps.tags.outputs.cache }}

@@ -67,6 +67,7 @@ jobs:
             BASE_IMAGE=ghcr.io/ucb-bar/chia:${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
             CHISEL_BUILD_IMAGE=ghcr.io/ucb-bar/chia-chisel-build:${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
           tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 

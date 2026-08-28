@@ -70,6 +70,9 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            CHIA_REVISION=${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
           no-cache: true
 
       - name: Show runner resources
