@@ -310,7 +310,7 @@ class AntigravityLLM(LLMCallBase):
 
         agy reads MCP servers only from this fixed path (no per-run override), so
         we merge into whatever is there: every Chia tool is registered under its
-        own name with a streamable-HTTP ``httpUrl``, while server keys we don't
+        own name with a streamable-HTTP ``serverUrl``, while server keys we don't
         manage are preserved. With no tools, leave the file untouched.
         """
         if not tools:
@@ -335,7 +335,8 @@ class AntigravityLLM(LLMCallBase):
         for tool in tools:
             port = getattr(tool, "port", 8000)
             servers[tool.name] = {
-                "httpUrl": f"http://{tool.hostname}:{port}/{tool.name}/mcp",
+                "serverUrl": f"http://{tool.hostname}:{port}/{tool.name}/mcp",
+                "disabled": False,
             }
         config["mcpServers"] = servers
 
