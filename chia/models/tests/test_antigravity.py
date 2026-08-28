@@ -97,14 +97,15 @@ def test_write_mcp_config(tmp_path, tool_name, expected_url):
     llm._write_mcp_config([tool])
     with open(llm._mcp_config_path) as f:
         config = json.load(f)
-    assert config["mcpServers"][tool_name]["httpUrl"] == expected_url
+    assert config["mcpServers"][tool_name]["serverUrl"] == expected_url
+    assert config["mcpServers"][tool_name]["disabled"] is False
 
 
 def test_write_mcp_config_merges_and_preserves_unmanaged(tmp_path):
     llm = AntigravityLLM(gemini_dir=str(tmp_path))
     os.makedirs(os.path.dirname(llm._mcp_config_path), exist_ok=True)
     with open(llm._mcp_config_path, "w") as f:
-        json.dump({"mcpServers": {"keepme": {"httpUrl": "http://x/keepme/mcp"}}}, f)
+        json.dump({"mcpServers": {"keepme": {"serverUrl": "http://x/keepme/mcp"}}}, f)
     tool = SimpleNamespace(name="calc", hostname="localhost", port=9001)
     llm._write_mcp_config([tool])
     with open(llm._mcp_config_path) as f:
