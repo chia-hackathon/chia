@@ -1,7 +1,7 @@
 Authenticating Gemini backends: Antigravity and OpenCode + Vertex AI
 ====================================================================
 
-Two CHIA backends reach Gemini through Google credentials that live on the
+We recommend reaching Gemini through Google credentials that live on the
 *host* and are bind-mounted into the LLM worker containers:
 
 * :class:`chia.models.antigravity.AntigravityLLM` — Google's **Antigravity CLI**
@@ -11,7 +11,7 @@ Two CHIA backends reach Gemini through Google credentials that live on the
   Default Credentials (ADC) under ``~/.config/gcloud`` by default.
 
 Both can be set up once on the host and then mounted into the credential
-directory in the corresponding docker container from the config yaml.
+directory in the corresponding docker container in your cluster config yaml.
 ``examples/memcpy/cluster.yaml`` and ``examples/circt_issue_solver/cluster_*.yaml``
  show this.
 
@@ -32,9 +32,8 @@ Install and sign in
 
 ``agy`` prints a Google OAuth URL — open it in a browser and sign in with the
 Google account whose Antigravity / Gemini Code Assist entitlement you want to
-use (on a headless host, copy the URL to your laptop's browser). In the license
-selector, enter the **GCP project** the usage is billed to and pick a
-**location**: ``global``, ``us`` or ``eu``. The result is stored in:
+use (on a headless host, copy the URL to your laptop's browser). You'll need to 
+pick a **location**: ``global``, ``us`` or ``eu``. The creds get stored in:
 
 * ``~/.gemini/antigravity-cli/antigravity-oauth-token`` — the refresh token
   (there is no API-key path);
@@ -48,8 +47,9 @@ endpoint; with ``us`` some ``gemini-*-pro*`` requests fails with
 later by editing ``settings.json`` or by signing in again.
 
 To switch accounts or projects, run ``agy`` interactively and use its ``/logout``
-then ``/login`` slash commands (the license selector appears again). Then
-confirm what you have:
+then ``/login`` slash commands (the license selector appears again). 
+
+You confirm what you have:
 
 .. code-block:: bash
 
@@ -85,8 +85,7 @@ list and a symlink to the shared ``antigravity-cli``.)
 
 Notes:
 
-* Use ``${HOME}`` (or an absolute path), not ``~`` — a quoted ``-v ~/...`` is not
-  tilde-expanded.
+* Recommended to use ``${HOME}`` (or an absolute path), not ``~``
 * Mount the whole ``~/.gemini`` tree, not just the token: project/location come
   from ``settings.json`` next to it. Editing ``settings.json`` on the host takes
   effect on the next call inside the container (no restart).
@@ -113,7 +112,7 @@ OpenCode with Gemini on Vertex AI
 OpenCode is provider-agnostic — the model is ``<provider>/<model>`` and each
 provider brings its own credentials. For Gemini on Vertex AI the provider is
 ``google-vertex``, which needs two things: **Google Application Default
-Credentials (ADC)** and a **GCP project** (plus a location, ``global`` for Pro).
+Credentials (ADC)** and a **GCP project**.
 Setup is three steps: sign in on the host, mount + configure the container, and
 tell the driver which model/project to use.
 
@@ -193,7 +192,7 @@ Config values take precedence over the container's ``GOOGLE_CLOUD_PROJECT`` /
 ``opencode run`` check above). Credentials are never in the config — they always
 come from the mounted ADC.
 
-The memcpy example does this for you (``examples/memcpy/llm.py``) whenever
+The memcpy example does this (``examples/memcpy/llm.py``) whenever
 ``MEMCPY_OPENCODE_MODEL`` starts with ``google-vertex/``, reading the project from
 ``GOOGLE_CLOUD_PROJECT`` on the **driver**. A ``chia job submit`` driver does not
 inherit your shell, so forward both values through the job's runtime env:
