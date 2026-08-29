@@ -126,6 +126,18 @@ def test_parse_rate_limit_reset():
     assert reset.tzinfo == timezone.utc
 
 
+def test_gemini_dir_resolves_home_lazily(monkeypatch, tmp_path):
+    # Built under one HOME (e.g. a circt worker, HOME=/root), run under another
+    # (the antigravity_creds node): the default must follow the RUNTIME home.
+    monkeypatch.setenv("HOME", "/nonexistent/build-home")
+    llm = AntigravityLLM()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert llm.gemini_dir == str(tmp_path / ".gemini")
+    assert llm._mcp_config_path == str(tmp_path / ".gemini" / "config" / "mcp_config.json")
+    # An explicit gemini_dir is still honored verbatim.
+    assert AntigravityLLM(gemini_dir="/x").gemini_dir == "/x"
+
+
 def test_prompt_routes_to_run_antigravity(monkeypatch):
     llm = AntigravityLLM()
     sentinel = QueryResult("X", 0, "", "")

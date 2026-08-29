@@ -133,7 +133,8 @@ _ERROR_PATTERNS: tuple[tuple[type[AntigravityError], tuple[str, ...]], ...] = (
     (
         InvalidRequestError,
         ("invalid request", "malformed", "bad request", "invalid model", "unknown model",
-         "model not found", "unrecognized", "invalid argument", "400", "404"),
+         "model not found", "unrecognized", "invalid argument", "400", "404",
+         "not supported in the selected location"),
     ),
     (
         ServerError,
@@ -216,8 +217,7 @@ class AntigravityLLM(LLMCallBase):
         self.work_dir = work_dir
         self.add_dirs = add_dirs or []
         # Where agy reads its config; MCP servers live in
-        # <gemini_dir>/config/mcp_config.json. Defaults to the standard location.
-        self.gemini_dir = gemini_dir or os.path.join(os.path.expanduser("~"), ".gemini")
+        self._gemini_dir = gemini_dir
         # self.dangerously_skip_permissions is set by LLMCallBase.__init__.
         self.sandbox = sandbox
         self.extra_cli_args = extra_cli_args or []
@@ -300,6 +300,14 @@ class AntigravityLLM(LLMCallBase):
         if not self.system_message:
             return user_message
         return f"[System Instructions]\n{self.system_message}\n\n[User Request]\n{user_message}"
+
+    @property
+    def gemini_dir(self) -> str:
+        return self._gemini_dir or os.path.join(os.path.expanduser("~"), ".gemini")
+
+    @gemini_dir.setter
+    def gemini_dir(self, value: str | None) -> None:
+        self._gemini_dir = value
 
     @property
     def _mcp_config_path(self) -> str:

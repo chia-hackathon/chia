@@ -69,21 +69,54 @@ def run_issue_remote(issue_md: str, number: int, cfg: dict,
     logs: dict = {}
 
     def _turn(phase: str, prompt: str, tools: list):
-        # chia.models.claude: `prompt` is a ChiaFunction we dispatch
-        # onto an `llm` worker (1.0/call, so the cluster's `llm` slots cap
-        # concurrency) — claude runs there while the bash/build/lit MCP servers
+        # chia.models.claude / .antigravity / .opencode: `prompt` is a ChiaFunction we
+        # dispatch onto an `llm` worker (1.0/call, so the cluster's `llm` slots
+        # cap concurrency) — the CLI runs there while the bash/build/lit MCP servers
         # stay on this chia-circt worker, reached over HTTP. log_dir is None: the
         # CLI's on-worker log would land on the ephemeral llm container, so we
         # persist cli.stream_result centrally instead. resume_session +
         # projects_cwd=None give each phase a fresh session whose .jsonl
         # transcript we read back for logging (no actual --resume — a new LLM is
         # built per phase).
-        llm = ClaudeCodeLLM(
-            model=cfg["model"], system_message=cfg["system_prompt"],
-            timeout_seconds=cfg["timeouts"][phase],
-            extra_cli_args=["--effort", "max"],
-            resume_session=True, projects_cwd=None,
-        )
+        backend = cfg.get("backend", "claude")
+        if backend == "antigravity":
+            # chia.models.antigravity: `agy --print`. Plain-text output, no
+            # session transcript; the system prompt is folded into the user
+            # message. Effort rides on the model id (e.g. gemini-3.1-pro-high).
+            from chia.models.antigravity import AntigravityLLM
+            llm = AntigravityLLM(
+                model=cfg["model"], system_message=cfg["system_prompt"],
+                timeout_seconds=cfg["timeouts"][phase],
+            )
+        elif backend == "opencode":
+            # chia.models.opencode: `opencode run` with its built-in google-vertex
+            # provider (model = "google-vertex/<gemini id>"). We (re)declare the
+            # provider block to pin project/location and to register the model
+            # id even if opencode's catalog lags Vertex. opencode's own
+            # write/edit/bash tools would act on the llm container's FS, not this
+            # circt worker, so deny everything except our MCP tools (cf.
+            # examples/memcpy).
+            from chia.models.opencode import OpenCodeLLM, AdditionalModelProvider
+            vertex = cfg["vertex"]
+            provider_id, _, model_id = cfg["model"].partition("/")
+            gemini = AdditionalModelProvider(
+                id=provider_id or "google-vertex", npm="@ai-sdk/google-vertex",
+                name="Google Vertex AI", models=[model_id],
+                options={"project": vertex["project"], "location": vertex["location"]},
+            )
+            perms = {"*": "deny", **{f"{t.name}_*": "allow" for t in tools}}
+            llm = OpenCodeLLM(
+                model=cfg["model"], system_message=cfg["system_prompt"],
+                timeout_seconds=cfg["timeouts"][phase],
+                additional_providers=[gemini], config=perms,
+            )
+        else:
+            llm = ClaudeCodeLLM(
+                model=cfg["model"], system_message=cfg["system_prompt"],
+                timeout_seconds=cfg["timeouts"][phase],
+                extra_cli_args=["--effort", "max"],
+                resume_session=True, projects_cwd=None,
+            )
         cli = get(llm.prompt.options(resources={"llm": 1.0}).chia_remote(llm, prompt, tools))
         transcript = getattr(cli, "session_transcript", None) or b""
         logs[phase] = {
