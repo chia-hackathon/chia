@@ -193,6 +193,36 @@ def test_stream_json_parsed_into_result_and_transcript(monkeypatch, tmp_path):
     assert cli.session_transcript is None
 
 
+def test_successful_run_is_not_classified_by_its_own_content(monkeypatch, tmp_path):
+    # Regression: a debug turn whose tool output / answer mention "429",
+    # "rate limit", "timeout", "login" etc. must NOT be classified as an error.
+    conv = "aaaaaaaa-0000-0000-0000-000000000000"
+    noisy = "\n".join([
+        json.dumps({"event": "init", "conversation_id": conv, "init": {"model": "m", "cwd": "/"}}),
+        json.dumps({"event": "step_update", "step_update": {"conversation_id": conv, "step_index": 1,
+                    "state": "DONE", "step_type": "tool", "tool_name": "chipyard_bash_run",
+                    "tool_info": {"name": "chipyard_bash_run", "parameters": {"cmd": "make"},
+                                  "output": "sim: 429 cycles; rate limit reached on mem port; "
+                                            "timeout after 1000; please sign in to view"}}}),
+        json.dumps({"event": "step_update", "step_update": {"conversation_id": conv, "step_index": 2,
+                    "state": "DONE", "step_type": "agent_response",
+                    "text_delta": "Fixed the RESOURCE_EXHAUSTED handling; too many requests were queued."}}),
+        json.dumps({"event": "result", "result": {"conversation_id": conv, "status": "SUCCESS",
+                    "response": "Fixed the RESOURCE_EXHAUSTED handling; too many requests were queued.",
+                    "num_turns": 1, "usage": {"total_tokens": 1}}}),
+    ])
+    _fake_subprocess(monkeypatch, {}, stdout=noisy, returncode=0)
+    llm = AntigravityLLM(gemini_dir=str(tmp_path))
+    cli = llm._run_antigravity("debug it", tools=[])
+    assert "429" in cli.stream_result and "rate limit" in cli.stream_result   # transcript intact
+    assert cli.diagnostics == ""                                              # nothing diagnostic
+    llm._classify_error(cli)                                                  # must not raise
+    # ...while the same words on stderr still classify.
+    cli.diagnostics = "Error: 429 Too Many Requests"
+    with pytest.raises(RateLimitError):
+        llm._classify_error(cli)
+
+
 def test_stream_json_error_result_is_classified(monkeypatch, tmp_path):
     # agy exits 0 but reports status=ERROR in the result event.
     bad = json.dumps({"event": "result", "result": {
@@ -202,6 +232,7 @@ def test_stream_json_error_result_is_classified(monkeypatch, tmp_path):
     llm = AntigravityLLM(gemini_dir=str(tmp_path))
     cli = llm._run_antigravity("hi", tools=[])
     assert cli.returncode == 1 and "invalid model selection" in cli.stderr
+    assert "invalid model selection" in cli.diagnostics
     with pytest.raises(InvalidRequestError):
         llm._classify_error(cli)
 

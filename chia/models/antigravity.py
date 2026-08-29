@@ -210,6 +210,11 @@ class AntigravityQueryResult(QueryResult):
     conversation_id: str | None = None
     usage: dict | None = None
     events: list = field(default_factory=list)
+    # Text that may legitimately describe a CLI/provider failure: stderr, agy's
+    # ``error`` field, and any non-JSON stdout. Deliberately EXCLUDES the model's
+    # answer and the tool outputs in ``stream_result`` — a simulator log or an
+    # explanation that mentions "429" or "rate limit" is not a rate limit.
+    diagnostics: str = ""
 
 
 class AntigravityLLM(LLMCallBase):
@@ -553,6 +558,8 @@ class AntigravityLLM(LLMCallBase):
             # the plain-text answer so nothing is lost.
             final_text = "\n".join(unparsed).strip() if unparsed else result.stdout.strip()
             conversation_id, usage = None, None
+        # Only genuine diagnostics feed the error classifier (see the field doc).
+        diagnostics = "\n".join(p for p in (stderr, "\n".join(unparsed)) if p and p.strip())
         if requested and conversation_id and conversation_id != requested:
             # The carried conversation wasn't found on this machine (agy warns
             # and starts afresh). Keep going on the new id rather than fail the
@@ -569,6 +576,7 @@ class AntigravityLLM(LLMCallBase):
         return AntigravityQueryResult(
             result=final_text, returncode=returncode, stderr=stderr, stream_result=stream,
             conversation_id=conversation_id, usage=usage, events=events,
+            diagnostics=diagnostics,
         )
 
     @staticmethod
@@ -670,7 +678,22 @@ class AntigravityLLM(LLMCallBase):
             f.write("-" * 80 + "\n\n")
 
     def _classify_error(self, cli: QueryResult) -> None:
-        combined = "\n".join(part for part in (cli.stderr, cli.result, cli.stream_result) if part)
+        """Raise a typed error if *cli* describes a failed run.
+
+        Classifies ONLY diagnostic text: for an :class:`AntigravityQueryResult`
+        that is ``diagnostics`` (stderr, agy's ``error``, non-JSON stdout). The
+        model's answer and the tool outputs rendered into ``stream_result`` are
+        never scanned — with stream-json they routinely contain words like
+        "429", "timeout" or "rate limit" from the task itself. A plain
+        :class:`QueryResult` (text-mode / legacy callers) falls back to scanning
+        everything, since there the final text IS the only place a printed
+        OAuth prompt or error could appear.
+        """
+        diagnostics = getattr(cli, "diagnostics", None)
+        if diagnostics is None:
+            combined = "\n".join(part for part in (cli.stderr, cli.result, cli.stream_result) if part)
+        else:
+            combined = diagnostics
         lower = combined.lower()
         node_id = self._get_node_id()
 

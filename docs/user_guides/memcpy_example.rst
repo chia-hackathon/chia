@@ -111,7 +111,8 @@ the ``agy`` CLI) — keep them up and pick per run with ``--llm`` (default
 ``claude``), or comment out the ones you don't use. Each backend reads its
 credentials from the mounts shown at the top of ``cluster.yaml`` (Antigravity
 mounts your ``~/.gemini`` sign-in; choose the ``global`` location at sign-in so
-Gemini Pro is available).
+Gemini Pro is available). See :doc:`google_auth` for the sign-in and mount
+details of the two Gemini backends.
 
 .. code-block:: bash
 
