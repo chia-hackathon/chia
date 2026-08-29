@@ -80,13 +80,17 @@ def run_issue_remote(issue_md: str, number: int, cfg: dict,
         # built per phase).
         backend = cfg.get("backend", "claude")
         if backend == "antigravity":
-            # chia.models.antigravity: `agy --print`. Plain-text output, no
-            # session transcript; the system prompt is folded into the user
-            # message. Effort rides on the model id (e.g. gemini-3.1-pro-high).
+            # chia.models.antigravity: `agy --print --output-format stream-json`
+            # (full tool/usage transcript on stream_result); the system prompt
+            # is folded into the user message and effort rides on the model id
+            # (e.g. gemini-3.1-pro-high). resume_session=True only so the
+            # conversation db comes back on cli.session_transcript for logging
+            # (SQLite bytes — persisted as llm_<phase>.db); a new LLM is built
+            # per phase, so nothing is actually resumed.
             from chia.models.antigravity import AntigravityLLM
             llm = AntigravityLLM(
                 model=cfg["model"], system_message=cfg["system_prompt"],
-                timeout_seconds=cfg["timeouts"][phase],
+                timeout_seconds=cfg["timeouts"][phase], resume_session=True,
             )
         elif backend == "opencode":
             # chia.models.opencode: `opencode run` with its built-in google-vertex
@@ -123,6 +127,9 @@ def run_issue_remote(issue_md: str, number: int, cfg: dict,
             "result": cli.result, "stream": cli.stream_result,
             "stderr": cli.stderr, "success": bool(getattr(cli, "success", False)),
             "transcript": transcript if isinstance(transcript, (bytes, bytearray)) else b"",
+            # claude: the CLI's .jsonl session file; antigravity: agy's SQLite
+            # conversation db. The head picks the artifact extension from this.
+            "transcript_ext": "db" if backend == "antigravity" else "jsonl",
         }
         return cli
 

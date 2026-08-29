@@ -46,7 +46,8 @@ If you have a non-default claude credential install location, change the first p
      failing tests to repair without un-fixing the bug.
    - **writeup** — the PR description it would submit.
 3. **Persist** (head): `issue_logs/issue_<N>/` (`fix.diff`, `pr_writeup.md`,
-   `verdict.json`, per-phase `llm_*.md` / `.jsonl`) + a row in `issues.db`.
+   `verdict.json`, per-phase `llm_*.md` + the raw session transcript — `.jsonl`
+   for Claude, agy's SQLite `.db` for Antigravity) + a row in `issues.db`.
 
 ### Review flow (`review_loop.py` → `review_task.py`)
 `./review_submit.sh --pr <PR#>:<ISSUE#>` reconstructs the PR (its current diff

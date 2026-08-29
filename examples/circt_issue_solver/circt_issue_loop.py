@@ -137,7 +137,9 @@ def _persist(issue, res: dict) -> None:
             art.joinpath(f"llm_{phase}.stderr").write_text(blob["stderr"])
         tr = blob.get("transcript")
         if isinstance(tr, (bytes, bytearray)) and tr:
-            art.joinpath(f"llm_{phase}.jsonl").write_bytes(tr)   # full raw session transcript
+            # full raw session transcript: claude .jsonl / antigravity SQLite .db
+            ext = blob.get("transcript_ext", "jsonl")
+            art.joinpath(f"llm_{phase}.{ext}").write_bytes(tr)
     rf = res.get("repro_files") or {}
     if rf:
         rdir = art / "repro"
