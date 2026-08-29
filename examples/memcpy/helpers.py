@@ -166,7 +166,7 @@ def collect_diff(
     """
     submodules = submodules or []
     for sm in submodules:
-        if not os.path.isdir(os.path.join(chipyard_path, sm, ".git")):
+        if not os.path.exists(os.path.join(chipyard_path, sm, ".git")):
             return (1, {})
 
     diffs: dict[str, str] = {}
