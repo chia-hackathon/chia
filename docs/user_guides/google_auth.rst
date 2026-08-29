@@ -66,8 +66,10 @@ Mounting into the container
 The ``ghcr.io/ucb-bar/chia-antigravity`` image has ``agy`` installed and reads
 its state from ``/home/ray/.gemini``. Bind-mount your signed-in directory there
 and run the container as your uid so the mounted files are readable **and
-writable** — agy writes its MCP server config, logs and the per-conversation
-SQLite databases into the same tree on every call:
+writable** — agy refreshes its token and writes logs and the per-conversation
+SQLite databases into ``antigravity-cli/`` on every call. (Chia never edits your
+``~/.gemini/config``: each run gets a private ``HOME`` with its own MCP server
+list and a symlink to the shared ``antigravity-cli``.)
 
 .. code-block:: yaml
 

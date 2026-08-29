@@ -29,6 +29,13 @@ the next run, exactly like Claude's ``.jsonl`` transcript. The
     a = get(llm.prompt.chia_remote(llm, "remember X", tools))
     b = get(llm.prompt.chia_remote(llm, "what was X?", tools))   # same conversation
 
+**Tools** are exposed to agy as MCP servers. agy only reads them from the fixed
+path ``~/.gemini/config/mcp_config.json`` and waits for every listed server
+before answering, so each run gets a private ``HOME`` holding exactly its own
+tool list (with ``~/.gemini/antigravity-cli`` symlinked to the real one); the
+user's own ``~/.gemini/config`` is never modified and concurrent prompts with
+different tool sets don't interfere.
+
 The system prompt is folded into the user message (print mode has no
 ``--system-prompt`` flag), mirroring :class:`~chia.models.codex.CodexLLM`.
 """
@@ -39,8 +46,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
@@ -457,47 +466,69 @@ class AntigravityLLM(LLMCallBase):
     def gemini_dir(self, value: str | None) -> None:
         self._gemini_dir = value
 
+    # ------------------------------------------------------------------
+    # Per-call HOME: agy reads its MCP servers only from the fixed path
+    # ~/.gemini/config/mcp_config.json (no per-run override), and it blocks the
+    # whole turn until every listed server connects — so a stale or foreign
+    # entry from another run can hang a prompt (an unreachable address from a
+    # different machine never fails fast). Sharing one file between concurrent
+    # prompts with different tool sets on the same machine is equally unsafe.
+    # We therefore run each agy with HOME pointed at a private temp dir whose
+    # ~/.gemini/config holds exactly this call's tools, while
+    # ~/.gemini/antigravity-cli is a symlink to the real one so the OAuth token,
+    # settings (project/location) and the conversation store stay shared.
+    # ------------------------------------------------------------------
+
     @property
     def _mcp_config_path(self) -> str:
+        """Where the user's own agy MCP config lives. Never written by Chia."""
         return os.path.join(self.gemini_dir, "config", "mcp_config.json")
 
-    def _write_mcp_config(self, tools: list[ChiaTool]) -> None:
-        """Write the Chia tools into ``<gemini_dir>/config/mcp_config.json``.
-
-        agy reads MCP servers only from this fixed path (no per-run override), so
-        we merge into whatever is there: every Chia tool is registered under its
-        own name with a streamable-HTTP ``serverUrl``, while server keys we don't
-        manage are preserved. With no tools, leave the file untouched.
-        """
-        if not tools:
-            return
-        path = self._mcp_config_path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-
-        config: dict = {}
-        try:
-            with open(path) as f:
-                text = f.read().strip()
-            if text:
-                loaded = json.loads(text)
-                if isinstance(loaded, dict):
-                    config = loaded
-        except (FileNotFoundError, json.JSONDecodeError):
-            config = {}
-
-        servers = config.get("mcpServers")
-        if not isinstance(servers, dict):
-            servers = {}
+    def _mcp_servers(self, tools: list[ChiaTool]) -> dict:
+        servers = {}
         for tool in tools:
             port = getattr(tool, "port", 8000)
             servers[tool.name] = {
                 "serverUrl": f"http://{tool.hostname}:{port}/{tool.name}/mcp",
                 "disabled": False,
             }
-        config["mcpServers"] = servers
+        return {"mcpServers": servers}
 
-        with open(path, "w") as f:
-            json.dump(config, f, indent=2)
+    def _prepare_run_home(self, tools: list[ChiaTool]) -> str:
+        """Build the private HOME for one agy run; returns its path (caller removes it).
+
+        Layout::
+
+            <tmp>/.gemini/antigravity-cli -> <gemini_dir>/antigravity-cli   (shared: token, settings, conversations)
+            <tmp>/.gemini/config/config.json                                (copied from the user's, if any)
+            <tmp>/.gemini/config/mcp_config.json                            (ONLY this call's tools)
+            <tmp>/.cache -> <real home>/.cache                              (agy's playwright driver cache)
+        """
+        run_home = tempfile.mkdtemp(prefix="agy_home_")
+        gem = os.path.join(run_home, ".gemini")
+        os.makedirs(os.path.join(gem, "config"))
+
+        real_cli = os.path.join(self.gemini_dir, "antigravity-cli")
+        os.makedirs(real_cli, exist_ok=True)
+        os.symlink(real_cli, os.path.join(gem, "antigravity-cli"))
+
+        user_cfg = os.path.join(self.gemini_dir, "config", "config.json")
+        if os.path.isfile(user_cfg):
+            shutil.copy(user_cfg, os.path.join(gem, "config", "config.json"))
+        migrated = os.path.join(self.gemini_dir, "config", ".migrated")
+        if os.path.isfile(migrated):
+            shutil.copy(migrated, os.path.join(gem, "config", ".migrated"))
+
+        with open(os.path.join(gem, "config", "mcp_config.json"), "w") as f:
+            json.dump(self._mcp_servers(tools), f, indent=2)
+
+        real_cache = os.path.join(os.path.expanduser("~"), ".cache")
+        try:
+            os.makedirs(real_cache, exist_ok=True)
+            os.symlink(real_cache, os.path.join(run_home, ".cache"))
+        except OSError:
+            pass  # agy will just use a per-run cache
+        return run_home
 
     def _build_cmd(self, user_message: str) -> list[str]:
         cmd = [self.agy_bin]
@@ -526,17 +557,22 @@ class AntigravityLLM(LLMCallBase):
         self, user_message: str, tools: list[ChiaTool] | None = None
     ) -> AntigravityQueryResult:
         tools = tools or []
-        self._write_mcp_config(tools)
         requested = self._conversation_id if self._session_id is not None else None
-        result = subprocess.run(
-            self._build_cmd(user_message),
-            capture_output=True,
-            text=True,
-            # Give agy's own --print-timeout a chance to fire first.
-            timeout=self.timeout_seconds + 30,
-            cwd=self.work_dir or None,
-            env=os.environ.copy(),
-        )
+        run_home = self._prepare_run_home(tools)
+        try:
+            env = os.environ.copy()
+            env["HOME"] = run_home
+            result = subprocess.run(
+                self._build_cmd(user_message),
+                capture_output=True,
+                text=True,
+                # Give agy's own --print-timeout a chance to fire first.
+                timeout=self.timeout_seconds + 30,
+                cwd=self.work_dir or None,
+                env=env,
+            )
+        finally:
+            shutil.rmtree(run_home, ignore_errors=True)
         events, unparsed = self._parse_events(result.stdout)
         final = next((e["result"] for e in reversed(events)
                       if e.get("event") == "result" and isinstance(e.get("result"), dict)), None)

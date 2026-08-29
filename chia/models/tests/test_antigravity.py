@@ -88,45 +88,59 @@ def test_build_cmd_safe_defaults_omit_optional_flags():
 
 
 @pytest.mark.parametrize(
-    ("tool_name", "expected_url"),
-    [
-        ("calc", "http://localhost:9001/calc/mcp"),
-        ("calc.one", "http://localhost:9001/calc.one/mcp"),
-    ],
+    "tool_name, expected_url",
+    [("calc", "http://localhost:9001/calc/mcp"), ("bash_42", "http://10.0.0.5:8000/bash_42/mcp")],
 )
-def test_write_mcp_config(tmp_path, tool_name, expected_url):
+def test_run_home_has_only_this_calls_tools(tmp_path, tool_name, expected_url):
     llm = AntigravityLLM(gemini_dir=str(tmp_path))
-    tool = SimpleNamespace(name=tool_name, hostname="localhost", port=9001)
-    llm._write_mcp_config([tool])
-    with open(llm._mcp_config_path) as f:
-        config = json.load(f)
-    assert config["mcpServers"][tool_name]["serverUrl"] == expected_url
-    assert config["mcpServers"][tool_name]["disabled"] is False
+    host, port = expected_url.split("//")[1].split("/")[0].split(":")
+    tool = SimpleNamespace(name=tool_name, hostname=host, port=int(port))
+    home = llm._prepare_run_home([tool])
+    try:
+        with open(os.path.join(home, ".gemini", "config", "mcp_config.json")) as f:
+            servers = json.load(f)["mcpServers"]
+        assert list(servers) == [tool_name]
+        assert servers[tool_name]["serverUrl"] == expected_url
+        # Shared state is reached through the symlink; the user's config is untouched.
+        link = os.path.join(home, ".gemini", "antigravity-cli")
+        assert os.path.islink(link) and os.path.realpath(link) == os.path.realpath(tmp_path / "antigravity-cli")
+        assert not os.path.exists(llm._mcp_config_path)
+    finally:
+        shutil.rmtree(home)
 
 
-def test_write_mcp_config_merges_and_preserves_unmanaged(tmp_path):
+def test_run_home_isolates_concurrent_tool_sets_and_copies_user_config(tmp_path):
     llm = AntigravityLLM(gemini_dir=str(tmp_path))
-    os.makedirs(os.path.dirname(llm._mcp_config_path), exist_ok=True)
-    with open(llm._mcp_config_path, "w") as f:
-        json.dump({"mcpServers": {"keepme": {"serverUrl": "http://x/keepme/mcp"}}}, f)
+    os.makedirs(tmp_path / "config")
+    (tmp_path / "config" / "config.json").write_text('{"userSettings": {"x": 1}}')
+    (tmp_path / "config" / "mcp_config.json").write_text('{"mcpServers": {"users_own": {}}}')
+    a = llm._prepare_run_home([SimpleNamespace(name="bash_1", hostname="h", port=8000)])
+    b = llm._prepare_run_home([SimpleNamespace(name="chipyard_bash", hostname="h2", port=8000)])
+    try:
+        for home, expected in ((a, ["bash_1"]), (b, ["chipyard_bash"])):
+            with open(os.path.join(home, ".gemini", "config", "mcp_config.json")) as f:
+                assert list(json.load(f)["mcpServers"]) == expected
+            with open(os.path.join(home, ".gemini", "config", "config.json")) as f:
+                assert json.load(f) == {"userSettings": {"x": 1}}
+        # No-tools run: empty server list, nothing inherited from the user's file.
+        c = llm._prepare_run_home([])
+        with open(os.path.join(c, ".gemini", "config", "mcp_config.json")) as f:
+            assert json.load(f) == {"mcpServers": {}}
+        shutil.rmtree(c)
+        assert json.loads((tmp_path / "config" / "mcp_config.json").read_text()) == {"mcpServers": {"users_own": {}}}
+    finally:
+        shutil.rmtree(a); shutil.rmtree(b)
+
+
+def test_run_antigravity_uses_private_home_and_cleans_up(monkeypatch, tmp_path):
+    capture = {}
+    _fake_subprocess(monkeypatch, capture, stdout="ok")
     tool = SimpleNamespace(name="calc", hostname="localhost", port=9001)
-    llm._write_mcp_config([tool])
-    with open(llm._mcp_config_path) as f:
-        config = json.load(f)
-    assert "keepme" in config["mcpServers"]
-    assert "calc" in config["mcpServers"]
-
-
-def test_write_mcp_config_noop_without_tools(tmp_path):
-    llm = AntigravityLLM(gemini_dir=str(tmp_path))
-    llm._write_mcp_config([])
-    assert not os.path.exists(llm._mcp_config_path)
-
-
-def test_parse_rate_limit_reset():
-    reset = parse_rate_limit_reset("usage limit - resets 4pm (America/Los_Angeles)")
-    assert reset is not None
-    assert reset.tzinfo == timezone.utc
+    AntigravityLLM(gemini_dir=str(tmp_path))._run_antigravity("use calc", tools=[tool])
+    home = capture["kwargs"]["env"]["HOME"]
+    assert os.path.basename(home).startswith("agy_home_")
+    assert not os.path.exists(home)                      # removed after the run
+    assert not os.path.exists(tmp_path / "config" / "mcp_config.json")   # user's file untouched
 
 
 def test_gemini_dir_resolves_home_lazily(monkeypatch, tmp_path):
@@ -139,6 +153,12 @@ def test_gemini_dir_resolves_home_lazily(monkeypatch, tmp_path):
     assert llm._mcp_config_path == str(tmp_path / ".gemini" / "config" / "mcp_config.json")
     # An explicit gemini_dir is still honored verbatim.
     assert AntigravityLLM(gemini_dir="/x").gemini_dir == "/x"
+
+
+def test_parse_rate_limit_reset():
+    reset = parse_rate_limit_reset("usage limit - resets 4pm (America/Los_Angeles)")
+    assert reset is not None
+    assert reset.tzinfo == timezone.utc
 
 
 # --------------------------------------------------------------------------- #
@@ -346,17 +366,6 @@ def test_run_antigravity_subprocess_flow(monkeypatch, tmp_path):
     assert capture["cmd"][-1].startswith("[System Instructions]")
     assert capture["kwargs"]["timeout"] == 63  # timeout_seconds + 30
     assert capture["kwargs"]["cwd"] == "/tmp"
-
-
-def test_run_antigravity_writes_mcp_config(monkeypatch, tmp_path):
-    capture = {}
-    _fake_subprocess(monkeypatch, capture, stdout="ok")
-    tool = SimpleNamespace(name="calc", hostname="localhost", port=9001)
-    llm = AntigravityLLM(gemini_dir=str(tmp_path))
-    llm._run_antigravity("use calc", tools=[tool])
-    with open(llm._mcp_config_path) as f:
-        config = json.load(f)
-    assert config["mcpServers"]["calc"]["serverUrl"] == "http://localhost:9001/calc/mcp"
 
 
 def test_classify_clean_success_no_raise():
