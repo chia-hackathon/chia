@@ -301,6 +301,21 @@ class AdditionalModelProvider:
         return entry
 
 
+@dataclass
+class OpenCodeQueryResult(QueryResult):
+    """:class:`QueryResult` specialised for the opencode CLI.
+
+    ``usage`` holds the run's summed metrics from ``opencode export`` (the same
+    dict pushed to the profiler as ``_last_metadata``): ``input_tokens``,
+    ``output_tokens``, ``reasoning_tokens``, ``cache_read``, ``cache_write``,
+    ``cost_usd`` (from opencode's model price table) and ``num_turns``.
+    ``session_id`` is opencode's id for the session the run created.
+    """
+
+    usage: Optional[dict] = None
+    session_id: Optional[str] = None
+
+
 class OpenCodeLLM(LLMCallBase):
     """Wraps the ``opencode`` CLI as an LLM backend.
 
@@ -458,7 +473,7 @@ class OpenCodeLLM(LLMCallBase):
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
-        return QueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+        return OpenCodeQueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
 
     def _get_node_id(self) -> str:
         try:
@@ -676,7 +691,7 @@ class OpenCodeLLM(LLMCallBase):
                     "opencode run exited %d: %s", run.returncode, run.stderr[:500]
                 )
             self._last_export_error = run_error
-            return QueryResult(
+            return OpenCodeQueryResult(
                 result="",
                 returncode=run.returncode if run.returncode != 0 else -1,
                 stderr=run.stderr or "no session id in opencode output",
@@ -710,11 +725,15 @@ class OpenCodeLLM(LLMCallBase):
                     "Could not write opencode log %s.log: %s", self._log_prefix, exc
                 )
 
-        return QueryResult(
+        return OpenCodeQueryResult(
             result=final_text,
             returncode=0,
             stderr=run.stderr,
             stream_result=stream,
+            # A copy: prompt() extends _last_metadata (model, tools) afterwards
+            # and usage must stay the pure token/cost totals.
+            usage=dict(meta) if meta else None,
+            session_id=session_id,
         )
 
     def _capture(self, cmd: list, env: dict) -> SimpleNamespace:
@@ -785,8 +804,12 @@ class OpenCodeLLM(LLMCallBase):
 
         Parts: ``{type:"text", text}``, ``{type:"reasoning", text}``,
         ``{type:"tool", tool, state:{status, input, output}}``, plus
-        ``step-start``/``step-finish``. The final answer is the text of the last
-        assistant message; tokens/cost are summed across assistant messages.
+        ``step-start``/``step-finish`` — the latter carrying that model step's
+        ``tokens``, ``cost`` and stop ``reason``, rendered as a ``[Usage]`` block
+        so the transcript shows per-step metrics (same shape as the Antigravity
+        backend's). The final answer is the text of the last assistant message;
+        tokens/cost are summed across assistant messages and appended as a
+        closing ``[Result]`` line.
 
         Returns:
             ``(text, metadata, stream, export_error)`` where *export_error* is the
@@ -849,8 +872,18 @@ class OpenCodeLLM(LLMCallBase):
                             out = out[:2000] + "\n... [truncated]"
                         if out:
                             stream_parts.append(f"[Tool Result]\n{out}\n\n")
+                    elif ptype == "step-finish":
+                        step = dict(p.get("tokens") or {})
+                        if p.get("cost") is not None:
+                            step["cost_usd"] = p["cost"]
+                        if p.get("reason"):
+                            step["reason"] = p["reason"]
+                        if step:
+                            stream_parts.append(f"[Usage]\n{json.dumps(step)}\n\n")
                 if turn_text:
                     last_assistant_text = "".join(turn_text)
 
         meta = {k: v for k, v in meta.items() if v}
+        if meta:
+            stream_parts.append(f"[Result]\n{json.dumps(meta)}\n\n")
         return last_assistant_text, meta, "".join(stream_parts), export_error

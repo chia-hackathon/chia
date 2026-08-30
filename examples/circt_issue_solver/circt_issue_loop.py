@@ -125,12 +125,16 @@ def _persist(issue, res: dict) -> None:
         art.joinpath("fix.diff").write_text(res["diff"])
     if res.get("writeup"):
         art.joinpath("pr_writeup.md").write_text(res["writeup"])
-    art.joinpath("verdict.json").write_text(json.dumps(
-        {k: res.get(k) for k in ("status", "reproduced", "build_ok", "fixed",
-                                 "lit_ok", "lit_passed", "lit_failed",
-                                 "lit_failures", "added", "removed", "test_paths",
-                                 "notes")},
-        indent=2))
+    verdict = {k: res.get(k) for k in ("status", "reproduced", "build_ok", "fixed",
+                                       "lit_ok", "lit_passed", "lit_failed",
+                                       "lit_failures", "added", "removed", "test_paths",
+                                       "notes")}
+    # Per-phase token/cost usage for backends that report it (antigravity, opencode).
+    usage = {phase: blob["usage"] for phase, blob in (res.get("logs") or {}).items()
+             if blob.get("usage")}
+    if usage:
+        verdict["llm_usage"] = usage
+    art.joinpath("verdict.json").write_text(json.dumps(verdict, indent=2))
     for phase, blob in (res.get("logs") or {}).items():
         art.joinpath(f"llm_{phase}.md").write_text(blob.get("stream") or blob.get("result") or "")
         if blob.get("stderr"):
