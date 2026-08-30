@@ -119,6 +119,15 @@ participate like any tailnet worker
 (unique advertise IP, own port block, served by the head's relay);
 peers reach them through the head's tailscaled.
 
+Cloud workers join the same way. `cluster_ec2_fullymanaged.yaml` (EC2 via
+`aws_nodes`) and `cluster_gcp_fullymanaged.yaml` (Compute Engine via
+`gcp_nodes`) are the same cluster — head + colocated worker + on-prem worker +
+one cloud worker, tailscale managed by CHIA on every machine — differing only
+in the cloud block: EC2 uses a cloud-registered key pair (`KeyName`) and an
+AMI, GCP injects your `ssh_private_key`'s `.pub` via instance metadata and
+takes a `project`/`zone`/image family, with API access from Application
+Default Credentials (`gcloud auth application-default login`).
+
 That's it — the presence of the `tailnet:` block opts the cluster in.
 Every worker IP that isn't the head machine is automatically treated as
 a tailnet machine, and SSH to it automatically goes through the SOCKS5
