@@ -130,6 +130,8 @@ def run_issue_remote(issue_md: str, number: int, cfg: dict,
             # claude: the CLI's .jsonl session file; antigravity: agy's SQLite
             # conversation db. The head picks the artifact extension from this.
             "transcript_ext": "db" if backend == "antigravity" else "jsonl",
+            # token/cost totals where the backend reports them (antigravity, opencode)
+            "usage": getattr(cli, "usage", None),
         }
         return cli
 

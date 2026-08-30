@@ -93,6 +93,9 @@ class Dumper:
 def dump_llm(dump: Dumper, name: str, cli) -> None:
     """Persist an LLM call's final text + full stream transcript."""
     body = f"# {name}\n\nsuccess={getattr(cli, 'success', None)}\n\n"
+    usage = getattr(cli, "usage", None)   # token/cost totals (antigravity, opencode)
+    if usage:
+        body += f"usage={json.dumps(usage)}\n\n"
     body += (getattr(cli, "result", "") or "")
     stream = getattr(cli, "stream_result", "") or ""
     if stream:
