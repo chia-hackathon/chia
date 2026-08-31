@@ -180,8 +180,7 @@ def add_nodes_to_cluster(
     if config.tailnet_config is not None:
         raise RuntimeError(
             "chia up --add is not yet supported for tailnet clusters — "
-            "re-run a full 'chia up' instead (existing workers are detected "
-            "and skipped).")
+            "run a full 'chia down' and 'chia up' instead")
 
     logger.info(f"Adding {len(new_assignments)} new worker(s) to cluster")
 
