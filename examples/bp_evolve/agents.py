@@ -1,0 +1,367 @@
+"""The LLM nodes: Design, Port, Repair.
+
+Three places a model is consulted, and none of them decides anything.  Design
+writes a HARCOM predictor; Port translates one into a ChampSim or gem5 module;
+Repair fixes source the lint gate or the compiler rejected.  Whether the result
+is legal is :mod:`harcom_lint`'s call, whether it is better is :mod:`vfs`'s, and
+whether it enters the archive is :mod:`archive`'s.
+
+Each returns a validated dict or raises :class:`AgentError`.  A malformed reply
+is retried with the parse error appended, because a schema slip is a formatting
+problem and says nothing about the design.
+
+:func:`offline_design` is not an agent.  It is the control: a deterministic
+mutation of the seed's template parameters, so the whole cascade can be
+exercised -- lint, build, run, score, archive, promote -- without an LLM in the
+loop.  If a sweep fails, running the same sweep with ``--arm offline`` is how
+you tell a bad agent from a broken harness.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+import re
+from string import Template
+
+from chia.base.ChiaFunction import get
+from chia.base.llm_call import QueryResult
+
+import constants as C
+
+
+class AgentError(RuntimeError):
+    """The node could not produce a reply matching its schema."""
+
+
+def _load(name: str, **subs: str) -> str:
+    """``${KEY}`` substitution, so prompt text can contain literal braces.
+
+    C++ and JSON both use braces heavily and ``str.format`` would choke on
+    every one of them.
+    """
+    text = (C.PROMPTS_DIR / name).read_text()
+    for k, v in subs.items():
+        text = text.replace("${" + k + "}", v)
+    return text
+
+
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+
+
+def extract_json(text: str) -> dict:
+    """Pull one JSON object out of a reply, fenced or bare."""
+    for candidate in ([m.group(1) for m in _FENCE.finditer(text)] + [text]):
+        candidate = candidate.strip()
+        start, end = candidate.find("{"), candidate.rfind("}")
+        if start < 0 or end <= start:
+            continue
+        try:
+            obj = json.loads(candidate[start:end + 1])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise AgentError("no JSON object found in the reply")
+
+
+# ---------------------------------------------------------------------------
+# The LLM handle
+# ---------------------------------------------------------------------------
+
+def make_llm(logging_name: str = "bp_evolve_agent"):
+    """One instance per lineage, reused across its repair rounds.
+
+    Deliberately not shared across lineages: a design agent that remembers the
+    last variant's failures is doing hill-climbing in its context window rather
+    than in the archive, and the archive is the thing being measured.
+    """
+    if C.LLM_BACKEND == "vertex":
+        from chia.models.vertex import VertexGeminiLLM
+        return VertexGeminiLLM(
+            model=C.GEMINI_MODEL,
+            system_message=C.LLM_SYSTEM_MESSAGE,
+            timeout_seconds=C.LLM_TIMEOUT_SECONDS,
+            logging_name=logging_name,
+            project=C.VERTEX_PROJECT,
+            location=C.VERTEX_LOCATION,
+            max_tokens=C.VERTEX_MAX_TOKENS,
+        )
+    if C.LLM_BACKEND != "claude":
+        raise ValueError(
+            f"unknown BPE_LLM_BACKEND {C.LLM_BACKEND!r}; expected 'claude' or 'vertex'")
+    from chia.models.claude import ClaudeCodeLLM
+    return ClaudeCodeLLM(
+        model=C.LLM_MODEL,
+        system_message=C.LLM_SYSTEM_MESSAGE,
+        timeout_seconds=C.LLM_TIMEOUT_SECONDS,
+        logging_name=logging_name,
+        resume_session=True,
+        projects_cwd=C.CLAUDE_PROJECTS_DIR,
+        extra_cli_args=list(C.LLM_EXTRA_CLI_ARGS),
+    )
+
+
+def _ask(llm, prompt: str, tools: list | None = None) -> QueryResult:
+    return get(
+        llm.prompt.options(resources={"llm": C.LLM_RESOURCE}).chia_remote(
+            llm, prompt, tools or [])
+    )
+
+
+def _ask_json(llm, prompt: str, validate, tools=None, retries: int = 2) -> dict:
+    """Ask, parse, validate; on failure re-ask with the reason appended."""
+    last = ""
+    for attempt in range(retries + 1):
+        text = prompt if attempt == 0 else (
+            f"{prompt}\n\n---\nYour previous reply was rejected: {last}\n"
+            f"Reply with ONLY the JSON object, matching the schema exactly.")
+        res = _ask(llm, text, tools)
+        if not res.success:
+            last = f"the model call failed (rc={res.returncode})"
+            continue
+        try:
+            obj = extract_json(res.result)
+        except AgentError as e:
+            last = str(e)
+            continue
+        ok, reason = validate(obj)
+        if ok:
+            return obj
+        last = reason
+    raise AgentError(f"no valid reply after {retries + 1} attempts: {last}")
+
+
+# ---------------------------------------------------------------------------
+# Shared validation
+# ---------------------------------------------------------------------------
+
+_IDENT = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _validate_source_reply(obj: dict, key: str = "source") -> tuple[bool, str]:
+    """Every source-producing node returns the same three fields."""
+    if not isinstance(obj.get(key), str) or len(obj[key].strip()) < 200:
+        return False, f"'{key}' must be the complete source, not a fragment or a diff"
+    name = obj.get("struct_name")
+    if not isinstance(name, str) or not _IDENT.match(name or ""):
+        return False, "'struct_name' must be a valid C++ identifier"
+    if not re.search(rf"\bstruct\s+{re.escape(name)}\b", obj[key]):
+        return False, f"'source' does not declare `struct {name}`"
+    if not isinstance(obj.get("rationale"), str) or not obj["rationale"].strip():
+        return False, "'rationale' must say what was changed and why"
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Design
+# ---------------------------------------------------------------------------
+
+def design(llm, *, parent_source: str, parent_summary: dict,
+           archive_summary: str, feedback: str, generation: int,
+           tools=None) -> dict:
+    """Propose one new predictor by editing a parent's HARCOM source.
+
+    The parent is drawn from the archive by the caller, not chosen here: which
+    region of the space to explore is a search decision, and search decisions
+    belong to the framework.
+    """
+    prompt = _load(
+        "design.md",
+        PARENT_SOURCE=parent_source,
+        PARENT_SUMMARY=json.dumps(parent_summary, indent=2),
+        ARCHIVE=archive_summary,
+        FEEDBACK=feedback or "(this is the first variant from this parent)",
+        GENERATION=str(generation),
+    )
+    return _ask_json(llm, prompt, _validate_source_reply, tools)
+
+
+def repair(llm, *, source: str, struct_name: str, diagnostics: str,
+           round_no: int, tools=None) -> dict:
+    """Fix source the gate or the compiler rejected.
+
+    Handed the filtered diagnostics, not the raw template backtrace -- see
+    ``cbp_ng._filter_cxx_diagnostics``.  A repair round that spends its context
+    reading HARCOM's internals is a wasted one.
+    """
+    prompt = _load(
+        "repair.md",
+        SOURCE=source,
+        STRUCT_NAME=struct_name,
+        DIAGNOSTICS=diagnostics,
+        ROUND=str(round_no),
+        MAX_ROUNDS=str(C.MAX_REPAIR_ROUNDS),
+    )
+    return _ask_json(llm, prompt, _validate_source_reply, tools)
+
+
+def port(llm, *, harcom_source: str, struct_name: str, target: str,
+         tier0_mpki: float, tools=None) -> dict:
+    """Translate a HARCOM predictor into a ChampSim or gem5 branch module.
+
+    The MPKI it must reproduce is stated up front, because the port is checked
+    against it (:func:`evaluator.check_port_fidelity`) and a translator that
+    knows the acceptance test can aim at it.  That is not cheating: the test is
+    "predict the same branches the same way", and there is no way to pass it
+    except by doing so.
+    """
+    if target not in ("champsim", "gem5"):
+        raise ValueError(f"target must be 'champsim' or 'gem5'; got {target!r}")
+    prompt = _load(
+        f"port_{target}.md",
+        HARCOM_SOURCE=harcom_source,
+        STRUCT_NAME=struct_name,
+        TIER0_MPKI=f"{tier0_mpki:.4f}",
+        TOLERANCE=f"{C.MPKI_AGREEMENT_TOLERANCE:.0%}",
+    )
+    return _ask_json(llm, prompt, _validate_source_reply, tools)
+
+
+# ---------------------------------------------------------------------------
+# The control arm: no LLM
+# ---------------------------------------------------------------------------
+
+# TAGE's template parameters, with the range each may take.  Ranges are not
+# arbitrary: LOGG/LOGB span roughly a quarter to four times the shipped size,
+# NUMG covers the usual 4-16 component count, and GHIST reaches far enough to
+# make the longest history genuinely long.  Widening them further mostly buys
+# designs that fail to compile.
+_TAGE_PARAMS = {
+    "LOGLB": (5, 7, 6),      # (low, high, default) -- log2 block length + 2
+    "NUMG": (4, 12, 8),      # number of tagged components
+    "LOGG": (9, 13, 11),     # log2 entries per component
+    "LOGB": (10, 14, 12),    # log2 bimodal entries
+    "TAGW": (8, 14, 11),     # tag width
+    "GHIST": (40, 400, 100), # longest history length
+    "LOGP1": (12, 16, 14),   # log2 first-level entries
+    "GHIST1": (4, 10, 6),    # first-level history
+}
+_TAGE_ORDER = ("LOGLB", "NUMG", "LOGG", "LOGB", "TAGW", "GHIST", "LOGP1", "GHIST1")
+
+# Which of those survive the port.  LOGP1 and GHIST1 size the P1 gshare, and
+# neither ChampSim nor gem5 has an interface that can hold a first-level
+# predictor that a second level overrides a cycle later, so Tiers 1 and 2 see
+# the TAGE alone.  `offline_design` still mutates them because they are real
+# design parameters at Tier 0 -- they cost latency and energy there -- but a
+# mutation confined to them is invisible downstream, and callers are told.
+PORTED_PARAMS = ("LOGLB", "NUMG", "LOGG", "LOGB", "TAGW", "GHIST")
+UNPORTED_PARAMS = ("LOGP1", "GHIST1")
+
+
+def seed_template_args() -> str:
+    """The seed predictor's own template arguments, in ``_TAGE_ORDER``.
+
+    The starting point every offline mutation walks away from, and the
+    parameter set ``ports/tage_core.h.in`` renders to reproduce the shipped
+    TAGE -- which is what makes it the right input to the port self-check.
+    """
+    return ",".join(str(_TAGE_PARAMS[k][2]) for k in _TAGE_ORDER)
+
+
+def offline_design(parent_source: str, struct_name: str, rng: random.Random,
+                   *, parent_args: dict | None = None) -> dict:
+    """Mutate the seed's template parameters. No model, no creativity.
+
+    This is the harness control, and it is worth being explicit about what it
+    can and cannot show.  It *can* show that the cascade runs: that a variant
+    builds, scores, lands in a cell, gets promoted and comes back with a
+    failure profile.  It *cannot* find a new prediction algorithm -- it only
+    resizes the one it was given.  A sweep where the offline arm matches the
+    LLM arm is not a sweep where the agent did well; it is one where the search
+    space collapsed to table sizes.
+    """
+    args = dict(parent_args or {k: v[2] for k, v in _TAGE_PARAMS.items()})
+    # Perturb two parameters, not one: single-parameter steps walk along an
+    # axis of the archive grid and tend to land back in the parent's own cell.
+    for key in rng.sample(_TAGE_ORDER, 2):
+        low, high, _ = _TAGE_PARAMS[key]
+        step = rng.choice([-2, -1, 1, 2]) if high - low > 4 else rng.choice([-1, 1])
+        args[key] = max(low, min(high, args[key] + step))
+
+    template_args = ",".join(str(args[k]) for k in _TAGE_ORDER)
+    return {
+        "source": parent_source,
+        "struct_name": struct_name,
+        "template_args": template_args,
+        "args": args,
+        "rationale": ("offline control: template parameters "
+                      + ", ".join(f"{k}={args[k]}" for k in _TAGE_ORDER)),
+    }
+
+
+def offline_port(template_args: str, *, target: str = "champsim") -> dict:
+    """Render the ChampSim or gem5 translation of the seed TAGE.
+
+    The porting counterpart of :func:`offline_design`, and it exists for the
+    same reason: so a failing Tier-1 or Tier-2 round can be diagnosed as a bad
+    agent or a broken harness, rather than guessed at.
+
+    It is also the only way to establish what the *interface* costs.  CBP-NG
+    predicts a whole cache line per cycle and advances its global history once
+    per prediction block; ChampSim and gem5 both ask once per branch and offer
+    no block hook, so all three run the same predictor over histories that
+    advance at different rates.  That gap is real and is not a translation
+    error -- but the only way to tell the two apart is to have a port that is
+    correct by construction, measure its gap, and hold every other port to it.
+    See :func:`evaluator.check_port_fidelity`.
+
+    Both targets are rendered from ``ports/tage_core.h.in``, which carries the
+    algorithm, plus a thin per-simulator adapter.  One algorithm, two calling
+    conventions: a cross-tier disagreement is then about the cost models, not
+    about TAGE having been written twice.
+
+    Unlike :func:`offline_design`, this cannot port an arbitrary design -- it
+    renders one template, for the TAGE family the offline arm explores.  A
+    design with a new prediction algorithm needs :func:`port`.
+    """
+    if target not in ("champsim", "gem5"):
+        raise ValueError(f"target must be 'champsim' or 'gem5'; got {target!r}")
+
+    params = (dict(zip(_TAGE_ORDER, (int(x) for x in template_args.split(","))))
+              if template_args else {k: v[2] for k, v in _TAGE_PARAMS.items()})
+    if set(_TAGE_ORDER) - set(params):
+        raise AgentError(
+            f"offline_port needs all of {_TAGE_ORDER}; got {sorted(params)}")
+
+    # Template, not str.format: these files are C++ and full of braces.
+    core = Template((C.PORTS_DIR / "tage_core.h.in").read_text()).substitute(
+        {k: str(params[k]) for k in PORTED_PARAMS})
+
+    # Say which parameters the port could not carry, rather than listing all
+    # eight and implying it carried them.  LOGP1/GHIST1 size the P1 gshare,
+    # which has no MPKI effect and no home in either simulator's interface --
+    # see the header of ports/tage_core.h.in.  Two designs differing only in
+    # those are one design to Tiers 1 and 2, and a rationale that did not say
+    # so would make that look like a suspiciously reproducible result.
+    rendered = ", ".join(f"{k}={params[k]}" for k in PORTED_PARAMS)
+    dropped = ", ".join(f"{k}={params[k]}" for k in UNPORTED_PARAMS)
+    if target == "champsim":
+        source = Template(
+            (C.PORTS_DIR / "tage_champsim.h.in").read_text()
+        ).substitute(TAGE_CORE=core)
+        return {"source": source, "struct_name": "evolved_bp",
+                "unported": {k: params[k] for k in UNPORTED_PARAMS},
+                "rationale": (f"offline port to ChampSim, rendered at {rendered}"
+                              f"; not ported (P1 gshare): {dropped}")}
+
+    # gem5 needs two files: the SimObject header and its implementation.
+    header = Template(
+        (C.PORTS_DIR / "tage_gem5.hh.in").read_text()).substitute(TAGE_CORE=core)
+    impl = (C.PORTS_DIR / "tage_gem5.cc.in").read_text()
+    return {"source": header, "impl": impl, "struct_name": "EvolvedBP",
+            "unported": {k: params[k] for k in UNPORTED_PARAMS},
+            "rationale": (f"offline port to gem5, rendered at {rendered}"
+                          f"; not ported (P1 gshare): {dropped}")}
+
+
+def rename_struct(source: str, old: str, new: str) -> str:
+    """Rename a predictor struct so two variants can coexist in one checkout.
+
+    Whole-word only.  ``tage`` appears inside ``tage_entry`` and in prose
+    comments in the shipped header, and renaming those would produce source
+    that no longer compiles for a reason nothing in the loop would explain.
+    """
+    if not _IDENT.match(new):
+        raise ValueError(f"{new!r} is not a valid C++ identifier")
+    return re.sub(rf"\b{re.escape(old)}\b", new, source)

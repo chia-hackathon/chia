@@ -1,0 +1,137 @@
+// The CHIA evolutionary loop for branch-predictor search.
+// Adapted from a3-hackathon/bp-evolve-loop.dot, retuned for a two-column
+// IEEE figure*: tighter separations, shorter labels, one-row legend.
+// Build:  dot -Tpdf loop.dot -o loop.pdf
+digraph bp_evolve_loop {
+  graph [fontname="Helvetica", bgcolor="white", rankdir=LR, splines=ortho,
+         compound=true, nodesep=0.16, ranksep=0.22,
+         margin=0, pad=0.04];
+  node  [fontname="Helvetica", shape=box, style="rounded,filled", penwidth=1.5,
+         margin="0.09,0.06", fontsize=16];
+  edge  [fontname="Helvetica", fontsize=10, penwidth=1.4, arrowsize=0.7];
+
+  subgraph cluster_all {
+    style="rounded,dashed"; color="#a8b3c0"; penwidth=1.2; margin=10;
+    labelloc=b; fontsize=12;
+    label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="5" CELLPADDING="2">
+      <TR>
+        <TD BORDER="2" COLOR="#d0a020" BGCOLOR="#fbf3d5" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Inputs</FONT></TD>
+        <TD BORDER="2" COLOR="#2b6cd4" BGCOLOR="#eaf1fd" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Agent</FONT></TD>
+        <TD BORDER="2" COLOR="#23a455" BGCOLOR="#eafaf0" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">CHIA node</FONT></TD>
+        <TD BORDER="2" COLOR="#a020a0" BGCOLOR="#f9eefb" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Build</FONT></TD>
+        <TD BORDER="2" COLOR="#e0398b" BGCOLOR="#fdeef4" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Simulate</FONT></TD>
+        <TD BORDER="2" COLOR="#5b6b7a" BGCOLOR="#f2f4f6" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Store</FONT></TD>
+        <TD WIDTH="18"></TD>
+        <TD ALIGN="LEFT"><FONT POINT-SIZE="13" COLOR="#808080">&#9472;&#9654;</FONT> <FONT POINT-SIZE="13">propose</FONT></TD>
+        <TD ALIGN="LEFT"><FONT POINT-SIZE="13" COLOR="#1f6fb2">&#9472;&#9654;</FONT> <FONT POINT-SIZE="13">evaluate</FONT></TD>
+        <TD ALIGN="LEFT"><FONT POINT-SIZE="13" COLOR="#e0398b">&#9472;&#9654;</FONT> <FONT POINT-SIZE="13">promote</FONT></TD>
+        <TD ALIGN="LEFT"><FONT POINT-SIZE="13" COLOR="#000000">&#9472;&#9654;</FONT> <FONT POINT-SIZE="13">feed back</FONT></TD>
+      </TR>
+    </TABLE>>;
+
+    // ---------------- Evolution ----------------
+    subgraph cluster_evo {
+      label=<<B>Evolution</B>>; labelloc=t; fontsize=17; labeljust=c;
+      style="rounded,dashed"; color="#a8b3c0"; penwidth=1.1; margin=9;
+
+      cfg  [shape=note, style="filled", fillcolor="#fbf3d5", color="#d0a020",
+            label=<<B>Search config</B><BR/><FONT POINT-SIZE="14">seed TAGE,<BR/>archive bins</FONT>>];
+      tmpl [shape=note, style="filled", fillcolor="#fbf3d5", color="#d0a020",
+            label=<<B>Prompt template</B><BR/><FONT POINT-SIZE="14">HARCOM idioms,<BR/>mux, not <FONT FACE="Courier">if</FONT></FONT>>];
+
+      agent [fillcolor="#eaf1fd", color="#2b6cd4",
+             label=<<B>Design agent</B><BR/><FONT POINT-SIZE="14">parent from<BR/>the archive</FONT>>];
+      arch  [shape=cylinder, style="filled", fillcolor="#f2f4f6", color="#5b6b7a",
+             label=<<B>MAP&#8209;Elites archive</B><BR/><FONT POINT-SIZE="14">EPI &#215; p1 &#215; p2</FONT>>];
+
+      bfn [fillcolor="#eafaf0", color="#23a455",
+           label=<<B>build_fn</B><BR/><FONT POINT-SIZE="14">lint gate,<BR/>three builds</FONT>>];
+      rfn [fillcolor="#eafaf0", color="#23a455",
+           label=<<B>run_fn</B><BR/><FONT POINT-SIZE="14">runs tiers,<BR/>gates promotion</FONT>>];
+      mfn [fillcolor="#eafaf0", color="#23a455",
+           label=<<B>result_mapper_fn</B><BR/><FONT POINT-SIZE="14">&#964; over tiers,<BR/>depth sweep</FONT>>];
+
+      {rank=same; cfg; tmpl;}
+      {rank=same; agent; arch;}
+      {rank=same; bfn; rfn; mfn;}
+    }
+
+    // ---------------- Evaluation ----------------
+    subgraph cluster_eval {
+      label=<<B>Evaluation</B>>; labelloc=t; fontsize=17; labeljust=c;
+      style="rounded,dashed"; color="#a8b3c0"; penwidth=1.1; margin=9;
+
+      cbpb [fillcolor="#f9eefb", color="#a020a0",
+            label=<<B>CBP&#8209;NG build</B><BR/><FONT POINT-SIZE="14"><FONT FACE="Courier">-Werror</FONT>, 6.5 s</FONT>>];
+      csb  [fillcolor="#f9eefb", color="#a020a0",
+            label=<<B>ChampSim build</B><BR/><FONT POINT-SIZE="14">branch module</FONT>>];
+      g5b  [fillcolor="#f9eefb", color="#a020a0",
+            label=<<B>gem5 build</B><BR/><FONT POINT-SIZE="14">BPredUnit, O3</FONT>>];
+
+      blds [shape=cylinder, style="filled", fillcolor="#f2f4f6", color="#5b6b7a", label=<<B>Binaries</B>>];
+      trcs [shape=cylinder, style="filled", fillcolor="#f2f4f6", color="#5b6b7a",
+            label=<<B>Traces</B><BR/><FONT POINT-SIZE="14">tier 0 / tier 1</FONT>>];
+      bins [shape=cylinder, style="filled", fillcolor="#f2f4f6", color="#5b6b7a",
+            label=<<B>Workloads</B><BR/><FONT POINT-SIZE="14">AArch64, gem5</FONT>>];
+
+      t0 [shape=box3d, style="filled", fillcolor="#fdeef4", color="#e0398b", penwidth=1.5,
+          label=<<B>Tier&#8209;0 CBP&#8209;NG</B><BR/><FONT POINT-SIZE="14">every variant<BR/>VFS, EPI, p1/p2</FONT>>];
+      t1 [shape=box3d, style="filled", fillcolor="#fdeef4", color="#e0398b", penwidth=1.5,
+          label=<<B>Tier&#8209;1 ChampSim</B><BR/><FONT POINT-SIZE="14">Pareto front<BR/>MPKI &#177;5%</FONT>>];
+      t2 [shape=box3d, style="filled", fillcolor="#fdeef4", color="#e0398b", penwidth=1.5,
+          label=<<B>Tier&#8209;2 gem5 O3</B><BR/><FONT POINT-SIZE="14">elites only<BR/>IPC vs depth</FONT>>];
+
+      edb  [shape=cylinder, style="filled", fillcolor="#f2f4f6", color="#5b6b7a", label=<<B>Lineage DB</B>>];
+
+      {rank=same; cbpb; csb; g5b;}
+      {rank=same; blds; trcs; bins;}
+      {rank=same; t0; t1; t2;}
+    }
+
+
+
+    // ---- row rails: invisible high-weight chains that align each column's rows
+    edge [style=invis, weight=500];
+    bfn  -> cbpb  -> trcs -> t0;
+    cfg  -> agent -> rfn  -> csb  -> blds -> t1;
+    tmpl -> arch  -> mfn  -> g5b  -> bins -> t2;
+    edge [style=solid, weight=1];
+
+    // ---------------- propose (gray) ----------------
+    edge [color="#808080"];
+    cfg   -> agent;
+    tmpl  -> agent;
+    agent -> bfn;
+    agent -> rfn;
+
+    // ---------------- evaluate (blue) ----------------
+    edge [color="#1f6fb2"];
+    bfn  -> cbpb;
+    bfn  -> csb;
+    bfn  -> g5b;
+    cbpb -> blds;
+    csb  -> blds;
+    g5b  -> blds;
+    rfn  -> t0 [constraint=false];
+    blds -> t0;
+    blds -> t1;
+    blds -> t2;
+    trcs -> t1;
+    bins -> t2;
+    t0   -> edb;
+    t1   -> edb;
+    t2   -> edb;
+
+    // ---------------- promote (pink) ----------------
+    edge [color="#e0398b", fontcolor="#c0206e", constraint=false];
+    t0 -> t1;
+    t1 -> t2;
+    edge [constraint=true];
+
+    // ---------------- feed back (black) ----------------
+    edge [color="#000000", fontcolor="#000000"];
+    edb   -> mfn   [constraint=false];
+    mfn   -> agent [constraint=false];
+    arch  -> agent [dir=back, weight=5];
+  }
+}

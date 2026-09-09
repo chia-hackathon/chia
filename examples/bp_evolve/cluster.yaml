@@ -1,0 +1,205 @@
+# Cluster for the branch-predictor evolution loop.
+#
+# Four node types, one per tier plus the agent:
+#   cbp_ng     Tier 0 -- HARCOM builds and the trace scoring runs
+#   champsim   Tier 1 -- the ChampSim port, conditional MPKI and ROB occupancy
+#   gem5       Tier 2 -- the O3 depth sweep
+#   llm        Design / Port / Repair
+#
+# The sweep is dominated by `cbp_ng`. Measured on this machine over whole
+# passes: a variant's 126 traces (3,880,932,589 instructions) take 31 minutes
+# alone, 2.09 MIPS; a generation of three overlapped takes 99 minutes of Tier 0
+# and 112 including promotion, 1.96 MIPS. Sixteen cores buy about seven, not sixteen --
+# HARCOM is memory-bound and the slots contend. Per-trace rates vary 2.5x by
+# branch density, from 124 kIPS on compress_44_trace to 317 on int_32_trace,
+# which is why Tier-0 run timeouts are sized per trace (see
+# evaluator.cbp_run_timeout_for) rather than set to one flat number.
+#
+# Scale `cbp_ng` first: it is the concurrent-trace count, and every other pool
+# sits idle waiting on it. Past 16 there is nothing left to win here -- the
+# slots would be contending for the same memory bandwidth, not more cores.
+#
+# A useful sweep runs Tier 0 alone. Start there:
+#   chia job submit -- python "$(pwd)/examples/bp_evolve/bp_evolve_loop.py" --no-tier1
+# and add the champsim/gem5 pools once the Tier-0 search is producing a front.
+#
+# Usage:
+#   python -m chia.cli.main up   examples/bp_evolve/cluster.yaml
+#   chia job submit -- python "$(pwd)/examples/bp_evolve/bp_evolve_loop.py" --selftest
+#   python -m chia.cli.main down examples/bp_evolve/cluster.yaml
+#
+# BEFORE `chia up`, in the shell you run it from:
+#   export THIS_MACHINE=$(hostname -I | awk '{print $1}')
+# ${THIS_MACHINE} and ${USER} are plain environment variables interpolated out
+# of your environment -- nothing fills them in for you, and an unset one is left
+# as the literal string "${THIS_MACHINE}", which fails late and confusingly.
+#
+# SITE-SPECIFIC -- three things this file assumes, all of them checkable:
+#
+#   1. Three host directories exist and are bind-mounted into the workers:
+#        ${HOME}/cbp-ng                     the cbp-ng checkout
+#        ${HOME}/bp_evolve_data/cbp_traces         CBP-NG traces (Tier 0)
+#        ${HOME}/bp_evolve_data/champsim_traces    the same traces converted
+#        ${HOME}/bp_evolve_data/gem5_workloads     static SE-mode binaries
+#      Build the second from the first with:
+#        tools/convert_traces.py --in <cbp traces> --out <champsim traces> --verify
+#      Tiers 0 and 1 must see the same branches or the port check is measuring
+#      the workload rather than the predictor.
+#
+#   2. The images are built locally, because two of them need more than the
+#      published ones have:
+#        bpe-cbpng:local     ray + gcc 12; cbp-ng is C++20 and the stock ray
+#                            image's gcc 11 will not build HARCOM.
+#        champsim-bp-test    ChampSim with a placeholder `evolved_bp` branch
+#                            module baked through config.sh. WITHOUT that
+#                            placeholder the baked config names `bimodal`, a
+#                            branch module written at runtime is referenced by
+#                            nothing, and make links a binary that silently
+#                            runs bimodal -- a Tier-1 result that looks fine
+#                            and is not about your predictor at all.
+#        bpe-gem5:local      chia-gem5 with build/X86/gem5.opt already built,
+#                            so Tier 2's first build is incremental rather than
+#                            a forty-minute scons run inside the flow.
+#
+#   3. cbp-ng is bind-mounted, not cloned. The traces are not redistributable,
+#      so the checkout that has them is the one the workers should use.
+#
+# Every node type sets its own `container_name`. Without it all four share the
+# default, and because they also share one host, the second node type onward
+# finds "container already running" and joins the FIRST one -- so `chia up`
+# reports four healthy workers while ChampSim and gem5 tasks are queued against
+# a container that has neither installed.
+#
+# See examples/tailscale/ if the workers live on a different network from the
+# head.
+
+cluster_name: bp-evolve
+
+provider:
+    head_ip: ${THIS_MACHINE}
+
+auth:
+    ssh_user: ${USER}
+    # ssh_private_key: ~/.ssh/<ssh_key_name>   # omit if your key is in ssh-agent
+
+available_node_types:
+
+    # Tier 0. The hot path: scale this one.
+    #
+    # `cbp_ng` is the concurrent-trace count, NOT the worker count -- run_cbp
+    # asks for 1.0 of it per trace, so a 16-core worker declaring 16 runs
+    # sixteen traces at once. build_cbp asks for the same resource, which is
+    # deliberate: a build and fifteen runs is a sane mix, and letting builds run
+    # unbounded would have every variant's compile contend with the previous
+    # variant's scoring.
+    #
+    # 16 is the machine's real core count. Ray's headline "80 CPUs" is five
+    # containers each declaring 16 and is not capacity; these named resources
+    # are what actually meters the work, so this number and the core count have
+    # to agree. It was 12 while the generation loop evaluated variants one at a
+    # time -- a single variant on 8 traces could not fill 12 slots anyway, so
+    # the extra 4 would have bought nothing. The loop now runs a generation's
+    # variants concurrently and there are always more traces queued than slots,
+    # so the four idle cores are now real work.
+    cbp_ng:
+        resources: {"cbp_ng": 16}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        docker:
+            image: "bpe-cbpng:local"
+            container_name: "bpe-cbp-ng-${USER}"
+            pull_before_run: False
+            run_options:
+                - "-v ${HOME}/cbp-ng:/home/ray/cbp-ng"
+                - "-v ${HOME}/bp_evolve_data/cbp_traces:/home/ray/cbp-ng/traces:ro"
+
+    # Tier 1. Promoted designs only, so one worker is enough.
+    #
+    # 8, not 16, and not because ChampSim deserves less: promotion happens
+    # after a generation's Tier-0 work is scored, so it has the machine to
+    # itself and could ask for all 16. ChampSim now runs each trace to its end
+    # -- up to 130M instructions -- and holds far more state per run than
+    # HARCOM does, so on 15 GB the memory ceiling binds before the core count.
+    champsim:
+        resources: {"champsim": 8}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        docker:
+            image: "champsim-bp-test:latest"
+            container_name: "bpe-champsim-${USER}"
+            pull_before_run: False
+            run_options:
+                - "-v ${HOME}/bp_evolve_data/champsim_traces:/home/ray/champsim/traces:ro"
+
+    # Tier 2. Elites only. The gem5 build is slow and the runs are slower;
+    # this pool spends most of a sweep idle, which is correct.
+    #
+    # gem5 needs a writable checkout: a branch predictor is a SimObject, so
+    # Tier 2 writes src/cpu/pred/evolved_bp.{hh,cc}, appends to
+    # BranchPredictor.py and to the SConscript, and rebuilds. All three edits
+    # are idempotent (see gem5_bp.py) because the same checkout is reused for
+    # every variant in the sweep.
+    gem5:
+        resources: {"gem5": 4}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        docker:
+            image: "bpe-gem5:local"
+            container_name: "bpe-gem5-${USER}"
+            pull_before_run: False
+            run_options:
+                - "-v ${HOME}/bp_evolve_data/gem5_workloads:/home/ray/workloads:ro"
+
+    # Design / Port / Repair. One concurrent agent call; raising this raises
+    # the inference bill, which is the dominant cost of the whole sweep.
+    #
+    # The offline arm needs none of this: --arm offline replaces the design
+    # agent with template mutation and the porting agent with a rendered
+    # template, and a sweep on that arm never contacts this pool.
+    llm:
+        resources: {"llm": 1}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        docker:
+            image: "ghcr.io/ucb-bar/chia-claude-code:latest"
+            container_name: "bpe-llm-${USER}"
+            pull_before_run: False
+            run_options:
+                - "-v ${HOME}/.claude-bpevolve:/home/ray/.claude"
+                - "-e CLAUDE_CONFIG_DIR=/home/ray/.claude"
+
+# The head runs the driver, so its environment is the one that must have this
+# checkout's chia and a matching Ray (workers get chia shipped to them as Ray
+# py_modules). Without an explicit `ray start --head` here the workers come up,
+# report ready, and have nothing to attach to -- `chia up` still prints a
+# healthy cluster.
+head_setup_commands: ["source ~/.bashrc && conda activate chia_env"]
+
+head_start_ray_commands:
+    - source ~/.bashrc && conda activate chia_env && ray stop
+    - source ~/.bashrc && conda activate chia_env && ulimit -c unlimited && ray start --head --port=6379 --include-dashboard=True --dashboard-agent-listen-port=0
+
+# Without this the workers get their containers, their bind mounts and their
+# trace directories, `chia up` logs "Worker ... ready" for each one and prints a
+# healthy 1-head-4-worker cluster -- and no raylet is ever started, because
+# `worker_start_ray_commands` defaults to an empty list and node_setup.py only
+# appends `--resources=` to a `ray start` line that is already there. The
+# symptom is that `ray status` shows the head's 16 CPUs and none of the named
+# resources below, and every task queues forever against a pool that does not
+# exist. Check `ray status` for `cbp_ng`, not `chia up`'s summary.
+#
+# $RAY_HEAD_IP is exported into the worker script by node_setup.py; chia appends
+# the per-pool `--resources` JSON to the `ray start --address=` line.
+worker_start_ray_commands:
+    - ray stop
+    - ray start --address=$RAY_HEAD_IP:6379 --dashboard-agent-listen-port=0
+
+# Where the loop looks for things on the workers. Override any of these in the
+# environment instead of editing code.
+env_vars:
+    BPE_CBP_NG_ROOT: "/home/ray/cbp-ng"
+    BPE_CHAMPSIM_ROOT: "/home/ray/champsim"
+    BPE_GEM5_ROOT: "/home/ray/gem5"
+    BPE_CBP_TRACE_DIR: "/home/ray/cbp-ng/traces"
+    BPE_CHAMPSIM_TRACE_DIR: "/home/ray/champsim/traces"
+    BPE_GEM5_WORKLOAD_DIR: "/home/ray/workloads"

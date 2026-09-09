@@ -1,0 +1,364 @@
+// The TAGE algorithm from cbp-ng's predictors/tage.hpp, as plain C++.
+//
+// This file is the single source of truth for both ports.  The ChampSim and
+// gem5 adapters are thin: they translate their simulator's calling convention
+// into predict/update/advance and do nothing else.  That matters because the
+// whole point of Tier 1 and Tier 2 is to compare cost models, and two ports
+// that had each been written separately would differ in ways nobody could
+// separate from the thing being measured.
+//
+// Substituted parameters: LOGLB NUMG LOGG LOGB TAGW GHIST.  The remaining
+// constants (MINHIST, METABITS, UCTRBITS, PATHBITS, METAPIPE) are fixed in the
+// original and fixed here.
+//
+// NOT substituted, and this is the one asymmetry a reader has to know about:
+// LOGP1 and GHIST1.  The HARCOM design is two-level -- a 1-cycle gshare (P1)
+// and this 2-cycle TAGE (P2) -- and cbp.hpp counts a misprediction only when
+// P2 is wrong (`mispredictions++` under `p2_misprediction`).  P1 disagreeing
+// with P2 costs a pipeline bubble, never an MPKI event, and P1 shares no state
+// with P2: separate history register, separate tables, and nothing P1 computes
+// is ever read on a P2 update.  So dropping P1 is exactly right for MPKI and
+// exactly wrong for anything else -- it is part of what Tier 0 charges for in
+// latency and energy, and neither ChampSim's `predict_branch` nor gem5's
+// `lookup` can express "answer now, correct yourself one cycle later", so
+// there is nowhere to put it.
+//
+// The consequence to keep in view: two designs differing only in LOGP1 or
+// GHIST1 are distinct at Tier 0 and identical at Tiers 1 and 2.  That is a
+// real blind spot in the cross-tier comparison, not a rendering bug, and the
+// loop reports it per port rather than hiding it.
+//
+// What is faithful: table geometry, geometric history lengths, the folded
+// history hash, tag construction including the line offset, provider and
+// alternate selection, the meta counter, the allocation policy with its u-bit
+// clearing and periodic reset, and the split of each prediction into a
+// direction bit plus a hysteresis counter.
+//
+// What cannot be: CBP-NG predicts a whole cache line per cycle and advances
+// its global history once per prediction *block*.  Neither ChampSim nor gem5
+// has a block hook -- both ask per branch -- so `advance` is called per
+// branch.  Identical predictors fed histories that advance at different rates
+// compute different indices, so the ports do not reproduce Tier-0 MPKI
+// exactly.  The gap is systematic rather than random, which is what makes it
+// measurable: see check_port_fidelity in evaluator.py.
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+
+struct tage_core {
+  static constexpr uint64_t LOGLB = ${LOGLB};
+  static constexpr uint64_t NUMG = ${NUMG};
+  static constexpr uint64_t LOGG = ${LOGG};
+  static constexpr uint64_t LOGB = ${LOGB};
+  static constexpr uint64_t TAGW = ${TAGW};
+  static constexpr uint64_t GHIST = ${GHIST};
+
+  static constexpr uint64_t MINHIST = 2;
+  static constexpr uint64_t METABITS = 4;
+  static constexpr uint64_t UCTRBITS = 8;
+  static constexpr uint64_t PATHBITS = 6;
+  static constexpr uint64_t METAPIPE = 2;
+
+  static constexpr uint64_t LOGLINEINST = LOGLB - 2;
+  static constexpr uint64_t LINEINST = uint64_t{1} << LOGLINEINST;
+  static constexpr uint64_t HTAGBITS = TAGW - LOGLINEINST;
+  static constexpr uint64_t BINDEX_BITS = LOGB - LOGLINEINST;
+
+  static constexpr int64_t META_MAX = (int64_t{1} << (METABITS - 1)) - 1;
+  static constexpr int64_t META_MIN = -(int64_t{1} << (METABITS - 1));
+  static constexpr uint64_t UCTR_MAX = (uint64_t{1} << UCTRBITS) - 1;
+
+  static constexpr uint64_t bmask(uint64_t bits)
+  {
+    return (bits >= 64) ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
+  }
+
+  // -- speculative state, saved and restored around a squash ----------------
+  struct history {
+    std::array<uint8_t, GHIST> gh{};
+    std::array<uint64_t, NUMG> ifold{};
+    std::array<uint64_t, NUMG> tfold{};
+  };
+
+  history hist;
+  std::array<uint64_t, NUMG> hlen{};
+
+  // -- tables ---------------------------------------------------------------
+  // The originals are per-line-offset arrays of narrow RAMs.  Flattening
+  // (offset, index) into one vector is the same storage with the same
+  // addressing; nothing here models the banking, which only ever mattered to
+  // the energy model that lives in Tier 0.
+  std::vector<uint8_t> bim, bhyst, gpred, ghyst, ubit;
+  std::vector<uint32_t> gtag;
+
+  std::array<int64_t, METAPIPE> meta{};
+  uint64_t uctr = 0;
+  uint64_t rng_state = 0x9E3779B97F4A7C15ull;
+
+  // -- what predict() computed, consumed by update() ------------------------
+  struct lookup {
+    uint64_t offset = 0, bindex = 0;
+    std::array<uint64_t, NUMG> gindex{};
+    std::array<uint64_t, NUMG> htag{};
+    std::array<uint32_t, NUMG> readt{};
+    std::array<uint8_t, NUMG> readc{}, readh{}, readu{};
+    uint8_t readb = 0;
+    uint64_t match = 0, match1 = 0, match2 = 0;
+    bool pred1 = false, pred2 = false, final_pred = false;
+    bool newly_alloc = false;
+  };
+
+  tage_core() { init(); }
+
+  void init()
+  {
+    // Geometric history lengths; hlen[0] is the longest, as in geometric_folds.
+    uint64_t prev = 0;
+    for (uint64_t i = 0; i < NUMG; i++) {
+      const double r = (NUMG == 1) ? 0.0
+                                   : (static_cast<double>(i) / static_cast<double>(NUMG - 1));
+      uint64_t hl = static_cast<uint64_t>(
+          static_cast<double>(MINHIST) *
+          std::pow(static_cast<double>(GHIST) / static_cast<double>(MINHIST), r));
+      hl = std::max(prev + 1, hl);
+      hlen[NUMG - 1 - i] = hl;
+      prev = hl;
+    }
+    bim.assign(LINEINST << BINDEX_BITS, 0);
+    bhyst.assign(LINEINST << BINDEX_BITS, 0);
+    gtag.assign(NUMG << LOGG, 0);
+    gpred.assign(NUMG << LOGG, 0);
+    ghyst.assign(NUMG << LOGG, 0);
+    ubit.assign(NUMG << LOGG, 0);
+  }
+
+  static uint64_t reverse_bits(uint64_t v, uint64_t bits)
+  {
+    uint64_t r = 0;
+    for (uint64_t i = 0; i < bits; i++) r |= ((v >> i) & 1) << (bits - 1 - i);
+    return r;
+  }
+
+  static uint64_t lowest_bit(uint64_t v) { return v & (~v + 1); }   // one_hot()
+
+  uint64_t next_rand()
+  {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    return rng_state;
+  }
+
+  static uint8_t update_ctr(uint8_t ctr, bool incr, uint8_t maxv)
+  {
+    if (incr) return static_cast<uint8_t>(ctr == maxv ? ctr : ctr + 1);
+    return static_cast<uint8_t>(ctr == 0 ? ctr : ctr - 1);
+  }
+
+  // -- folded global history ------------------------------------------------
+  // Michaud's circular-shift-register folding, transcribed from
+  // predictors/common.hpp.  The folds are updated before the global history
+  // advances, because geometric_folds::update() does it in that order -- the
+  // other order shifts every index by one branch, which is invisible except as
+  // a few percent of MPKI.
+  void fold_update(uint64_t& folded, uint64_t F, uint64_t ghlen, uint64_t in,
+                   uint64_t in_size)
+  {
+    const uint64_t inbits = std::min(F, std::min(in_size, ghlen));
+    const uint64_t outbit = hist.gh[ghlen - 1];
+    const uint64_t outpos = ghlen % F;
+    uint64_t ff = ((folded << 1) | (folded >> (F - 1))) & bmask(F);
+    ff ^= (outbit << (outpos % F));
+    folded = (ff ^ (in & bmask(inbits))) & bmask(F);
+  }
+
+  void gh_shift(uint64_t in, uint64_t inbits)
+  {
+    for (uint64_t i = GHIST - 1; i >= inbits; i--) hist.gh[i] = hist.gh[i - 1];
+    for (uint64_t i = inbits - 1; i >= 1; i--)
+      hist.gh[i] = static_cast<uint8_t>(hist.gh[i - 1] ^ ((in >> i) & 1));
+    hist.gh[0] = static_cast<uint8_t>(in & 1);
+  }
+
+  /// Advance the speculative history past a branch whose next PC is known.
+  void advance(uint64_t next_pc)
+  {
+    const uint64_t branchbits = next_pc >> 2;
+    for (uint64_t i = 0; i < NUMG; i++) {
+      fold_update(hist.ifold[i], LOGG, hlen[i], branchbits, PATHBITS);
+      fold_update(hist.tfold[i], HTAGBITS, hlen[i], branchbits, PATHBITS);
+    }
+    gh_shift(branchbits & bmask(PATHBITS), PATHBITS);
+  }
+
+  // -- prediction -----------------------------------------------------------
+  lookup predict(uint64_t pc)
+  {
+    lookup L;
+    L.offset = (pc >> 2) & (LINEINST - 1);
+    const uint64_t lineaddr = pc >> LOGLB;
+    L.bindex = lineaddr & bmask(BINDEX_BITS);
+
+    for (uint64_t i = 0; i < NUMG; i++) {
+      L.gindex[i] = (lineaddr ^ hist.ifold[i]) & bmask(LOGG);
+      L.htag[i] = (reverse_bits(lineaddr & bmask(HTAGBITS), HTAGBITS) ^ hist.tfold[i])
+                  & bmask(HTAGBITS);
+    }
+
+    L.readb = bim[(L.offset << BINDEX_BITS) | L.bindex];
+    for (uint64_t i = 0; i < NUMG; i++) {
+      const uint64_t a = (i << LOGG) | L.gindex[i];
+      L.readt[i] = gtag[a];
+      L.readc[i] = gpred[a];
+      L.readh[i] = ghyst[a];
+      L.readu[i] = ubit[a];
+    }
+
+    // The tag carries the line offset in its high bits, so an entry only
+    // matches the branch that owns that slot in the line.  Dropping the offset
+    // from the comparison would let any branch in the line steal the entry --
+    // which is the reason the original packs it into the tag at all.
+    L.match = uint64_t{1} << NUMG;   // the bimodal always matches
+    const uint64_t want_hi = L.offset << HTAGBITS;
+    for (uint64_t i = 0; i < NUMG; i++)
+      if (L.readt[i] == (want_hi | L.htag[i])) L.match |= (uint64_t{1} << i);
+
+    L.match1 = lowest_bit(L.match);              // longest matching history
+    L.match2 = lowest_bit(L.match ^ L.match1);   // next longest
+
+    auto pred_of = [&](uint64_t onehot) -> bool {
+      if (onehot == 0) return false;
+      if (onehot == (uint64_t{1} << NUMG)) return L.readb != 0;
+      for (uint64_t i = 0; i < NUMG; i++)
+        if (onehot == (uint64_t{1} << i)) return L.readc[i] != 0;
+      return false;
+    };
+    L.pred1 = pred_of(L.match1);
+    L.pred2 = pred_of(L.match2);
+
+    // A just-allocated provider has an unset u bit and a zeroed hysteresis;
+    // the meta counter decides whether it is trusted yet.
+    L.newly_alloc = false;
+    for (uint64_t i = 0; i < NUMG; i++)
+      if (L.match1 == (uint64_t{1} << i) && L.readu[i] == 0 && L.readh[i] == 0)
+        L.newly_alloc = true;
+
+    const bool metasign = meta[METAPIPE - 1] >= 0;
+    const bool altsel = metasign && L.newly_alloc && (L.match2 != 0);
+    L.final_pred = altsel ? L.pred2 : L.pred1;
+    return L;
+  }
+
+  // -- update ---------------------------------------------------------------
+  void update(const lookup& L, bool taken)
+  {
+    const bool mispredict = (L.final_pred != taken);
+    const bool correct_pred = !mispredict;
+    const bool primary_wrong = (L.pred1 != taken);
+    const bool bim_primary = (L.match1 == (uint64_t{1} << NUMG));
+    const uint64_t primary_mask = L.match1 & bmask(NUMG);   // 0 when bimodal provided
+
+    // -- choose an allocation victim among the longer histories -------------
+    const uint64_t longer = bmask(NUMG) & (L.match1 - 1);
+    uint64_t notumask = 0;
+    for (uint64_t i = 0; i < NUMG; i++)
+      if (L.readu[i] == 0) notumask |= (uint64_t{1} << i);
+
+    const uint64_t postmask = mispredict ? longer : 0;
+    const uint64_t candalloc = postmask & notumask;
+    const uint64_t colla = reverse_bits(candalloc, NUMG);
+    const uint64_t colla1 = lowest_bit(colla);
+    const uint64_t colla2 = lowest_bit(colla ^ colla1);
+    // One time in four, take the second candidate instead of the nearest.
+    //
+    // Note there is no `colla2 != 0` guard, and there must not be: when only
+    // one candidate exists colla2 is zero, and the original then allocates
+    // NOTHING for this branch --
+    //
+    //     collamask12 = select(rand()%4==0, collamask2, collamask1);
+    //
+    // selects collamask2 unconditionally, zero or not (predictors/tage.hpp).
+    // So a quarter of all single-candidate mispredicts allocate no entry at
+    // all.  Falling back to colla1 here reads like a harmless guard and is
+    // not: it raises the allocation rate, and allocation rate is the knob
+    // TAGE is most sensitive to.
+    //
+    // The original draws this from std::rand() interleaved with the rest of
+    // the simulation; that call sequence cannot be reproduced, only its
+    // distribution.
+    const uint64_t chosen = ((next_rand() & 3) == 0) ? colla2 : colla1;
+    const uint64_t allocmask = reverse_bits(chosen, NUMG);
+    const uint64_t allocmask1 = reverse_bits(colla1, NUMG);
+
+    // When every longer entry is marked useful, none can be allocated -- clear
+    // their u bits instead and try again next time.
+    const uint64_t uclearmask = (candalloc == 0) ? postmask : 0;
+
+    auto bdir_of = [&](uint64_t i) -> bool {
+      if (allocmask & (uint64_t{1} << i)) return taken;
+      return ((L.readt[i] >> HTAGBITS) == L.offset) && taken;
+    };
+
+    // -- meta: is the alternate prediction beating a fresh allocation? ------
+    const bool altdiff = (L.match2 != 0) && (L.pred2 != L.pred1);
+    int64_t incr = 0;
+    if (altdiff && L.newly_alloc) incr = (L.pred2 != taken) ? -1 : +1;
+    for (uint64_t i = METAPIPE - 1; i != 0; i--) meta[i] = meta[i - 1];
+    const int64_t newmeta = meta[0] + incr;
+    meta[0] = (newmeta > META_MAX) ? META_MAX
+                                   : ((newmeta < META_MIN) ? META_MIN : newmeta);
+
+    // -- allocate ------------------------------------------------------------
+    for (uint64_t i = 0; i < NUMG; i++)
+      if (allocmask & (uint64_t{1} << i))
+        gtag[(i << LOGG) | L.gindex[i]] =
+            static_cast<uint32_t>((L.offset << HTAGBITS) | L.htag[i]);
+
+    // -- u bits --------------------------------------------------------------
+    for (uint64_t i = 0; i < NUMG; i++) {
+      const bool is_primary = (primary_mask & (uint64_t{1} << i)) != 0;
+      const bool allocated = (allocmask & (uint64_t{1} << i)) != 0;
+      const bool cleared = (uclearmask & (uint64_t{1} << i)) != 0;
+      const bool altdiffer = is_primary && (L.readc[i] != (L.pred2 ? 1 : 0));
+      if (altdiffer || allocated || cleared) {
+        const bool goodpred = ((L.readt[i] >> HTAGBITS) != L.offset) || correct_pred;
+        ubit[(i << LOGG) | L.gindex[i]] =
+            static_cast<uint8_t>(goodpred && !allocated && !cleared);
+      }
+    }
+
+    // -- bimodal -------------------------------------------------------------
+    const uint64_t baddr = (L.offset << BINDEX_BITS) | L.bindex;
+    if (bim_primary && primary_wrong && bhyst[baddr] == 0)
+      bim[baddr] = static_cast<uint8_t>(taken);
+    if (bim_primary) bhyst[baddr] = static_cast<uint8_t>(!primary_wrong);
+
+    // -- tagged entries ------------------------------------------------------
+    for (uint64_t i = 0; i < NUMG; i++) {
+      const bool is_primary = (primary_mask & (uint64_t{1} << i)) != 0;
+      const bool allocated = (allocmask & (uint64_t{1} << i)) != 0;
+      const bool bdir = bdir_of(i);
+      const bool badpred1 = (L.readc[i] != (bdir ? 1 : 0));
+      const uint64_t a = (i << LOGG) | L.gindex[i];
+      // The direction bit only flips once the hysteresis has run out: the pair
+      // is a three-bit counter split across two RAMs.
+      if ((is_primary && badpred1 && L.readh[i] == 0) || allocated)
+        gpred[a] = static_cast<uint8_t>(bdir);
+      if (is_primary || allocated)
+        ghyst[a] = allocated ? 0 : update_ctr(L.readh[i], !badpred1, 3);
+    }
+
+    // -- periodic u-bit reset ------------------------------------------------
+    const uint64_t far_probe = lowest_bit((L.match1 >> 3) | allocmask1);
+    const bool faralloc = ((far_probe ^ allocmask1) == 0);
+    const bool uctrsat = (uctr == UCTR_MAX);
+    if (!correct_pred)
+      uctr = uctrsat ? 0
+                     : update_ctr(static_cast<uint8_t>(uctr), faralloc,
+                                  static_cast<uint8_t>(UCTR_MAX));
+    if (uctrsat) std::fill(ubit.begin(), ubit.end(), 0);
+  }
+};

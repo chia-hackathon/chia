@@ -1,0 +1,463 @@
+<title>Auditing VFS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Tinos:ital,wght@0,400;0,700;1,400&display=swap">
+<style>
+:root{
+  --paper:#ffffff; --ink:#101112; --ink2:#4a4d52; --rule:#c9ccd1; --grid:#dfe2e6;
+  --neg:#8a2e2a; --s1:#1b3a4b; --s2:#546a7b; --s3:#8d99a6; --panel:#f6f7f8;
+  --serif:"Tinos","Nimbus Roman","Liberation Serif","Times New Roman",Times,serif;
+  --mono:ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --paper:#15171b; --ink:#e9e7e3; --ink2:#a4a8ae; --rule:#3a3f46; --grid:#2a2e34;
+  --neg:#e0796f; --s1:#9dc7dd; --s2:#7f96a6; --s3:#5f6b76; --panel:#1c1f24;
+}}
+:root[data-theme="dark"]{
+  --paper:#15171b; --ink:#e9e7e3; --ink2:#a4a8ae; --rule:#3a3f46; --grid:#2a2e34;
+  --neg:#e0796f; --s1:#9dc7dd; --s2:#7f96a6; --s3:#5f6b76; --panel:#1c1f24;
+}
+body{background:var(--paper);color:var(--ink);font-family:var(--serif);
+  font-size:9.6pt;line-height:1.30;margin:0;padding:0;text-rendering:optimizeLegibility}
+.page{max-width:8.5in;margin:0 auto;padding:.62in .70in .7in;box-sizing:border-box;background:var(--paper)}
+.head{text-align:center;margin-bottom:14pt}
+h1{font-size:19pt;font-weight:700;line-height:1.16;margin:0 0 9pt;text-wrap:balance;letter-spacing:-.005em}
+.auth{font-size:10pt;line-height:1.35;color:var(--ink)}
+.auth em{color:var(--ink2);font-style:italic}
+.cols{column-count:2;column-gap:.26in;column-fill:balance}
+@media (max-width:640px){.cols{column-count:1}.page{padding:.5in .5in}}
+h2{font-size:9.6pt;font-weight:700;font-variant:small-caps;letter-spacing:.03em;
+  text-align:center;margin:11pt 0 5pt;break-after:avoid}
+h3{font-size:9.6pt;font-weight:400;font-style:italic;margin:8pt 0 3pt;break-after:avoid}
+p{margin:0;text-align:justify;hyphens:auto;text-indent:1.1em}
+p.first,h2+p,h3+p,.abs p{text-indent:0}
+.abs{font-weight:700;font-size:9pt;margin-bottom:7pt}
+.abs .lbl{font-variant:small-caps;letter-spacing:.03em}
+.kw{font-size:9pt;margin-bottom:4pt}
+.kw .lbl{font-style:italic;font-weight:700}
+ol,ul{margin:4pt 0 4pt 0;padding-left:1.25em}
+li{margin-bottom:2.5pt;text-align:justify}
+code,.m{font-family:var(--mono);font-size:8.5pt}
+.eq{margin:6pt 0;text-align:center;font-style:italic;break-inside:avoid;line-height:1.5}
+.eq .n{float:right;font-style:normal;font-size:9pt}
+figure{margin:8pt 0;break-inside:avoid}
+figure svg{width:100%;height:auto;display:block}
+figcaption,.tcap{font-size:8.2pt;line-height:1.28;margin-top:4pt;text-align:justify}
+.tcap{margin:0 0 4pt;text-align:center}
+.tno{font-variant:small-caps;letter-spacing:.03em}
+table{width:100%;border-collapse:collapse;font-size:8.4pt;margin-bottom:3pt}
+th,td{padding:2.2pt 3pt;text-align:left}
+th{border-bottom:.6pt solid var(--rule);font-weight:700}
+thead tr:first-child th{border-top:1.1pt solid var(--ink)}
+tbody tr:last-child td{border-bottom:1.1pt solid var(--ink)}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.hi td{color:var(--neg);font-weight:700}
+.tw{break-inside:avoid;margin:7pt 0}
+.tk{font-family:var(--serif);font-size:7pt;fill:var(--ink2)}
+.ax{font-family:var(--serif);font-size:7.6pt;fill:var(--ink2)}
+.leg{font-size:7.8pt;color:var(--ink2);margin-top:3pt;line-height:1.45}
+.sw{display:inline-block;width:16px;height:0;border-top-width:2px;vertical-align:middle;margin-right:3px}
+.note{background:var(--panel);border-left:2pt solid var(--neg);padding:5pt 7pt;margin:7pt 0;
+  font-size:8.6pt;break-inside:avoid;text-align:justify}
+.refs{font-size:8.2pt;line-height:1.3}
+.refs ol{padding-left:1.5em;margin:0}
+.refs li{margin-bottom:2.5pt}
+.foot{margin-top:12pt;padding-top:5pt;border-top:.5pt solid var(--rule);
+  font-size:7.8pt;color:var(--ink2);text-align:center}
+@page{size:letter;margin:.62in .70in}
+@media print{body{background:#fff}.page{padding:0;max-width:none}}
+</style>
+
+<div class="page">
+<div class="head">
+  <h1>What VFS Rewards: An Audit of the CBP-NG<br>Scoring Function under Automated Search</h1>
+  <div class="auth">CHIA Branch-Predictor Evolution Study<br>
+  <em>Automated hardware/software co-design with CHIA</em><br>
+  <em>Generated from sweep <span class="m">bp_evolve</span>, generations 0&ndash;10</em></div>
+</div>
+
+<div class="cols">
+
+<div class="abs"><span class="lbl">Abstract</span>&mdash;The Championship Branch Prediction
+Next Generation (CBP-NG) contest replaces raw misprediction rate with VFS, a
+voltage-frequency-scaled speedup that folds prediction throughput, misprediction cost and
+predictor energy into a single number. We treat VFS not as a ranking device but as an
+<em>optimization target</em>, and ask what an automated search actually finds when VFS is
+the only signal it receives. We built a three-tier evaluation cascade on CHIA&mdash;CBP-NG
+for scoring, ChampSim for port fidelity, gem5 for a pipeline-depth sweep&mdash;and ran
+eleven generations of MAP-Elites over the template parameters of the shipped TAGE
+predictor, scoring 29 designs on all 126 inner traces of the official set. Three results
+follow. First, over the scored population VFS correlates strongly with prediction
+throughput (r&nbsp;=&nbsp;+0.890) and with first-level predictor latency
+(r&nbsp;=&nbsp;&minus;0.833), and <em>not at all</em> with accuracy
+(r&nbsp;=&nbsp;&minus;0.024 against MPKI spanning 5.08&ndash;10.09). Second, the gem5 tier
+does not discriminate: core IPC at the shipped depth varies by 0.51% across ten promoted
+designs, and its apparent agreement with Tier-1 MPKI (r&nbsp;=&nbsp;&minus;0.908) is
+carried by a single outlier and inverts to +0.884 when two points are removed. Third, the
+ranking VFS produces at the shipped depth of nine is not depth-robust, and the failure is
+attributable: at every depth beyond twelve, <em>every</em> discordant pair in the elite
+ranking involves the one archived design with high MPKI. Accuracy governs depth
+robustness, and accuracy is exactly what the depth-nine score does not measure.</div>
+
+<div class="kw"><span class="lbl">Index Terms</span>&mdash;branch prediction, CBP-NG,
+design-space exploration, quality diversity, MAP-Elites, simulation methodology, agentic
+co-design.</div>
+
+<h2>I.&ensp;Introduction</h2>
+<p class="first">A scoring function used to rank a fixed slate of contest entries and a
+scoring function used to <em>steer</em> an automated search are not the same artifact. The
+first needs only to order designs a human already thought worth submitting. The second is
+climbed: whatever it rewards, a search will supply, including rewards its designers did
+not intend to offer. This paper audits the CBP-NG scoring function in the second role.</p>
+
+<h3>A. CBP-NG</h3>
+<p>The Championship Branch Prediction Next Generation contest distributes a simulator, a
+set of 168 instruction traces, and a reference predictor written in <em>HARCOM</em>, a
+restricted C++ subset in which storage is declared as typed RAM arrays with explicit read
+and write ports, so that a predictor's latency and energy can be derived from its source
+rather than asserted by its author. Entries are ranked by VFS&mdash;Voltage-Frequency-Scaled
+speedup&mdash;which combines three measured quantities: how many predictions the design
+delivers per cycle, how many cycles it loses to mispredictions at an assumed pipeline
+depth, and how much dynamic energy it spends per instruction. VFS is a deliberate
+improvement on ranking by misprediction rate alone, which rewards predictors that cannot
+be built. Our question is what it rewards instead.</p>
+
+<h3>B. ChampSim</h3>
+<p>ChampSim is a trace-driven out-of-order core simulator widely used in branch and cache
+prediction research. It models a real reorder buffer, so a mispredicted branch costs what
+the machine's actual occupancy makes it cost. We use ChampSim as a <em>port-fidelity</em>
+tier: a design that scores well in CBP-NG must be re-expressed against ChampSim's
+branch-predictor interface and must reproduce its CBP-NG conditional MPKI within
+tolerance. This catches the failure mode in which a CBP-NG design scores well because of
+something the CBP-NG harness permits and no core would.</p>
+
+<h3>C. gem5</h3>
+<p>gem5's O3 model is an execution-driven, cycle-level core in which pipeline depth is a
+parameter rather than a constant. CBP-NG charges misprediction at a <em>fixed</em>
+nine-stage penalty. Whether a ranking obtained under that assumption survives a machine
+that is deeper or shallower is an empirical question, and gem5 is where we ask it,
+sweeping depth over {3, 6, 9, 12, 16, 20, 25, 30}.</p>
+
+<h3>D. CHIA</h3>
+<p>CHIA is an open-source framework for agentic hardware/software co-design that expresses
+a workflow as a graph of typed nodes over a Ray-based runtime, with each node type pinned
+to its own container image and its own pool of cluster resources. It is what makes a
+three-simulator cascade practical: CBP-NG scoring, ChampSim porting and gem5 depth sweeps
+are three incompatible toolchains, and CHIA runs them as one flow with independently
+scaled pools (<span class="m">cbp_ng</span>, <span class="m">champsim</span>,
+<span class="m">gem5</span>), a single lineage database, and the same graph running on a
+workstation or across cloud VMs.</p>
+
+<h2>II.&ensp;Related Work</h2>
+<p class="first"><em>Branch predictor championships.</em> The CBP series has driven
+predictor research for two decades, and the TAGE family [1], [2] remains the reference
+against which entries are measured. The metric has evolved from misprediction rate toward
+cost-aware scoring precisely because rate alone is unphysical; CBP-NG's VFS is the current
+endpoint of that evolution.</p>
+<p><em>Simulator fidelity.</em> A long line of work establishes that simulator-relative
+conclusions do not transfer freely: ChampSim, gem5 and custom harnesses disagree in
+magnitude and sometimes in order [3]&ndash;[5]. Cross-simulator validation is recommended
+practice, but is usually performed once, on a final design, rather than being wired into
+the search that produced it.</p>
+<p><em>Automated architecture search.</em> Design-space exploration by evolutionary and
+learned methods is well established, and MAP-Elites and quality-diversity search [6], [7]
+are attractive here because they retain a front of behaviorally distinct designs rather
+than collapsing to a single optimum. Recent work applies large language models to hardware
+design generation and repair; our harness supports an LLM arm, but every number in this
+paper comes from the <em>offline</em> control arm, which mutates template parameters with
+no model in the loop.</p>
+
+<h2>III.&ensp;What the Existing Setting Lacks</h2>
+<p class="first">Three gaps motivate this study.</p>
+<p><em>The metric is never audited as an objective.</em> VFS is validated as a ranking of
+submitted entries. Nobody has reported what a search does when VFS is the sole
+gradient&mdash;which of its three inputs actually carries the optimizer, and which are
+decorative. A term that changes the score by a few parts per thousand is not a design
+pressure, however principled its derivation.</p>
+<p><em>Cross-simulator checks are terminal, not structural.</em> Validation usually happens
+once at the end. But the useful question is whether the <em>ranking</em> the cheap tier
+produces survives the expensive one, and that question can only be asked if the expensive
+tier is inside the loop, scoring the same lineage.</p>
+<p><em>Depth is assumed, not swept.</em> CBP-NG's nine-stage penalty is a fixed constant in
+the scoring path. A predictor that wins at depth nine may or may not win at depth
+twenty-five, and no contest result reports which.</p>
+
+<h2>IV.&ensp;What We Achieve</h2>
+<ol>
+<li>A <strong>three-tier evaluation cascade</strong> on CHIA in which CBP-NG scoring,
+ChampSim port verification and a gem5 depth sweep run as one flow over one lineage
+database, so every design carries all three tiers' verdicts.</li>
+<li>A <strong>numerical audit of VFS</strong> over a search-generated population,
+identifying which of its inputs the score is actually sensitive to.</li>
+<li>A <strong>depth-robustness analysis</strong> that does not merely report that the
+depth-nine ranking degrades, but isolates <em>which design</em> makes it degrade and
+<em>why</em>.</li>
+<li>A <strong>re-scoring identity</strong> that lets the full depth sweep be recomputed
+from counters measured once, making an eight-depth sweep free relative to one CBP-NG
+pass.</li>
+</ol>
+
+<h2>V.&ensp;Methodology</h2>
+
+<h3>A. Nomenclature</h3>
+<p>Three distinct quantities are called &ldquo;IPC&rdquo; in this pipeline, and conflating
+them invalidates everything downstream. Table I separates them.</p>
+
+<div class="tw">
+<div class="tcap"><span class="tno">Table I</span><br>Quantities that share a name.</div>
+<table>
+<thead><tr><th>Symbol</th><th>Meaning</th><th class="n">Observed range</th></tr></thead>
+<tbody>
+<tr><td><em>T</em></td><td>CBP-NG prediction throughput</td><td class="n">3.63&ndash;6.84</td></tr>
+<tr><td>IPC<sub>1</sub></td><td>ChampSim core IPC</td><td class="n">&asymp;1.125</td></tr>
+<tr><td>IPC<sub>2</sub></td><td>gem5 O3 core IPC (depth 9)</td><td class="n">0.887&ndash;0.891</td></tr>
+<tr><td><em>C</em></td><td>cycles lost per instruction</td><td class="n">0.053&ndash;0.101</td></tr>
+<tr><td>EPI</td><td>predictor energy per instruction</td><td class="n">1230&ndash;2271</td></tr>
+</tbody></table>
+</div>
+
+<p><em>T</em> is a <em>throughput</em>, not a core IPC: it is how many predictions the
+predictor supplies per cycle. <em>C</em> is a <em>penalty</em>, not a period: it is cycles
+lost to mispredictions per instruction. EPI is normalized so the reference predictor
+scores 1000.</p>
+
+<h3>B. The scoring function</h3>
+<p>Let &rho;&nbsp;=&nbsp;0.05 be the fraction of system energy attributed to the predictor,
+<em>T</em><sub>ref</sub>&nbsp;=&nbsp;8, <em>C</em><sub>ref</sub>&nbsp;=&nbsp;0.0315,
+&alpha;&nbsp;=&nbsp;1.625, &gamma;&nbsp;=&nbsp;2/(&alpha;&minus;1)&nbsp;=&nbsp;3.2 and
+&beta;&nbsp;=&nbsp;4&alpha;/(&alpha;&minus;1)&sup2;&nbsp;=&nbsp;16.64. Define the reference
+and actual work-per-instruction</p>
+<div class="eq"><span class="n">(1)</span>w<sub>ref</sub> = T<sub>ref</sub>C<sub>ref</sub> = 0.252,&emsp; w = TC.</div>
+<p class="first">The speedup term is</p>
+<div class="eq"><span class="n">(2)</span>S = (T / T<sub>ref</sub>) &middot; (1 + w<sub>ref</sub>) / (1 + w).</div>
+<p class="first">With &lambda;&nbsp;=&nbsp;(1&nbsp;+&nbsp;w<sub>ref</sub>/2)<sup>&minus;1</sup>
+&minus;&nbsp;&rho;&nbsp;=&nbsp;0.838099, the normalized energy is</p>
+<div class="eq"><span class="n">(3)</span>E = ( (EPI/1000)&rho; + &lambda;S<sup>&gamma;</sup> )(1 + w/2),</div>
+<p class="first">and the score is</p>
+<div class="eq"><span class="n">(4)</span>VFS = S&alpha;( 1 &minus; 2 / (1 + &radic;(1 + &beta;/(SE)) ) ).</div>
+
+<p class="first">Equation (2) is the structural heart of the audit. Throughput <em>T</em>
+enters <em>S</em> <em>linearly and in the numerator</em>. Accuracy enters only through
+<em>w</em>&nbsp;=&nbsp;<em>TC</em> in the denominator, where <em>C</em>&nbsp;&#8810;&nbsp;1,
+so a design that doubles its misprediction cost moves 1&nbsp;+&nbsp;<em>w</em> from 1.05 to
+1.10&mdash;a few percent&mdash;while a design that adds one prediction per cycle moves
+<em>S</em> proportionally. Energy is weighted by &rho;&nbsp;=&nbsp;0.05 before it is added
+to a term of order one. The score is therefore a throughput metric with accuracy and energy
+corrections, and the search finds this out immediately.</p>
+
+<h3>C. Aggregation and the re-scoring identity</h3>
+<p>Per trace, with <em>p</em><sub>1</sub>, <em>p</em><sub>2</sub> the first- and
+second-level predictor latencies in cycles, cycles are accumulated as
+<em>N</em><sub>p</sub>&thinsp;max(1,&thinsp;<em>p</em><sub>2</sub>) when
+<em>p</em><sub>2</sub>&nbsp;&le;&nbsp;<em>p</em><sub>1</sub>, and as
+<em>N</em><sub>p</sub>&thinsp;max(1,&thinsp;<em>p</em><sub>1</sub>) +
+<em>N</em><sub>d</sub><em>p</em><sub>2</sub> &minus;
+<em>N</em><sub>e</sub>&thinsp;max(1,&thinsp;<em>p</em><sub>1</sub>) otherwise, for
+<em>N</em><sub>p</sub> predictions, <em>N</em><sub>d</sub> divergences and
+<em>N</em><sub>e</sub> divergences at end of trace; <em>T</em> is the harmonic mean of
+<em>N</em><sub>inst</sub>/cyc over traces. The misprediction cost is</p>
+<div class="eq"><span class="n">(5)</span>C = mpi &middot; ( D + p<sub>2</sub> &minus; max(1, min(p<sub>1</sub>, p<sub>2</sub>)) ),</div>
+<p class="first">where <em>D</em> is pipeline depth and mpi is mispredictions per
+instruction. Equation (5) is the <em>only</em> place <em>D</em> appears. Consequently the
+entire depth sweep is a closed-form re-scoring of counters measured once: eight depths cost
+one CBP-NG pass, not eight. We verified our reimplementation reproduces every stored VFS to
+better than 10<sup>&minus;4</sup> and the stored depth sweep exactly.</p>
+
+<h3>D. Search</h3>
+<p>We use MAP-Elites over a behavior grid keyed on (EPI band, <em>p</em><sub>1</sub>
+latency, <em>p</em><sub>2</sub> latency), nominally 6&times;4&times;6&nbsp;=&nbsp;144
+cells. Parents are drawn <em>uniformly over occupied cells</em>, not proportionally to VFS;
+this is what keeps behaviorally distinct designs alive and matters in Section VII. The
+offline arm perturbs exactly two of eight template parameters of the seed TAGE per
+proposal, clipped to declared ranges. It changes no algorithm: the source diff between the
+seed and any offline descendant is the struct name.</p>
+
+<h3>E. Tiers</h3>
+<p>Tier&nbsp;0 scores every proposal on all 126 inner traces. Tier&nbsp;1 re-expresses the
+best designs against ChampSim and requires conditional MPKI agreement within tolerance.
+Tier&nbsp;2 promotes one design per generation to gem5 and sweeps depth.</p>
+
+<h2>VI.&ensp;Experimental Setup</h2>
+<p class="first">We ran eleven generations (0&ndash;10), three variants per generation, on
+the official 168-trace CBP-NG set split 126 inner / 42 held out, with every trace run to its
+end and 10<sup>6</sup> warm-up instructions. Thirty-one designs were proposed; 29 scored and
+two failed at the run stage. Eleven designs reached Tier&nbsp;1 and ten reached
+Tier&nbsp;2. Generations 0&ndash;2 ran on four <span class="m">t2d-standard-8</span> cloud
+VMs plus a local pool; generations 3&ndash;10 ran on a single workstation with 16 concurrent
+CBP-NG slots, resumed from the generation-2 archive. Because MAP-Elites' search state is the
+archive, and each archived elite stores its own template-parameter vector, the parameter
+walk continues across that boundary; we verified this directly, and every generation-3
+variant is two parameters from its parent rather than from the seed.</p>
+
+<div class="note"><strong>All VFS values reported here are in-sample.</strong> The 42
+held-out traces have not been scored, and no claim in this paper is a generalization
+claim.</div>
+
+<h2>VII.&ensp;Results</h2>
+
+<h3>A. Finding 1: VFS tracks throughput, not accuracy</h3>
+<p>Over the 29 scored designs (Table II), VFS correlates strongly with prediction
+throughput and with first-level latency, weakly with energy, and <em>not at all</em> with
+accuracy&mdash;despite MPKI spanning a factor of two, from 5.08 to 10.09. This is not a
+small-sample effect; it is Equation (2) made visible.</p>
+
+<div class="tw">
+<div class="tcap"><span class="tno">Table II</span><br>Pearson correlation with VFS over 29 scored designs.</div>
+<table>
+<thead><tr><th>Quantity</th><th class="n">r</th><th>Interpretation</th></tr></thead>
+<tbody>
+<tr><td>Throughput <em>T</em></td><td class="n">+0.890</td><td>the objective</td></tr>
+<tr><td><em>p</em><sub>1</sub> latency</td><td class="n">&minus;0.833</td><td>the cost of throughput</td></tr>
+<tr><td>EPI</td><td class="n">&minus;0.624</td><td>weighted by &rho; = 0.05</td></tr>
+<tr><td><em>p</em><sub>2</sub> latency</td><td class="n">&minus;0.192</td><td>hidden behind <em>p</em><sub>1</sub></td></tr>
+<tr class="hi"><td>MPKI</td><td class="n">&minus;0.024</td><td>no signal</td></tr>
+</tbody></table>
+</div>
+
+<p>The best design found, <span class="m">gen007_2</span> at VFS&nbsp;=&nbsp;0.9256, is the
+seed with two parameters changed: the fetch-line width <span class="m">LOGLB</span>
+6&nbsp;&rarr;&nbsp;7, which doubles delivered predictions per cycle from 16 to 32, and
+<span class="m">LOGB</span> 12&nbsp;&rarr;&nbsp;11, which merely rebalances the bimodal
+index. It is <em>not</em> more accurate than the seed&mdash;MPKI rises from 5.338 to
+5.462&mdash;and it is not larger, at 34.5&nbsp;KiB against the seed's 35.0&nbsp;KiB. It is
+simply wider. Conversely the most accurate design found, <span class="m">gen010_2</span> at
+MPKI&nbsp;=&nbsp;5.084, spends 72.25&nbsp;KiB, more than twice the seed, and scores
+VFS&nbsp;=&nbsp;0.7444: second worst among archived elites.</p>
+
+<p>A single derived parameter explains the accuracy axis. The number of hashed tag bits is
+<em>H</em>&nbsp;=&nbsp;<span class="m">TAGW</span>&nbsp;&minus;&nbsp;(<span class="m">LOGLB</span>&nbsp;&minus;&nbsp;2),
+and MPKI is a step function of it: designs with <em>H</em>&nbsp;&ge;&nbsp;6 average 5.4
+MPKI, designs with <em>H</em>&nbsp;&le;&nbsp;5 average 9.5, and nothing lands between. Tag
+aliasing is a cliff, not a slope.</p>
+
+<h3>B. Finding 2: the gem5 tier does not discriminate</h3>
+<p>Across the ten designs promoted to Tier&nbsp;2, gem5 core IPC at the shipped depth spans
+0.8867&ndash;0.8912: a total spread of 0.51%. Tier&nbsp;2 as configured cannot separate
+these designs, and this must be stated before any correlation computed on it is
+believed.</p>
+<p>It is worth showing why. Regressing Tier-1 MPKI against gem5 depth-9 IPC over all ten
+designs gives r&nbsp;=&nbsp;&minus;0.908, which reads as strong cross-simulator agreement.
+Removing the single outlier <span class="m">gen005_0</span> (Tier-1 MPKI&nbsp;=&nbsp;16.15,
+the only design far from the pack) collapses it to &minus;0.420. Removing one further point,
+<span class="m">gen008_1</span>, <em>inverts</em> it to +0.884. A correlation that changes
+sign on the removal of two of ten points is not evidence of anything. We report it because
+the per-generation &tau;(VFS,&nbsp;IPC)&nbsp;=&nbsp;+1.00 printed by our own harness is
+likewise degenerate&mdash;it is computed over the single design promoted per
+generation&mdash;and should not be quoted.</p>
+
+<h3>C. Finding 3: depth robustness is governed by accuracy</h3>
+<p>We rank the seven archived elites by VFS at each depth and compare against the shipped
+depth of nine by Kendall's &tau; over all 21 pairs (Table III). The ranking is exactly
+stable to depth twelve and then degrades.</p>
+
+<div class="tw">
+<div class="tcap"><span class="tno">Table III</span><br>Rank agreement of the seven-elite
+ordering at depth <em>D</em> against the ordering at the shipped depth <em>D</em> = 9.</div>
+<table>
+<thead><tr><th class="n"><em>D</em></th><th class="n">&tau;</th><th class="n">Disc.</th><th>Pairs involved</th></tr></thead>
+<tbody>
+<tr><td class="n">3, 6, 9, 12</td><td class="n">+1.000</td><td class="n">0</td><td>&mdash;</td></tr>
+<tr><td class="n">16</td><td class="n">+0.905</td><td class="n">1</td><td>all <span class="m">gen006_2</span></td></tr>
+<tr><td class="n">20</td><td class="n">+0.714</td><td class="n">3</td><td>all <span class="m">gen006_2</span></td></tr>
+<tr><td class="n">25, 30</td><td class="n">+0.619</td><td class="n">4</td><td>all <span class="m">gen006_2</span></td></tr>
+</tbody></table>
+</div>
+
+<p>The decay is not diffuse. <em>Every</em> discordant pair, at every depth, has
+<span class="m">gen006_2</span> on one side. Remove that one design and
+&tau;&nbsp;=&nbsp;+1.000 at all eight depths. And <span class="m">gen006_2</span> is
+precisely the archived elite with high MPKI: 9.220 against 5.08&ndash;5.46 for the other
+six. Its tag width was cut to <span class="m">TAGW</span>&nbsp;=&nbsp;8, giving
+<em>H</em>&nbsp;=&nbsp;4 hashed tag bits and eight times the tag aliasing of the seed, while
+its first-level gshare was doubled&mdash;accuracy traded for bandwidth.</p>
+
+<figure>
+<svg viewBox="0 0 344 196" role="img" aria-label="VFS against pipeline depth for four archived elites">
+<line x1="46" y1="152.5" x2="334" y2="152.5" stroke="var(--grid)" stroke-width=".5"/><text x="40" y="155.5" text-anchor="end" class="tk">0.50</text><line x1="46" y1="125.5" x2="334" y2="125.5" stroke="var(--grid)" stroke-width=".5"/><text x="40" y="128.5" text-anchor="end" class="tk">0.60</text><line x1="46" y1="98.5" x2="334" y2="98.5" stroke="var(--grid)" stroke-width=".5"/><text x="40" y="101.5" text-anchor="end" class="tk">0.70</text><line x1="46" y1="71.4" x2="334" y2="71.4" stroke="var(--grid)" stroke-width=".5"/><text x="40" y="74.4" text-anchor="end" class="tk">0.80</text><line x1="46" y1="44.4" x2="334" y2="44.4" stroke="var(--grid)" stroke-width=".5"/><text x="40" y="47.4" text-anchor="end" class="tk">0.90</text><line x1="46" y1="17.4" x2="334" y2="17.4" stroke="var(--grid)" stroke-width=".5"/><text x="40" y="20.4" text-anchor="end" class="tk">1.00</text><line x1="46.0" y1="12" x2="46.0" y2="166" stroke="var(--grid)" stroke-width=".5"/><text x="46.0" y="178" text-anchor="middle" class="tk">3</text><line x1="78.0" y1="12" x2="78.0" y2="166" stroke="var(--grid)" stroke-width=".5"/><text x="78.0" y="178" text-anchor="middle" class="tk">6</text><line x1="110.0" y1="12" x2="110.0" y2="166" stroke="var(--grid)" stroke-width=".5"/><text x="110.0" y="178" text-anchor="middle" class="tk">9</text><line x1="142.0" y1="12" x2="142.0" y2="166" stroke="var(--grid)" stroke-width=".5"/><text x="142.0" y="178" text-anchor="middle" class="tk">12</text><line x1="184.7" y1="12" x2="184.7" y2="166" stroke="var(--grid)" stroke-width=".5"/><text x="184.7" y="178" text-anchor="middle" class="tk">16</text><line x1="227.3" y1="12" x2="227.3" y2="166" stroke="var(--grid)" stroke-width=".5"/><text x="227.3" y="178" text-anchor="middle" class="tk">20</text><line x1="280.7" y1="12" x2="280.7" y2="166" stroke="var(--grid)" stroke-width=".5"/><text x="280.7" y="178" text-anchor="middle" class="tk">25</text><line x1="334.0" y1="12" x2="334.0" y2="166" stroke="var(--grid)" stroke-width=".5"/><text x="334.0" y="178" text-anchor="middle" class="tk">30</text><path d="M46.0,18.3 L78.0,27.3 L110.0,37.5 L142.0,48.1 L184.7,62.0 L227.3,75.2 L280.7,90.5 L334.0,104.2" fill="none" stroke="var(--s1)" stroke-width="1.8" stroke-linejoin="round"/><path d="M46.0,35.8 L78.0,46.4 L110.0,56.7 L142.0,66.7 L184.7,79.2 L227.3,90.8 L280.7,104.0 L334.0,115.7" fill="none" stroke="var(--s2)" stroke-width="1.4" stroke-dasharray="5 3" stroke-linejoin="round"/><path d="M46.0,39.7 L78.0,58.1 L110.0,75.4 L142.0,91.0 L184.7,109.3 L227.3,125.0 L280.7,141.4 L334.0,155.1" fill="none" stroke="var(--neg)" stroke-width="2.4" stroke-linejoin="round"/><path d="M46.0,68.3 L78.0,77.7 L110.0,86.5 L142.0,94.7 L184.7,104.9 L227.3,114.3 L280.7,124.8 L334.0,134.3" fill="none" stroke="var(--s3)" stroke-width="1.4" stroke-dasharray="1.5 2.5" stroke-linejoin="round"/>
+<circle cx="163.3" cy="98.0" r="3.6" fill="none" stroke="var(--neg)" stroke-width="1.2"/>
+<text x="170.3" y="93.0" class="tk" fill="var(--neg)">crossing</text>
+<text x="190" y="192" text-anchor="middle" class="ax">pipeline depth D</text>
+<text x="12" y="89" text-anchor="middle" class="ax" transform="rotate(-90 12 89)">VFS</text>
+</svg>
+<div class="leg">
+<span class="sw" style="border-top:2px solid var(--s1)"></span>gen007_2 (best, MPKI 5.46)&emsp;
+<span class="sw" style="border-top:2px dashed var(--s2)"></span>gen009_0 (MPKI 5.20)<br>
+<span class="sw" style="border-top:3px solid var(--neg)"></span>gen006_2 (MPKI 9.22)&emsp;
+<span class="sw" style="border-top:2px dotted var(--s3)"></span>gen010_2 (MPKI 5.08)
+</div>
+<figcaption><strong>Fig. 1.</strong> VFS against pipeline depth for four archived elites.
+<span class="m">gen006_2</span> starts above <span class="m">gen010_2</span> and ends below
+it: the steep slope is mpi&nbsp;&middot;&nbsp;<em>D</em> in Equation (5). All ranking
+instability in Table III is this one crossing family.</figcaption>
+</figure>
+
+<p>By Equation (5), <em>C</em> scales with mpi&nbsp;&middot;&nbsp;<em>D</em>. A design with
+1.7&times; the misprediction rate loses ground 1.7&times; faster as <em>D</em> grows, so it
+must eventually cross the others; depth 16 is where it does. Depth robustness is thus a
+direct function of accuracy&mdash;and accuracy is exactly the quantity Finding 1 shows the
+depth-nine score does not measure. The score is blind to the property that determines
+whether its own ranking survives.</p>
+
+<h3>D. The archive</h3>
+<p>Seven of 144 nominal cells are occupied, which reads as 4.9% coverage and invites the
+conclusion that the search barely explored. That conclusion is wrong, and the correct one is
+more interesting. Across all 29 designs, only two EPI bands, two <em>p</em><sub>1</sub>
+values and two <em>p</em><sub>2</sub> values were ever realized: the <em>reachable</em>
+sub-grid is 2&times;2&times;2&nbsp;=&nbsp;8 cells, and the search occupies seven of them.
+The grid is mis-specified for this design space&mdash;four of six EPI bands lie below any
+achievable predictor energy&mdash;rather than under-explored. Notably,
+<span class="m">gen006_2</span> scores <em>worse</em> than the seed (0.7855 vs. 0.8784) and
+survives only because it occupies a different cell. The design that breaks the depth ranking
+entered the archive through the diversity mechanism, not through the score.</p>
+
+<h2>VIII.&ensp;Threats to Validity</h2>
+<p class="first"><em>In-sample scores.</em> Every VFS here is measured on the 126 traces the
+search optimized against. The 42 held-out traces remain unscored.</p>
+<p><em>One seed, one operator.</em> The offline arm resizes tables; it cannot invent an
+algorithm. Findings 1 and 3 concern the metric's response to a population, and that
+population is a parameter family. A structurally different predictor could move
+<em>p</em><sub>2</sub> or EPI into regions we never reached.</p>
+<p><em>Tier-2 configuration, not gem5.</em> Finding 2 is a statement about our gem5
+configuration&mdash;5&times;10<sup>6</sup> instructions, one promoted design per generation,
+SE-mode workloads&mdash;not about gem5's capability. A longer window or a wider promotion
+budget could well restore discrimination.</p>
+<p><em>Small elite set.</em> Table III rests on seven elites and 21 pairs. The attribution
+to <span class="m">gen006_2</span> is unambiguous within this set, but the set is small.</p>
+
+<h2>IX.&ensp;Conclusions</h2>
+<p class="first">VFS is a considerable improvement on ranking predictors by misprediction
+rate, but as an optimization target it behaves as a throughput metric with minor
+corrections. An automated search given VFS alone finds width, not accuracy: the best design
+we found is the seed with a wider fetch line and slightly worse MPKI. Because CBP-NG assumes
+a fixed nine-stage penalty, and because misprediction cost is the only depth-dependent term,
+the score is structurally blind to the one property&mdash;accuracy&mdash;that decides whether
+its ranking survives a deeper machine. A single high-MPKI design accounts for every rank
+inversion we observed. We suggest that cost-aware predictor metrics be reported at more than
+one depth, which the re-scoring identity of Equation (5) makes nearly free, and that
+automated searches over such metrics report which term is actually carrying the
+optimizer.</p>
+
+<h2>References</h2>
+<div class="refs">
+<ol>
+<li>A. Seznec and P. Michaud, &ldquo;A case for (partially) tagged geometric history length
+branch prediction,&rdquo; <em>J. Instruction-Level Parallelism</em>, vol. 8, 2006.</li>
+<li>A. Seznec, &ldquo;A new case for the TAGE branch predictor,&rdquo; in <em>Proc.
+MICRO</em>, 2011.</li>
+<li>N. Binkert <em>et al.</em>, &ldquo;The gem5 simulator,&rdquo; <em>ACM SIGARCH Comput.
+Archit. News</em>, vol. 39, no. 2, 2011.</li>
+<li>N. Gober <em>et al.</em>, &ldquo;The Championship Simulator: Architectural simulation
+for education and competition,&rdquo; arXiv:2210.14324, 2022.</li>
+<li>A. Akram and L. Sawalha, &ldquo;A survey of computer architecture simulation techniques
+and tools,&rdquo; <em>IEEE Access</em>, vol. 7, 2019.</li>
+<li>J.-B. Mouret and J. Clune, &ldquo;Illuminating search spaces by mapping elites,&rdquo;
+arXiv:1504.04909, 2015.</li>
+<li>A. Cully, J. Clune, D. Tarapore and J.-B. Mouret, &ldquo;Robots that can adapt like
+animals,&rdquo; <em>Nature</em>, vol. 521, 2015.</li>
+</ol>
+</div>
+
+</div>
+<div class="foot">Generated from sweep <span class="m">bp_evolve</span>, generations
+0&ndash;10 &middot; CBP-NG &middot; ChampSim &middot; gem5 &middot; CHIA</div>
+</div>

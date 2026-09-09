@@ -1,0 +1,148 @@
+// Where the port-fidelity check sits in the sweep, and what it compares.
+//
+// Render:  dot -Tpng -Gdpi=140 docs/port_fidelity.dot -o docs/port_fidelity.png
+//
+// The one thing the picture is for: ports/tage_core.h.in feeds three
+// consumers, and the self-check is the only one of them whose number can be
+// compared to Tier 0 with no simulator standing in the way.
+//
+// The driver appears as two boxes -- proposal and gate -- because those are
+// two stages of the same loop, not two machines. Both run in
+// bp_evolve_loop.py on the machine that submits the jobs.
+
+digraph port_fidelity {
+    rankdir=TB;
+    bgcolor="white";
+    newrank=true;
+    compound=true;
+    nodesep=0.40;
+    ranksep=0.55;
+    fontname="Helvetica";
+    node [shape=box, style="filled,rounded", fontname="Helvetica",
+          fontsize=11, margin="0.18,0.11", color="#94a3b8", penwidth=1.2];
+    edge [fontname="Helvetica", fontsize=9, color="#475569", penwidth=1.1,
+          arrowsize=0.8];
+
+    // ------------------------------------------------------- driver, part 1
+    subgraph cluster_design {
+        label=<<b>driver</b>  ·  propose>;
+        fontname="Helvetica"; fontsize=13; fontcolor="#1e3a8a";
+        style="rounded"; color="#93c5fd"; bgcolor="#eff6ff"; penwidth=1.5;
+
+        design [label=<<b>agents.offline_design</b><br/><font point-size="9">mutates 2 of 8 template parameters<br/>→ template_args &quot;6,8,11,12,11,100,14,6&quot;</font>>,
+                fillcolor="#dbeafe"];
+
+        core [label=<<b>ports/tage_core.h.in</b><br/><font point-size="9">the algorithm, written once</font>>,
+              fillcolor="#fef9c3", color="#eab308", penwidth=2.2];
+
+        adapters [label=<<b>agents.offline_port</b><br/><font point-size="9">tage_champsim.h.in · tage_gem5.{hh,cc}.in<br/>~40-line adapters over the core</font>>,
+                  fillcolor="#dbeafe"];
+    }
+
+    // --------------------------------------------------------------- tier 0
+    subgraph cluster_t0 {
+        label=<<b>Tier 0</b>  ·  cbp_ng worker>;
+        fontname="Helvetica"; fontsize=13; fontcolor="#166534";
+        style="rounded"; color="#86efac"; bgcolor="#f0fdf4"; penwidth=1.5;
+
+        t0run [label=<<b>run_fn_tier0</b>  ·  HARCOM<br/><font point-size="9">predictors/tage.hpp at the same params<br/>per-trace counters → vfs.aggregate</font>>,
+               fillcolor="#dcfce7"];
+        t0mpki [label=<<b>Tier-0 MPKI</b><br/><font point-size="9">unweighted mean of the per-trace rates</font>>,
+                fillcolor="#bbf7d0", color="#16a34a", penwidth=1.8];
+    }
+
+    // --------------------------------------------------------------- tier 1
+    subgraph cluster_t1 {
+        label=<<b>Tier 1</b>  ·  champsim worker>;
+        fontname="Helvetica"; fontsize=13; fontcolor="#9a3412";
+        style="rounded"; color="#fdba74"; bgcolor="#fff7ed"; penwidth=1.5;
+
+        t1run [label=<<b>run_fn_tier1</b>  ·  ChampSim<br/><font point-size="9">conditional MPKI, ROB occupancy at mispredict<br/>window = TIER1_SIM_INSTRUCTIONS</font>>,
+               fillcolor="#ffedd5"];
+        loopwarn [label=<<font point-size="9"><b>wrap detector</b><br/>ChampSim reopens a trace it runs off the end of.<br/>TIER1_LOOP_MARKER in the log ⇒ that MPKI is<br/>about the window, not the predictor.</font>>,
+                  fillcolor="#ffedd5", style="filled,rounded,dashed"];
+    }
+
+    // ------------------------------------------------------- driver, part 2
+    subgraph cluster_gate {
+        label=<<b>driver</b>  ·  port-fidelity gate  —  no simulator on either side>;
+        fontname="Helvetica"; fontsize=13; fontcolor="#1e3a8a";
+        style="rounded"; color="#93c5fd"; bgcolor="#eff6ff"; penwidth=1.5;
+
+        hosttraces [label=<<b>_tier0_host_traces</b><br/><font point-size="9">ev.tier0.counters names → driver paths<br/>(a bind mount has two names)</font>>,
+                    fillcolor="#dbeafe"];
+
+        selfcheck [label=<<b>_port_selfcheck</b> → tools/port_selfcheck.py<br/><font point-size="9">renders the SAME core · g++ -O2 · runs<br/>tools/tage_selfcheck.cpp over Tier 0's own traces,<br/>same warmup, same window · ≈1 s per trace<br/>cached on template_args</font>>,
+                   fillcolor="#fee2e2", color="#dc2626", penwidth=2.2];
+
+        fallback [label=<<i>fallback</i>  ·  _port_baseline<br/><font point-size="9">Tier-1/Tier-0 ratio. Reached only when there are no<br/>template args to render (the LLM arm writes HARCOM<br/>directly). Weaker — it compares two harnesses too.</font>>,
+                  fillcolor="#f1f5f9", style="filled,rounded,dashed"];
+
+        gate [label=<<b>check_port_fidelity</b><br/><font point-size="9">| ported ÷ Tier-0 − 1 | ≤ PORT_SELFCHECK_TOLERANCE (10%)</font>>,
+              shape=box, fillcolor="#fecaca", color="#dc2626", penwidth=2.2];
+    }
+
+    // --------------------------------------------------------------- tier 2
+    subgraph cluster_t2 {
+        label=<<b>Tier 2</b>  ·  gem5 worker>;
+        fontname="Helvetica"; fontsize=13; fontcolor="#5b21b6";
+        style="rounded"; color="#c4b5fd"; bgcolor="#f5f3ff"; penwidth=1.5;
+
+        t2run [label=<<b>run_fn_tier2</b>  ·  gem5 O3 depth sweep<br/><font point-size="9">IPC at each depth → Kendall tau against VFS</font>>,
+               fillcolor="#ede9fe"];
+    }
+
+    reject [label=<<b>Failure.PORT_MISMATCH</b><br/><font point-size="9">recorded in the lineage DB; no Tier 2</font>>,
+            fillcolor="#fecaca", color="#dc2626", penwidth=1.8];
+
+    // ---------------------------------------------------------------- edges
+    design -> t0run    [label=" build_fn "];
+    design -> core     [label=" template_args "];
+    core   -> adapters;
+    adapters -> t1run  [label=" build_fn "];
+
+    core   -> selfcheck [label=<  <b>same file, same params</b>  >,
+                         color="#dc2626", fontcolor="#b91c1c", penwidth=2.2];
+
+    t0run  -> t0mpki;
+    t0run  -> hosttraces [label=" which traces,\l by name \l", style=dashed];
+    hosttraces -> selfcheck [label=" the same traces "];
+
+    t1run -> loopwarn [style=dashed, arrowhead=none];
+    // The gate is invoked from result_mapper_fn under `if t1 and t1.ran`, so
+    // a --no-tier1 sweep never reaches it. Tier 1 decides *whether* the check
+    // happens; it no longer supplies the number the check is made of.
+    t1run -> gate [label=" the gate runs only\l once Tier 1 has\l (result_mapper_fn)\l",
+                   style=dotted, color="#94a3b8", fontcolor="#64748b",
+                   arrowhead=vee, arrowsize=0.6];
+    t1run -> fallback [style=dashed, color="#94a3b8"];
+    fallback -> gate  [style=dashed, color="#94a3b8"];
+
+    selfcheck -> gate [label=<  <b>ported MPKI</b>  >, color="#dc2626",
+                       fontcolor="#b91c1c", penwidth=2.2];
+    t0mpki    -> gate [label=<  <b>Tier-0 MPKI</b>  >, color="#16a34a",
+                       fontcolor="#15803d", penwidth=2.2];
+
+    gate -> t2run  [label=<  <b>pass</b>  →  promote_to_tier2  >,
+                    color="#16a34a", fontcolor="#15803d", penwidth=1.6];
+    gate -> reject [label=<  <b>fail</b>  >, color="#dc2626",
+                    fontcolor="#b91c1c", penwidth=1.6];
+
+    // ------------------------------------------------------------- the point
+    note [shape=note, fillcolor="#fffbeb", color="#f59e0b", penwidth=1.6,
+          fontsize=10,
+          label=<<b>Why the gate runs on the driver</b><br align="left"/>
+<font point-size="10"><br align="left"/>
+Comparing Tier-1 MPKI against Tier-0 MPKI compares two<br align="left"/>
+<i>harnesses</i> as well as two predictors — and the harnesses win.<br align="left"/>
+That ratio read 0.702 on the seed and moved between 0.48 and<br align="left"/>
+0.82 across designs, because ChampSim had looped the trace 13×.<br align="left"/>
+<br align="left"/>
+Rendering the core and running it over Tier 0's own traces and<br align="left"/>
+window leaves exactly one difference: CBP-NG advances its global<br align="left"/>
+history once per prediction <i>block</i>, the port once per <i>branch</i>.<br align="left"/>
+<br align="left"/>
+<b>Measured: 2–6%, one-sided, stable across a 2.3× MPKI spread.</b><br align="left"/></font>>];
+
+    reject -> note [style=invis];
+}

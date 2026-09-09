@@ -1,0 +1,74 @@
+#include "cpu/pred/evolved_bp.hh"
+
+#include "base/trace.hh"
+
+namespace gem5
+{
+namespace branch_prediction
+{
+
+EvolvedBP::EvolvedBP(const EvolvedBPParams &params)
+    : ConditionalPredictor(params)
+{}
+
+bool
+EvolvedBP::lookup(ThreadID tid, Addr pc, void *&bp_history)
+{
+    BPHistory *h = new BPHistory;
+    h->hist = core.hist;                 // snapshot before anything speculative
+    h->lk = core.predict(pc);
+    h->pred = h->lk.final_pred;
+    bp_history = static_cast<void *>(h);
+    return h->pred;
+}
+
+void
+EvolvedBP::updateHistories(ThreadID tid, Addr pc, bool uncond, bool taken,
+                           Addr target, const StaticInstPtr &inst,
+                           void *&bp_history)
+{
+    // An unconditional branch never reaches lookup(), so it has no history
+    // entry yet -- but it does end a prediction block in the original, so it
+    // must still advance the history.
+    if (bp_history == nullptr) {
+        BPHistory *h = new BPHistory;
+        h->hist = core.hist;
+        h->uncond = true;
+        h->pred = true;
+        bp_history = static_cast<void *>(h);
+    }
+    core.advance(taken ? target : (pc + 4));
+}
+
+void
+EvolvedBP::squash(ThreadID tid, void *&bp_history)
+{
+    BPHistory *h = static_cast<BPHistory *>(bp_history);
+    // Roll the speculative history back to what it was before this branch.
+    // Tables are untouched here: nothing has been written to them yet.
+    core.hist = h->hist;
+    delete h;
+    bp_history = nullptr;
+}
+
+void
+EvolvedBP::update(ThreadID tid, Addr pc, bool taken, void *&bp_history,
+                  bool squashed, const StaticInstPtr &inst, Addr target)
+{
+    BPHistory *h = static_cast<BPHistory *>(bp_history);
+    if (h == nullptr) return;
+
+    if (squashed) {
+        // Called on the mispredicting branch before it retires; the tables are
+        // trained at commit, so there is nothing to do but leave the history
+        // entry alive for the squash() that follows.
+        return;
+    }
+
+    if (!h->uncond) core.update(h->lk, taken);
+    delete h;
+    bp_history = nullptr;
+}
+
+} // namespace branch_prediction
+} // namespace gem5

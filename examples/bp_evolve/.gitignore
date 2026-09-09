@@ -1,0 +1,11 @@
+out/
+__pycache__/
+
+# Build products: the converter binary and the statically linked SE-mode
+# workloads. Both are rebuilt by a documented one-liner (see README, "Before
+# the first cluster run"); a 780 KB static binary per workload does not belong
+# in the repo.
+tools/cbp2champsim
+gem5/workloads/bsearch
+gem5/workloads/sort
+gem5/workloads/dijkstra

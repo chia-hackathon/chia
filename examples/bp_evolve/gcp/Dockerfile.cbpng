@@ -1,0 +1,25 @@
+# bpe-cbpng, rebuilt on the VM instead of pushed to it.
+#
+# This is the whole difference between the stock Ray image and the Tier-0
+# worker: gcc 12. cbp-ng is C++20 and the 2.54.0-cpu image ships gcc 11, which
+# will not build HARCOM.
+#
+# Rebuilding beats pushing. The image `docker build` produces here is 3.7 GB,
+# of which 3.4 GB is the public Ray base the VM can pull from Docker Hub at
+# in-cloud bandwidth; only the 283 MB apt layer is actually ours. Pushing the
+# assembled image from home would move all 3.7 GB up a domestic uplink, and
+# there would then be a registry to keep in sync with this file. The apt-get
+# takes about a minute on a t2d.
+#
+# The base tag is pinned, and it has to be: the driver on the head runs
+# ray 2.54.0, and Ray refuses to join a worker whose version differs.
+FROM rayproject/ray:2.54.0-cpu
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        g++-12 gcc-12 zlib1g-dev make git \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100 \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100
+USER ray
