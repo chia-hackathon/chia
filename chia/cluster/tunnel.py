@@ -19,6 +19,22 @@ def _pid_file(key: str) -> str:
     return os.path.join(_PID_DIR, f"chia_tunnel_{safe_key}.pid")
 
 
+def _log_file(key: str) -> str:
+    """Where a tunnel's ssh stderr goes.
+
+    NOT a pipe.  A tunnel outlives the ``chia up`` process that spawned it,
+    so a ``stderr=PIPE`` nobody drains is a live grenade: once ``chia up``
+    exits the read end is closed, and the next line ssh writes to stderr --
+    a routine "channel N: open failed: connect failed: Connection refused"
+    is enough -- kills it with SIGPIPE.  The tunnel dies, the remote raylet
+    loses its only route to the GCS, and ~10 minutes later the node is gone
+    from the cluster with nothing in any log to say why.  Observed on the
+    bp_evolve GCP run: three tunnels dead, exactly the three dead raylets.
+    """
+    safe_key = key.replace(".", "-")
+    return os.path.join(_PID_DIR, f"chia_tunnel_{safe_key}.log")
+
+
 def _kill_orphaned_tunnel(ip: str, tunnel_ip: str | None = None,
                           gcs_port: int | None = None) -> None:
     """Kill any leftover SSH tunnel process for *ip*.
@@ -86,6 +102,17 @@ def _kill_orphaned_tunnel(ip: str, tunnel_ip: str | None = None,
             pass
 
 
+def _tail_log(tunnel_ip: str, n: int = 4000) -> str:
+    """Last *n* bytes of a tunnel's ssh stderr log, for error messages."""
+    try:
+        with open(_log_file(tunnel_ip), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - n))
+            return f.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
 class TunnelManager:
     """Manages SSH tunnels for cross-network Ray cluster connectivity.
 
@@ -148,7 +175,7 @@ class TunnelManager:
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "LogLevel=ERROR",
             "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
+            "-o", "ServerAliveCountMax=6",
             "-o", "ExitOnForwardFailure=yes",
         ]
         if ssh_auth.ssh_proxy_command:
@@ -206,11 +233,20 @@ class TunnelManager:
         logger.info(f"Starting SSH tunnel {tunnel_ip} -> {ip}")
         logger.debug(f"Tunnel command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        log_path = _log_file(tunnel_ip)
+        # Line-buffered append, inherited by ssh as fd 2.  See _log_file().
+        err = open(log_path, "ab", buffering=0)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=err,
+                # Detach from chia's process group so a Ctrl-C in the parent
+                # terminal does not take the tunnels down with it.
+                start_new_session=True,
+            )
+        finally:
+            err.close()
         self._procs[tunnel_ip] = proc
 
         # Write PID file for cross-process cleanup
@@ -260,7 +296,7 @@ class TunnelManager:
                 logger.info(f"Tunnel {tunnel_ip} is alive (pid {proc.pid})")
                 return
             else:
-                stderr = proc.stderr.read().decode() if proc.stderr else ""
+                stderr = _tail_log(tunnel_ip)
                 raise RuntimeError(
                     f"Tunnel {tunnel_ip} exited with code {ret}. stderr: {stderr}"
                 )

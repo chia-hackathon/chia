@@ -30,6 +30,7 @@ available_node_types:
             image: "ghcr.io/ucb-bar/chia-claude-code:latest"
             container_name: "g5-claude-code-${USER}"
             pull_before_run: True
+            pull_timeout: 7200
             run_options:
                 - --ulimit nofile=65536:65536
                 - --shm-size=10.24gb
@@ -41,7 +42,7 @@ available_node_types:
                 - echo "user:x:$(id -u):$(id -g)::/home/ray:/bin/bash" >> /etc/passwd
                 # Empty working directory the Claude Code process chdirs into.
                 - mkdir -p /home/ray/llm_env
-        compatible_ips: # FILL
+        compatible_ips: ["${THIS_MACHINE}"]
 
     chisel_build:
         resources: {"chipyard": 2}
@@ -52,7 +53,7 @@ available_node_types:
             image: "ghcr.io/ucb-bar/chia-chisel-build:latest"
             container_name: "g5-chisel-build-${USER}"
             pull_before_run: True
-            pull_timeout: 3600
+            pull_timeout: 7200
             run_options:
                 - --ulimit nofile=65536:65536
                 - --shm-size=10.24gb
@@ -62,7 +63,7 @@ available_node_types:
                 - cd /home/ray/chipyard
                 - git -c submodule.recurse=false pull
                 - git submodule update --init generators/
-        compatible_ips: # FILL
+        compatible_ips: ["${THIS_MACHINE}"]
 
     verilator_run:
         resources: {"verilator_run": 10}
@@ -72,10 +73,11 @@ available_node_types:
             image: "ghcr.io/ucb-bar/chia-verilator-run:latest"
             container_name: "g5-verilator-run-${USER}"
             pull_before_run: True
+            pull_timeout: 7200
             run_options:
                 - --ulimit nofile=65536:65536
                 - --shm-size=10.24gb
-        compatible_ips: # FILL
+        compatible_ips: ["${THIS_MACHINE}"]
 
     gem5_worker:
         resources: {"gem5": 1}
@@ -85,6 +87,7 @@ available_node_types:
             image: "ghcr.io/ucb-bar/chia-gem5:latest"
             container_name: "g5-worker-${USER}"
             pull_before_run: True
+            pull_timeout: 7200
             run_options:
                 - --ulimit nofile=65536:65536
                 - --shm-size=10.24gb
@@ -92,14 +95,14 @@ available_node_types:
                 - "-v $SSH_AUTH_SOCK:/ssh-agent"
                 - "-e SSH_AUTH_SOCK=/ssh-agent"
 
-        compatible_ips: # FILL
+        compatible_ips: ["${THIS_MACHINE}"]
 
 provider:
-    head_ip: # FILL
+    head_ip: ${THIS_MACHINE}
 
 auth:
     ssh_user: ${USER}
-    # ssh_private_key: /path/to/private/key
+    ssh_private_key: ~/.ssh/id_ed25519
 
 
 head_setup_commands: ["source ~/.bashrc && conda activate gem5-align"]

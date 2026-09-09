@@ -92,6 +92,13 @@ _PLAIN_PRINTER_PREFIXES = (
 # ---------------------------------------------------------------------------
 
 
+# Module source directories a loop may edit.  Both capture and restore default
+# to this so a branch-predictor loop's edits under ``branch/`` are not silently
+# dropped from the lineage diff (which would make every child rebuild its
+# parent's source instead of its own).
+_MODULE_DIRS = ["prefetcher/", "branch/"]
+
+
 @dataclass
 class CachePrefetchStats:
     """Per-cache prefetch counters and derived quality metrics.
@@ -208,6 +215,16 @@ class ChampSimRunResult:
             (e.g. ``"L1D"``, ``"L2C"``, ``"LLC"``).
         branch_mispredictions: Per-type branch misprediction counts
             (e.g. ``"BRANCH_CONDITIONAL": 5``).
+        total_branch_mispredictions: Sum over all branch types.
+        branch_mpki: Branch mispredictions per kilo-instruction.  None when
+            ``instructions == 0``.  NOTE: ChampSim's JSON emits only
+            misprediction counts, not ``total_branch_types``, so the
+            misprediction *rate* (misses/branch) is not recoverable here --
+            only MPKI.  The plain-text printer has the rate.
+        avg_rob_occupancy_at_mispredict: Mean ROB occupancy when a branch
+            mispredict resolved -- a proxy for how much work each mispredict
+            squashed, and the main signal for whether a mispredict overlapped
+            a long-latency miss.  None when absent from the JSON.
         dram_stats: DRAM-level statistics (row buffer hits/misses,
             congestion cycles, etc.).
         custom_prefetch_stats: Key-value pairs extracted from custom
@@ -224,6 +241,9 @@ class ChampSimRunResult:
     cycles: int
     cache_stats: dict[str, CacheStats] = field(default_factory=dict)
     branch_mispredictions: dict[str, int] = field(default_factory=dict)
+    total_branch_mispredictions: int = 0
+    branch_mpki: float | None = None
+    avg_rob_occupancy_at_mispredict: float | None = None
     dram_stats: dict[str, float] = field(default_factory=dict)
     custom_prefetch_stats: dict[str, str] = field(default_factory=dict)
     success: bool = False
@@ -372,6 +392,20 @@ def _parse_champsim_json(
     mispredict = core0.get("mispredict", {})
     for k, v in mispredict.items():
         branch_mispredictions[k] = int(v)
+    total_branch_mispredictions = sum(branch_mispredictions.values())
+    branch_mpki = (
+        total_branch_mispredictions * 1000 / instructions
+        if instructions > 0 else None
+    )
+
+    # ChampSim writes this as a float, or NaN when there were no mispredicts.
+    avg_rob_occupancy = core0.get("Avg ROB occupancy at mispredict")
+    try:
+        avg_rob_occupancy = float(avg_rob_occupancy)
+        if avg_rob_occupancy != avg_rob_occupancy:   # NaN
+            avg_rob_occupancy = None
+    except (TypeError, ValueError):
+        avg_rob_occupancy = None
 
     # DRAM stats
     dram_stats: dict[str, float] = {}
@@ -431,6 +465,9 @@ def _parse_champsim_json(
         "cycles": cycles,
         "ipc": ipc,
         "branch_mispredictions": branch_mispredictions,
+        "total_branch_mispredictions": total_branch_mispredictions,
+        "branch_mpki": branch_mpki,
+        "avg_rob_occupancy_at_mispredict": avg_rob_occupancy,
         "dram_stats": dram_stats,
     }
 
@@ -728,27 +765,40 @@ if _HAS_RAY:
             prefetcher_src: str,
             module_name: str,
             *,
+            module_type: str = "prefetcher",
             cache_level: str = "L2C",
             timeout_s: int = 600,
             incremental: bool = False,
         ) -> ChampSimBuildResult:
-            """Build ChampSim with a custom prefetcher module.
+            """Build ChampSim with a custom prefetcher or branch predictor module.
 
             Writes ``prefetcher_src`` to
-            ``prefetcher/{module_name}/{module_name}.h``, generates a config
-            JSON targeting ``cache_level``, then runs
+            ``{module_type_dir}/{module_name}/{module_name}.h``, generates a
+            config JSON naming that module, then runs
             ``make clean && config.sh && make``.  The compiled binary is read
             as bytes and embedded in the result so it can be shipped to any
             worker for simulation.
+
+            The config JSON shape differs by module type.  Prefetchers use a
+            flat per-cache key (``{"L2C": {"prefetcher": name}}``); branch
+            predictors are nested under the per-core ``ooo_cpu`` array
+            (``{"ooo_cpu": [{"branch_predictor": name}]}``).
 
             Args:
                 champsim_root: Path to the DPC4-ChampSim checkout on the
                     worker filesystem.
                 prefetcher_src: Complete C++ header source for the prefetcher
                     module (written as ``{module_name}.h``).
-                module_name: Identifier for the prefetcher (must match
+                module_name: Identifier for the module (must match
                     ``[a-zA-Z_][a-zA-Z0-9_]*``).
+                module_type: ``"prefetcher"`` (default) or ``"branch"``.
+                    Selects the source subdirectory and the config JSON shape.
+                    NOTE: with ``incremental=True`` the module named here must
+                    match what the worker image baked via ``config.sh``, or the
+                    module is referenced by nothing and the link silently
+                    produces a binary running the image's default module.
                 cache_level: Which cache level to attach the prefetcher to.
+                    Ignored when ``module_type="branch"``.
                     One of ``L1D``, ``L1I``, ``L2C``, ``LLC``, ``ITLB``,
                     ``DTLB``, ``STLB``.  Defaults to ``"L2C"``.
                 timeout_s: Maximum wall-clock seconds for the build before
@@ -774,15 +824,25 @@ if _HAS_RAY:
                     f"[a-zA-Z_][a-zA-Z0-9_]*"
                 )
 
-            # Validate cache_level against known ChampSim cache names.
-            _VALID_CACHE_LEVELS = {
-                "L1D", "L1I", "L2C", "LLC", "ITLB", "DTLB", "STLB",
-            }
-            if cache_level not in _VALID_CACHE_LEVELS:
+            # Validate module_type and map it to its source subdirectory.
+            _MODULE_SUBDIR = {"prefetcher": "prefetcher", "branch": "branch"}
+            if module_type not in _MODULE_SUBDIR:
                 raise ValueError(
-                    f"Invalid cache_level {cache_level!r}: must be one of "
-                    f"{sorted(_VALID_CACHE_LEVELS)}"
+                    f"Invalid module_type {module_type!r}: must be one of "
+                    f"{sorted(_MODULE_SUBDIR)}"
                 )
+
+            # Validate cache_level against known ChampSim cache names.  Only
+            # meaningful for prefetchers; branch predictors are per-core.
+            if module_type == "prefetcher":
+                _VALID_CACHE_LEVELS = {
+                    "L1D", "L1I", "L2C", "LLC", "ITLB", "DTLB", "STLB",
+                }
+                if cache_level not in _VALID_CACHE_LEVELS:
+                    raise ValueError(
+                        f"Invalid cache_level {cache_level!r}: must be one of "
+                        f"{sorted(_VALID_CACHE_LEVELS)}"
+                    )
 
             # Capture git HEAD before any changes.
             base_rev = ""
@@ -795,7 +855,7 @@ if _HAS_RAY:
             # to get the full struct definition; all method bodies are
             # inline so no separate .cc is needed.
             module_dir = os.path.join(
-                champsim_root, "prefetcher", module_name,
+                champsim_root, _MODULE_SUBDIR[module_type], module_name,
             )
             os.makedirs(module_dir, exist_ok=True)
             header_path = os.path.join(module_dir, f"{module_name}.h")
@@ -803,10 +863,18 @@ if _HAS_RAY:
                 f.write(prefetcher_src)
 
             # Generate config JSON with the specified cache level (Pitfall 4).
-            config = {
-                "executable_name": "champsim",
-                cache_level: {"prefetcher": module_name},
-            }
+            if module_type == "branch":
+                # Branch predictors are per-core: nested under ooo_cpu[0],
+                # NOT a flat top-level key like prefetchers.
+                config = {
+                    "executable_name": "champsim",
+                    "ooo_cpu": [{"branch_predictor": module_name}],
+                }
+            else:
+                config = {
+                    "executable_name": "champsim",
+                    cache_level: {"prefetcher": module_name},
+                }
             config_fd, config_path = tempfile.mkstemp(
                 suffix=".json", prefix="champsim_config_",
             )
@@ -999,6 +1067,13 @@ if _HAS_RAY:
                         branch_mispredictions=core_info.get(
                             "branch_mispredictions", {},
                         ),
+                        total_branch_mispredictions=core_info.get(
+                            "total_branch_mispredictions", 0,
+                        ),
+                        branch_mpki=core_info.get("branch_mpki"),
+                        avg_rob_occupancy_at_mispredict=core_info.get(
+                            "avg_rob_occupancy_at_mispredict",
+                        ),
                         dram_stats=core_info.get("dram_stats", {}),
                         custom_prefetch_stats=custom,
                         success=True,
@@ -1043,13 +1118,13 @@ if _HAS_RAY:
                 champsim_root: Path to the DPC4-ChampSim checkout.
                 base_rev: Git commit to diff against.  Defaults to HEAD.
                 diff_paths: Paths to include in the diff (default:
-                    ``["prefetcher/"]``).
+                    ``["prefetcher/", "branch/"]``).
 
             Returns:
                 A :class:`ChampSimSourceState` that can be shipped to another
                 worker and applied with :meth:`restore_champsim_source_state`.
             """
-            paths = diff_paths or ["prefetcher/"]
+            paths = diff_paths or list(_MODULE_DIRS)
 
             if base_rev is None:
                 rev = _git(
@@ -1107,12 +1182,12 @@ if _HAS_RAY:
                 state: A :class:`ChampSimSourceState` from a prior
                     :meth:`capture_champsim_source_state` call.
                 restore_paths: Paths to reset and apply the diff to
-                    (default: ``["prefetcher/"]``).
+                    (default: ``["prefetcher/", "branch/"]``).
 
             Returns:
                 A ``(ok, message)`` tuple.  ``ok`` is True on success.
             """
-            paths = restore_paths or ["prefetcher/"]
+            paths = restore_paths or list(_MODULE_DIRS)
 
             if state.base_rev:
                 co = _git(

@@ -391,7 +391,7 @@ def parse_gcp_nodes(
         "machine_type", "count", "image", "zone", "disk_size_gb", "spot",
         "ssh_user", "ssh_private_key", "ssh_public_key", "use_os_login",
         "skip_default_setup", "setup_commands", "setup_timeout", "ssh_timeout",
-        "join_tailnet",
+        "join_tailnet", "service_account", "service_account_scopes",
     }
 
     for name, node_raw in gcp_raw.items():
@@ -423,6 +423,9 @@ def parse_gcp_nodes(
             ssh_private_key=node_raw.get("ssh_private_key"),
             ssh_public_key=node_raw.get("ssh_public_key"),
             use_os_login=node_raw.get("use_os_login", False),
+            service_account=node_raw.get("service_account"),
+            **({"service_account_scopes": node_raw["service_account_scopes"]}
+               if "service_account_scopes" in node_raw else {}),
             extra_args=extra_args,
             skip_default_setup=node_raw.get("skip_default_setup", False),
             setup_commands=node_raw.get("setup_commands", []),

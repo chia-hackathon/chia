@@ -228,7 +228,10 @@ class SSHClient:
                     return
                 if result.stderr.strip():
                     last_error = result.stderr.strip().splitlines()[-1]
-            except subprocess.TimeoutExpired:
+            except (subprocess.TimeoutExpired, SSHError):
+                # run() re-raises TimeoutExpired as SSHError, so catching only
+                # the former let the very first probe against a still-booting
+                # VM escape this loop and strand the `timeout` deadline unused.
                 last_error = "connection attempt timed out"
             if time.monotonic() >= deadline:
                 raise SSHError(

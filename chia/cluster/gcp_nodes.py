@@ -96,6 +96,14 @@ class GCPNodeConfig:
     ssh_private_key: str | None = None
     ssh_public_key: str | None = None   # else derive <ssh_private_key>.pub
     use_os_login: bool = False          # metadata-key path is the default
+    # Attach a service account so software on the instance can call Google APIs
+    # through Application Default Credentials. Without this GCP attaches none,
+    # and ADC on the box has nothing to use — a Vertex/Gemini worker would fail
+    # to authenticate. "default" resolves to the project's Compute Engine
+    # default service account.
+    service_account: str | None = None
+    service_account_scopes: list[str] = field(
+        default_factory=lambda: ["https://www.googleapis.com/auth/cloud-platform"])
     extra_args: dict[str, Any] = field(default_factory=dict)
     skip_default_setup: bool = False
     setup_commands: list[str] = field(default_factory=list)
@@ -455,6 +463,12 @@ def _build_instance(
         ),
     )
 
+    if cfg.service_account:
+        instance.service_accounts = [
+            cv.ServiceAccount(email=cfg.service_account,
+                              scopes=list(cfg.service_account_scopes))
+        ]
+
     if cfg.spot:
         instance.scheduling = cv.Scheduling(
             provisioning_model="SPOT",
@@ -476,6 +490,15 @@ def _build_instance(
 # ---------------------------------------------------------------------------
 # Provisioning
 # ---------------------------------------------------------------------------
+
+def _get_instance(client, project: str, zone: str, name: str):
+    """Return the instance, or None if it does not exist."""
+    from google.api_core import exceptions as _gexc
+    try:
+        return client.get(project=project, zone=zone, instance=name)
+    except _gexc.NotFound:
+        return None
+
 
 def provision_gcp_nodes(
     cluster_name: str,
@@ -515,6 +538,25 @@ def provision_gcp_nodes(
                     cluster_name, name, cfg, i, z, network, subnetwork,
                     ssh_user, default_ssh_private_key,
                 )
+                # Reuse an instance that is already there instead of inserting
+                # a duplicate. Bring-up fails for reasons that have nothing to
+                # do with the VMs -- a raylet evicted by a health check, a bad
+                # worker image -- and the fix is to run `chia up` again. Without
+                # this that retry dies on
+                #     409 ... instance 'chia-<cluster>-<type>-0' already exists
+                # and the only way forward is to delete healthy, fully set-up
+                # machines, which in a zone short on capacity may not come back.
+                # Note this instance is NOT added to `launched`, so the rollback
+                # below still only deletes what this call actually created.
+                existing = _get_instance(client, project, z, inst.name)
+                if existing is not None:
+                    if existing.status != "RUNNING":
+                        raise RuntimeError(
+                            f"{inst.name} exists but is {existing.status}, not "
+                            f"RUNNING; delete it or wait for it to start")
+                    logger.info(f"  Reusing existing {inst.name} (index {i})")
+                    entries_by_node[name].append((i, z, inst.name))
+                    continue
                 op = client.insert(project=project, zone=z, instance_resource=inst)
                 pending.append((op, name, z, i, inst.name))
                 launched.append((z, inst.name))
@@ -524,6 +566,8 @@ def provision_gcp_nodes(
         for op, name, z, i, inst_name in pending:
             _wait_op(op)
             entries_by_node[name].append((i, z, inst_name))
+        for name in entries_by_node:
+            entries_by_node[name].sort(key=lambda e: e[0])
 
     except Exception:
         if launched:

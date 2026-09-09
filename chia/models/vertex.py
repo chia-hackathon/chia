@@ -301,9 +301,32 @@ class VertexGeminiLLM(LLMCallBase):
                 return cli
 
             # -- Never retry: propagate immediately --
-            except (RateLimitError, AuthenticationError, InvalidRequestError,
+            # A bad key, a malformed request and blocked content are all
+            # permanent: the same call will fail the same way forever.
+            except (AuthenticationError, InvalidRequestError,
                     ContentBlockedError):
                 raise
+
+            # -- Retry with a long backoff: quota is transient by definition --
+            # This used to sit in the "never retry" group above, which is
+            # exactly backwards. A 429 is the one error where waiting IS the
+            # remedy, and grouping it with permanent failures made a fleet-wide
+            # condition fatal per episode: on 2026-09-02, 13 of 48 episodes
+            # (27%) died outright because 28 concurrent workers exceeded the
+            # Gemini request quota. Nothing was wrong with those episodes.
+            #
+            # The backoff is deliberately longer than the ServerError one: a
+            # quota window is measured in tens of seconds, and every worker
+            # that retries too eagerly is part of the reason the quota is
+            # exhausted.
+            except RateLimitError:
+                backoff = min(15 * 2 ** attempt, 240)
+                self.logger.warning(
+                    "Rate limited on attempt %d/%d, backing off %ds",
+                    attempt + 1, self.retries, backoff,
+                )
+                _time.sleep(backoff)
+                continue
 
             # -- Retry once: a shorter generation may fit --
             except MaxOutputTokensError:

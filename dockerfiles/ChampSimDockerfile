@@ -89,13 +89,21 @@ RUN cd /home/ray/champsim \
 # at runtime in Phase 2+ (D-07).
 COPY --chown=ray:ray chia/simulators/tests/traces/smoke.champsimtrace.gz /home/ray/champsim/test/traces/
 
+# Seed a placeholder branch predictor module so config.sh can bake the branch
+# module into the generated build environment.  Mirrors the evolved_pf pattern:
+# header-only with inline bodies, so no separate .cc is required.  Without this
+# the baked config would name the default `bimodal`, and a branch module written
+# at runtime would be referenced by nothing -- make would link a binary that
+# silently runs bimodal.
+COPY --chown=ray:ray dockerfiles/champsim_modules/branch/evolved_bp/evolved_bp.h /home/ray/champsim/branch/evolved_bp/evolved_bp.h
+
 # Build ChampSim with the evolved_pf module at L2C.  The evolved_pf prefetcher
 # (a next-line placeholder) is already in the repo.  The build system uses
 # split translation units (module_inst_*.cc) so incremental builds during
 # evolutionary search only recompile the single TU containing the prefetcher
 # header + relink (~30s vs ~15min for the monolithic generated_environment.cc).
 RUN cd /home/ray/champsim \
-    && echo '{"executable_name":"champsim","L2C":{"prefetcher":"evolved_pf"}}' > /tmp/champsim_config.json \
+    && echo '{"executable_name":"champsim","ooo_cpu":[{"branch_predictor":"evolved_bp"}],"L2C":{"prefetcher":"evolved_pf"}}' > /tmp/champsim_config.json \
     && python3 ./config.sh --no-compile-all-modules /tmp/champsim_config.json \
     && make -j$(nproc)
 
