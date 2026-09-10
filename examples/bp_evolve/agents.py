@@ -69,12 +69,18 @@ def extract_json(text: str) -> dict:
 # The LLM handle
 # ---------------------------------------------------------------------------
 
-def make_llm(logging_name: str = "bp_evolve_agent"):
+def make_llm(logging_name: str = "bp_evolve_agent", *, resume_session: bool = True):
     """One instance per lineage, reused across its repair rounds.
 
     Deliberately not shared across lineages: a design agent that remembers the
     last variant's failures is doing hill-climbing in its context window rather
     than in the archive, and the archive is the thing being measured.
+
+    ``resume_session=False`` gives a cold context on every call.  The bounds
+    agent uses it: its prompt already carries the full history of what was
+    asked for and what was refused, so a remembered session adds no
+    information -- it only lets an earlier generation's framing persist into a
+    later one, which is exactly the thing being measured.
     """
     if C.LLM_BACKEND == "vertex":
         from chia.models.vertex import VertexGeminiLLM
@@ -96,7 +102,7 @@ def make_llm(logging_name: str = "bp_evolve_agent"):
         system_message=C.LLM_SYSTEM_MESSAGE,
         timeout_seconds=C.LLM_TIMEOUT_SECONDS,
         logging_name=logging_name,
-        resume_session=True,
+        resume_session=resume_session,
         projects_cwd=C.CLAUDE_PROJECTS_DIR,
         extra_cli_args=list(C.LLM_EXTRA_CLI_ARGS),
     )
@@ -196,6 +202,84 @@ def repair(llm, *, source: str, struct_name: str, diagnostics: str,
     return _ask_json(llm, prompt, _validate_source_reply, tools)
 
 
+def _validate_params_reply(obj: dict) -> tuple[bool, str]:
+    params = obj.get("params")
+    if not isinstance(params, dict):
+        return False, "'params' must be an object naming all eight parameters"
+    missing = set(_TAGE_PARAMS) ^ set(params)
+    if missing:
+        return False, f"'params' must name exactly the 8 parameters; differs by {sorted(missing)}"
+    for k, v in params.items():
+        if not isinstance(v, int) or isinstance(v, bool):
+            return False, f"{k}: expected an integer, got {v!r}"
+    if not isinstance(obj.get("rationale"), str) or not obj["rationale"].strip():
+        return False, "'rationale' must say what is being moved and why"
+    return True, ""
+
+
+def design_params(llm, *, parent_args: dict, parent_summary: dict,
+                  archive_summary: str, feedback: str, generation: int,
+                  tools=None) -> dict:
+    """Choose one child's template parameters.  No source is written.
+
+    The middle arm.  :func:`offline_design` picks the numbers with an RNG and
+    :func:`design` hands the model the HARCOM source and lets it change the
+    algorithm; this one holds everything else fixed -- same template, same
+    bounds, same rendering path, same parent selection -- and swaps out only
+    who chooses the eight integers.  Because the predictor is rendered rather
+    than written, a proposal cannot fail to compile, so the comparison against
+    the offline arm carries no repair-round confound: the two arms differ in
+    the choice and in nothing else.
+
+    Values outside their bounds are clipped by the caller rather than rejected,
+    which is what :func:`offline_design` does to its own arithmetic.  An arm
+    that got its proposals thrown away for being out of range would be
+    searching a smaller space than its control.
+    """
+    bounds = "\n".join(
+        f"  {k:7s} low={v[0]:<5d} high={v[1]:<5d}"
+        for k, v in _TAGE_PARAMS.items())
+    parent = json.dumps(
+        {"template_args": ",".join(str(parent_args[k]) for k in _TAGE_ORDER),
+         "params": {k: parent_args[k] for k in _TAGE_ORDER},
+         **parent_summary}, indent=2)
+    prompt = _load(
+        "design_params.md",
+        BOUNDS=bounds,
+        PARENT=parent,
+        ARCHIVE=archive_summary,
+        FEEDBACK=feedback or "(this is the first child of this parent)",
+        GENERATION=str(generation),
+    )
+    return _ask_json(llm, prompt, _validate_params_reply, tools)
+
+
+def render_params(parent_source: str, struct_name: str, params: dict,
+                  rationale: str = "") -> dict:
+    """Turn a chosen parameter set into the same proposal dict the arms share.
+
+    Clipping happens here so that every arm reaches the renderer through one
+    path: whatever chose the numbers, what gets built is inside the bounds.
+    """
+    args, clipped = {}, []
+    for k in _TAGE_ORDER:
+        low, high, dflt = _TAGE_PARAMS[k]
+        want = int(params.get(k, dflt))
+        got = max(low, min(high, want))
+        if got != want:
+            clipped.append(f"{k}={want}->{got}")
+        args[k] = got
+    note = f" [clipped {', '.join(clipped)}]" if clipped else ""
+    return {
+        "source": parent_source,
+        "struct_name": struct_name,
+        "template_args": ",".join(str(args[k]) for k in _TAGE_ORDER),
+        "args": args,
+        "clipped": clipped,
+        "rationale": (rationale or "parameter choice") + note,
+    }
+
+
 def port(llm, *, harcom_source: str, struct_name: str, target: str,
          tier0_mpki: float, tools=None) -> dict:
     """Translate a HARCOM predictor into a ChampSim or gem5 branch module.
@@ -238,6 +322,126 @@ _TAGE_PARAMS = {
     "GHIST1": (4, 10, 6),    # first-level history
 }
 _TAGE_ORDER = ("LOGLB", "NUMG", "LOGG", "LOGB", "TAGW", "GHIST", "LOGP1", "GHIST1")
+
+# ---------------------------------------------------------------------------
+# The search space itself, as an object of study
+# ---------------------------------------------------------------------------
+#
+# `_TAGE_PARAMS` above is not a law of nature.  Every bound in it was a
+# judgement call, and the ranges carry a comment justifying LOGG, LOGB, NUMG and
+# GHIST -- but not LOGLB, whose ceiling of 7 was never argued for.  The audit
+# arm exists to find out what an agent does when the bounds are handed to it
+# rather than fixed: it may widen or narrow any of them, and what it reaches for
+# first is the measurement.
+#
+# The guard below is not a taste filter and deliberately does not encode any
+# opinion about which bounds are architecturally reasonable.  It rejects exactly
+# one class of change: the one that breaks the renderer SILENTLY.
+#
+#   ports/tage_core.h.in:67   HTAGBITS    = TAGW - (LOGLB - 2)
+#   ports/tage_core.h.in:68   BINDEX_BITS = LOGB - (LOGLB - 2)
+#
+# Both are `uint64_t`.  If LOGLB-2 ever reaches TAGW or LOGB the subtraction
+# wraps, `bmask(bits >= 64)` returns ~0, and the predictor keeps running with
+# its tag comparison disabled -- no crash, no build error, just a scored result
+# that means nothing.  A bound set that permits that combination is rejected
+# whatever its rationale, because the failure is invisible downstream and would
+# enter the archive as a real design.
+
+_BOUNDS_MIN_BITS = 1
+
+
+def bounds_snapshot() -> dict:
+    """The live bound table, as plain data."""
+    return {k: list(v) for k, v in _TAGE_PARAMS.items()}
+
+
+def validate_bounds(bounds: dict) -> tuple[bool, str]:
+    """Structural check, plus the silent-underflow guard.
+
+    Worst case over the whole box, not over any one design: the mutator may
+    combine LOGLB at its ceiling with TAGW and LOGB at their floors, so that is
+    the combination the guard has to hold for.
+    """
+    if set(bounds) != set(_TAGE_PARAMS):
+        missing = set(_TAGE_PARAMS) ^ set(bounds)
+        return False, f"bounds must name exactly the 8 parameters; differs by {sorted(missing)}"
+    for k, v in bounds.items():
+        if len(v) != 3 or not all(isinstance(x, int) for x in v):
+            return False, f"{k}: expected three integers [low, high, default]"
+        low, high, dflt = v
+        if low < 1 or high < low:
+            return False, f"{k}: need 1 <= low <= high, got low={low} high={high}"
+        if not low <= dflt <= high:
+            return False, f"{k}: default {dflt} outside [{low}, {high}]"
+
+    lineinst_max = bounds["LOGLB"][1] - 2
+    for dependent in ("TAGW", "LOGB"):
+        slack = bounds[dependent][0] - lineinst_max
+        if slack < _BOUNDS_MIN_BITS:
+            return False, (
+                f"LOGLB high={bounds['LOGLB'][1]} implies LOGLINEINST="
+                f"{lineinst_max}, leaving {dependent} low={bounds[dependent][0]} "
+                f"with {slack} bit(s). tage_core.h.in computes "
+                f"{dependent} - LOGLINEINST as uint64_t; at {slack} it wraps and "
+                f"the tag compare silently disables. Raise {dependent}'s low to "
+                f"at least {lineinst_max + _BOUNDS_MIN_BITS}, or lower LOGLB's high.")
+    return True, ""
+
+
+def apply_bounds(bounds: dict) -> None:
+    """Install a validated bound table.  Raises rather than half-applying."""
+    ok, reason = validate_bounds(bounds)
+    if not ok:
+        raise AgentError(f"refusing to install bounds: {reason}")
+    for k, v in bounds.items():
+        _TAGE_PARAMS[k] = tuple(v)
+
+
+def _validate_bounds_reply(obj: dict) -> tuple[bool, str]:
+    changes = obj.get("changes")
+    if not isinstance(changes, list):
+        return False, "'changes' must be a list (use [] to leave the bounds alone)"
+    if not isinstance(obj.get("rationale"), str) or not obj["rationale"].strip():
+        return False, "'rationale' must say what is being widened or narrowed and why"
+    for c in changes:
+        if not isinstance(c, dict):
+            return False, "each change must be an object"
+        if c.get("param") not in _TAGE_PARAMS:
+            return False, f"unknown parameter {c.get('param')!r}"
+        for field in ("low", "high"):
+            if not isinstance(c.get(field), int):
+                return False, f"{c.get('param')}: '{field}' must be an integer"
+    return True, ""
+
+
+def tune_bounds(llm, *, archive_summary: str, history: str, generation: int,
+                occupancy: str = "(unavailable)", tools=None) -> dict:
+    """Ask the agent whether to move the search-space bounds.
+
+    Returns the reply as given.  Applying it is the caller's job, because a
+    rejected change is data -- what the agent reached for and why the harness
+    would not allow it belongs in the record just as much as an accepted one.
+
+    ``occupancy`` is where the evaluated designs actually landed inside each
+    bound, elites and non-elites alike.  Without it the agent sees only the
+    elites, and a parameter pinned against its ceiling is indistinguishable
+    from one that converged -- an ambiguity measured at 3/6 either way across
+    repeated cold-context calls on the same archive.
+    """
+    bounds = "\n".join(
+        f"  {k:7s} low={v[0]:<5d} high={v[1]:<5d} default={v[2]}"
+        for k, v in _TAGE_PARAMS.items())
+    prompt = _load(
+        "tune_bounds.md",
+        BOUNDS=bounds,
+        ARCHIVE=archive_summary,
+        OCCUPANCY=occupancy or "(unavailable)",
+        HISTORY=history or "(no bounds have been changed yet)",
+        GENERATION=str(generation),
+    )
+    return _ask_json(llm, prompt, _validate_bounds_reply, tools)
+
 
 # Which of those survive the port.  LOGP1 and GHIST1 size the P1 gshare, and
 # neither ChampSim nor gem5 has an interface that can hold a first-level

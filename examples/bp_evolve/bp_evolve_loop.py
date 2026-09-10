@@ -279,7 +279,31 @@ def run_sweep(args) -> int:
     else:
         archive = Archive(C.EPI_BIN_EDGES, C.P1_LATENCY_BINS, C.P2_LATENCY_BINS)
         resume_from = 1
+    # An archive only knows the generations that left a surviving elite, so a
+    # sweep that ran on past its last turnover resumes too early and reissues
+    # variant ids the database already holds.  The override is the caller
+    # asserting where the previous sweep actually stopped.
+    if args.resume_from is not None:
+        if args.resume_from < resume_from:
+            print(f"warning: --resume-from {args.resume_from} is behind the "
+                  f"archive's own {resume_from}; variant ids may collide")
+        resume_from = args.resume_from
+        print(f"overridden: continuing at generation {resume_from}")
     llm = None if args.arm == "offline" else agents.make_llm("bp_evolve_design")
+    # Everything downstream that would EDIT SOURCE -- repair and the ports --
+    # is off in the params arm, exactly as it is offline. The arm's premise is
+    # that the algorithm is fixed and only the eight numbers move; a repair
+    # round rewriting HARCOM, or a model hand-porting a design it never wrote,
+    # would put an uncontrolled variable back into the one comparison built to
+    # have none. A rendered design cannot fail to compile anyway, so repair
+    # should never fire here -- and if it does, that is a renderer bug to see,
+    # not to paper over with a model.
+    source_llm = None if args.arm in ("offline", "params") else llm
+    # The bounds agent is a separate handle even when a design agent exists:
+    # they are two different jobs with two different prompts, and sharing one
+    # context would let the design it just wrote argue for the box it wants.
+    bounds_llm = (agents.make_llm("bp_evolve_bounds", resume_session=False)
+                  if args.tune_bounds else None)
 
     with CbpNgNode(require_colocated=False) as cbp_node, \
             LineageDB(str(C.OUT_DIR / "bp_evolve.db")) as db:
@@ -329,6 +353,13 @@ def run_sweep(args) -> int:
 
         # -- generations ---------------------------------------------------
         for gen in range(resume_from, args.generations + 1):
+            # Before anything is proposed, so every variant in this generation
+            # is drawn from one table and the recorded bounds are exactly the
+            # ones it was built under.
+            if bounds_llm is not None:
+                _tune_bounds(bounds_llm, archive, db, gen,
+                             args.occupancy_db or ())
+
             evaluations = []
 
             # A generation runs in three phases, and the split is what lets the
@@ -395,7 +426,7 @@ def run_sweep(args) -> int:
                         pool.submit(
                             _evaluate_core, variant, cbp_node=cbp_node,
                             traces=inner, archive=archive, parent=parent,
-                            llm=llm, cbp_root=args.cbp_root)
+                            llm=source_llm, cbp_root=args.cbp_root)
                         for _vid, variant, parent in proposals]
                     for (vid, _v, _p), fut in zip(proposals, futs):
                         try:
@@ -428,7 +459,8 @@ def run_sweep(args) -> int:
                   f"VFS {best.vfs:.4f}")
 
             if args.tier1 and evaluations:
-                _promote(evaluations, archive, db, gen, llm, args, promo_state)
+                _promote(evaluations, archive, db, gen, source_llm, args,
+                         promo_state)
 
         # -- the headline result -------------------------------------------
         _report(archive, db, held_out, args)
@@ -443,6 +475,24 @@ def _propose(arm, llm, parent, archive, rng, *, feedback, generation, vid,
         p = agents.offline_design(parent.source, parent.struct_name, rng,
                                   parent_args=offline_args
                                   or _parse_template_args(parent.template_args))
+        p["source"] = agents.rename_struct(parent.source, parent.struct_name, vid)
+        p["struct_name"] = vid
+        return p
+    if arm == "params":
+        # Same template, same bounds, same renderer as the offline arm; the
+        # model chooses the numbers instead of the RNG, and nothing else moves.
+        parent_args = (offline_args
+                       or _parse_template_args(parent.template_args)
+                       or {k: v[2] for k, v in agents._TAGE_PARAMS.items()})
+        reply = agents.design_params(
+            llm, parent_args=parent_args,
+            parent_summary=parent.summary(),
+            archive_summary=_bounds_archive_summary(archive),
+            feedback=feedback, generation=generation)
+        p = agents.render_params(parent.source, parent.struct_name,
+                                 reply["params"], reply.get("rationale", ""))
+        if p["clipped"]:
+            print(f"[gen {generation}] {vid}: clipped {', '.join(p['clipped'])}")
         p["source"] = agents.rename_struct(parent.source, parent.struct_name, vid)
         p["struct_name"] = vid
         return p
@@ -489,6 +539,178 @@ def _archive_summary(archive: Archive, limit: int = 12) -> str:
     if len(archive) > limit:
         lines.append(f"  ... and {len(archive) - limit} more")
     return "\n".join(lines)
+
+
+def _bounds_archive_summary(archive: Archive, limit: int = 12) -> str:
+    """Like `_archive_summary`, but with the parameters each elite was built at.
+
+    The bounds agent is reasoning about the box, not about a design, so it
+    needs to see where in the box the survivors actually sit -- an elite pinned
+    against a bound is the whole signal, and the cost-only summary hides it.
+    """
+    if not len(archive):
+        return "(empty)"
+    order = ",".join(agents._TAGE_ORDER)
+    lines = [f"{len(archive)} cells occupied ({archive.coverage():.0%} of the grid).",
+             f"Parameters are listed in the order {order}.",
+             ""]
+    for e in archive.elites[:limit]:
+        lines.append(
+            f"  cell {archive.descriptor(e)}: {e.variant_id} VFS {e.vfs:.4f}, "
+            f"EPI {e.epi:.0f}, P1 {e.p1_latency}, P2 {e.p2_latency}, "
+            f"MPKI {e.mpki:.3f}")
+        lines.append(f"    args {e.template_args or '(unknown)'}")
+    if len(archive) > limit:
+        lines.append(f"  ... and {len(archive) - limit} more")
+    return "\n".join(lines)
+
+
+def _bounds_occupancy(db, extra_dbs=()) -> str:
+    """Where the evaluated designs actually sit inside each bound.
+
+    The archive summary shows the elites, and the elites alone cannot answer
+    the question the bounds agent is being asked.  A parameter every elite
+    shares reads equally well as "converged, lock it" and as "pinned against
+    a ceiling, raise it"; repeated cold-context calls on the gen-39 archive
+    split 3/6 between those two readings of the same LOGLB column, with the
+    two framings visible in the agent's own wording.  The share of designs
+    sitting ON a bound separates them, and it is reported the same way for all
+    eight parameters -- this is a missing measurement, not a hint about which
+    bound to move.
+
+    It also separates "explored and rejected" from "never visited".  GHIST is
+    bounded [40,400] and every design ever evaluated landed in 95-104: the
+    mutation operator has never gone near the ends.  Shown only the elites,
+    every one of six calls read that clustering as evidence the rest of the
+    range was dead and proposed narrowing it.
+
+    ``extra_dbs`` are earlier sweeps' databases, read directly.  A new sweep's
+    own table is empty at its first generation, which is exactly when the
+    agent's first move is being measured.
+    """
+    import sqlite3
+
+    args = []
+    try:
+        args += db.template_args_seen()
+    except Exception as exc:                    # a sweep older than the method
+        return f"(unavailable: {exc})"
+    for path in extra_dbs:
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            args += [r[0] for r in conn.execute(
+                "SELECT template_args FROM variants WHERE template_args != ''")]
+            conn.close()
+        except Exception as exc:
+            print(f"occupancy: skipping {path} ({exc})")
+
+    order = agents._TAGE_ORDER
+    values = {k: [] for k in order}
+    for a in args:
+        parts = a.split(",")
+        if len(parts) != len(order):
+            continue
+        for k, v in zip(order, parts):
+            try:
+                values[k].append(int(v))
+            except ValueError:
+                pass
+
+    n = len(values[order[0]])
+    if not n:
+        return "(no designs evaluated yet)"
+
+    lines = [f"{n} designs evaluated so far, elites and non-elites alike.",
+             "'at low'/'at high' count designs sitting exactly ON that bound.",
+             "",
+             f"  {'param':8s} {'bound':13s} {'seen':>11s}  {'at low':>7s}  {'at high':>7s}"]
+    for k in order:
+        v = values[k]
+        lo, hi, _ = agents._TAGE_PARAMS[k]
+        at_lo = sum(1 for x in v if x <= lo)
+        at_hi = sum(1 for x in v if x >= hi)
+        lines.append(
+            f"  {k:8s} [{lo},{hi}]{'':<{max(0, 11 - len(f'[{lo},{hi}]'))}s} "
+            f"{min(v):4d}-{max(v):<6d} "
+            f"{at_lo:4d} ({100*at_lo/len(v):3.0f}%) {at_hi:4d} ({100*at_hi/len(v):3.0f}%)")
+    return "\n".join(lines)
+
+
+def _bounds_history(db) -> str:
+    """Bound moves already made, so the agent does not re-propose them."""
+    try:
+        rows = db.bound_history()
+    except Exception as exc:                    # a sweep older than the table
+        return f"(unavailable: {exc})"
+    if not rows:
+        return "(none yet -- this is the first generation of the audit)"
+    lines = []
+    for r in rows:
+        verdict = ("accepted" if r["accepted"]
+                   else f"REJECTED ({r['reject_reason']})")
+        lines.append(
+            f"  gen {r['generation']}: {r['param']} "
+            f"[{r['old_low']},{r['old_high']}] -> "
+            f"[{r['new_low']},{r['new_high']}] -- {verdict}; {r['why']}")
+    return "\n".join(lines)
+
+
+def _tune_bounds(bounds_llm, archive, db, gen, occupancy_dbs=()) -> None:
+    """Let the agent move `agents._TAGE_PARAMS` before this generation runs.
+
+    Everything is recorded -- the table as it stood, the change asked for, and
+    the refusal if there was one.  A rejected proposal is not an error to be
+    retried: it is the observation that the agent went for a dimension the
+    guard defends, and it belongs in the same table as the accepted ones.
+
+    Failures here never stop the sweep.  The bounds are a perturbation on top
+    of a search that is complete without them, so an agent that times out
+    costs one generation of tuning, not the run.
+    """
+    before = agents.bounds_snapshot()
+    try:
+        reply = agents.tune_bounds(
+            bounds_llm,
+            archive_summary=_bounds_archive_summary(archive),
+            occupancy=_bounds_occupancy(db, occupancy_dbs),
+            history=_bounds_history(db),
+            generation=gen)
+    except Exception as exc:
+        print(f"gen {gen}: bounds agent failed ({exc}); bounds unchanged")
+        db.record_bounds(gen, before, [], accepted=False,
+                         reject_reason=f"agent error: {exc}")
+        return
+
+    changes = reply.get("changes") or []
+    rationale = reply.get("rationale", "")
+    if not changes:
+        print(f"gen {gen}: bounds unchanged by request -- {rationale}")
+        db.record_bounds(gen, before, [], accepted=True, rationale=rationale)
+        return
+
+    proposed = {k: list(v) for k, v in before.items()}
+    for c in changes:
+        param = c["param"]
+        proposed[param] = [int(c["low"]), int(c["high"]), proposed[param][2]]
+        # A default left outside its own bounds is the agent's arithmetic
+        # slipping, not its intent; pull it in rather than reject the move.
+        lo, hi, dflt = proposed[param]
+        proposed[param][2] = max(lo, min(hi, dflt))
+
+    ok, why_not = agents.validate_bounds(proposed)
+    if not ok:
+        print(f"gen {gen}: bounds change REJECTED -- {why_not}")
+        db.record_bounds(gen, before, changes, accepted=False,
+                         rationale=rationale, reject_reason=why_not)
+        return
+
+    agents.apply_bounds(proposed)
+    for c in changes:
+        param = c["param"]
+        print(f"gen {gen}: bounds {param} "
+              f"[{before[param][0]},{before[param][1]}] -> "
+              f"[{proposed[param][0]},{proposed[param][1]}] -- {c.get('why','')}")
+    db.record_bounds(gen, before, changes, accepted=True, rationale=rationale)
 
 
 def _promote(evaluations, archive, db, gen, llm, args, state):
@@ -862,17 +1084,26 @@ def score_held_out(args) -> int:
         # predictors/evolved_<variant_id>.hpp, so the shared checkout is safe.
         # 42 traces on 16 slots leaves the last few minutes of each elite's run
         # using one core; overlapping the elites fills them.
+        #
+        # Printed as they land rather than gathered and printed at the end.
+        # This is a full pass over 42 traces per elite and it runs for hours;
+        # the 2026-09-10 attempt was killed by a WSL shutdown 22 minutes in and
+        # left NOTHING behind, because every completed elite was still sitting
+        # in a list waiting for the slowest one. Rows therefore arrive in
+        # completion order, not archive order, which costs nothing: tau pairs
+        # each elite with its own re-score.
         with futures.ThreadPoolExecutor(max_workers=max(1, len(elites))) as pool:
-            done = list(pool.map(rescore, elites))
-
-    for e, out, why in done:
-        if out is None:
-            print(f"  {e.variant_id:<16}  {why}")
-            continue
-        m = out.metrics
-        print(f"  {e.variant_id:<16}{e.vfs:11.4f}{m.vfs:11.4f}"
-              f"{m.vfs - e.vfs:+9.4f}  {m.epi:8.0f}{m.mpki:8.3f}")
-        rows.append((e, out))
+            pending = [pool.submit(rescore, e) for e in elites]
+            for fut in futures.as_completed(pending):
+                e, out, why = fut.result()
+                if out is None:
+                    print(f"  {e.variant_id:<16}  {why}", flush=True)
+                    continue
+                m = out.metrics
+                print(f"  {e.variant_id:<16}{e.vfs:11.4f}{m.vfs:11.4f}"
+                      f"{m.vfs - e.vfs:+9.4f}  {m.epi:8.0f}{m.mpki:8.3f}",
+                      flush=True)
+                rows.append((e, out))
 
     if len(rows) < 2:
         print("\ntoo few designs survived for a rank comparison")
@@ -999,9 +1230,19 @@ def main(argv=None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--selftest", action="store_true",
                    help="check scoring, lint gate and one real build/run, then exit")
-    p.add_argument("--arm", choices=["main", "offline"], default="main",
+    p.add_argument("--arm", choices=["main", "offline", "params"],
+                   default="main",
                    help="'offline' replaces the design agent with deterministic "
-                        "template-parameter mutation -- the harness control")
+                        "template-parameter mutation -- the harness control. "
+                        "'params' is the middle arm: the model picks the eight "
+                        "template parameters but writes no source, so the "
+                        "algorithm is fixed and the design is rendered from the "
+                        "same template. It is not the same operator as "
+                        "'offline' -- that one moves exactly two parameters per "
+                        "proposal and this one moves as many as it chooses -- so "
+                        "the comparison is of mutation operators, not of values "
+                        "chosen for one fixed move. 'main' hands the model the "
+                        "HARCOM source and lets it change the algorithm.")
     p.add_argument("--generations", type=int, default=C.GENERATIONS)
     p.add_argument("--variants-per-generation", type=int,
                    default=C.VARIANTS_PER_GENERATION)
@@ -1045,6 +1286,25 @@ def main(argv=None) -> int:
                    help="archive.json from an interrupted sweep: reload it, skip "
                         "generation 0, and continue at the generation after the "
                         "newest elite in it")
+    p.add_argument("--resume-from", type=int, default=None,
+                   help="generation to continue at, overriding the one derived "
+                        "from --resume-archive; use it when the sweep the "
+                        "archive came from ran past its newest surviving elite")
+    p.add_argument("--tune-bounds", action="store_true",
+                   help="the audit arm: before each generation, let an agent "
+                        "move the search-space bounds in agents._TAGE_PARAMS. "
+                        "It never writes a design -- what it reaches for is "
+                        "the measurement. Composable with --arm offline, and "
+                        "that is the interesting combination: the designs stay "
+                        "deterministic, so any change in the trajectory is the "
+                        "bounds and nothing else.")
+    p.add_argument("--occupancy-db", action="append", metavar="PATH",
+                   help="an earlier sweep's bp_evolve.db, read-only, folded "
+                        "into the occupancy table the bounds agent is shown. "
+                        "A fresh audit database is empty at generation 40, "
+                        "which is precisely when the agent's first move is "
+                        "being measured; without this it would be told no "
+                        "design has ever been evaluated. Repeatable.")
     p.add_argument("--notes", default="")
     args = p.parse_args(argv)
 

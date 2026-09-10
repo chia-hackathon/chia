@@ -101,6 +101,35 @@ CREATE TABLE IF NOT EXISTS archive_snapshots (
     archive_json TEXT NOT NULL,
     PRIMARY KEY (sweep_id, generation)
 );
+
+-- The audit arm moves the search-space bounds while the search runs, so the
+-- bounds are no longer a property of the sweep: they are a property of the
+-- generation, and a result cannot be reproduced without them.  `bound_states`
+-- is the full table at every generation, `bound_changes` the deltas with the
+-- agent's reasoning.  Rejected changes are recorded too -- what the agent
+-- reached for and was refused is the measurement, not an error.
+CREATE TABLE IF NOT EXISTS bound_states (
+    sweep_id     INTEGER NOT NULL,
+    generation   INTEGER NOT NULL,
+    bounds_json  TEXT NOT NULL,
+    PRIMARY KEY (sweep_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS bound_changes (
+    sweep_id      INTEGER NOT NULL,
+    generation    INTEGER NOT NULL,
+    seq           INTEGER NOT NULL,
+    param         TEXT NOT NULL,
+    old_low       INTEGER,
+    old_high      INTEGER,
+    new_low       INTEGER,
+    new_high      INTEGER,
+    why           TEXT,
+    rationale     TEXT,
+    accepted      INTEGER NOT NULL,
+    reject_reason TEXT,
+    PRIMARY KEY (sweep_id, generation, seq)
+);
 """
 
 
@@ -186,6 +215,50 @@ class LineageDB:
                 "depth, vfs, cpi) VALUES (?,?,?,?,?)",
                 [(sid, v.variant_id, d, s.vfs, s.cpi)
                  for d, s in sorted(t0.depth_scores.items())]))
+
+    def record_bounds(self, generation: int, bounds: dict, changes: list,
+                      *, accepted: bool, rationale: str = "",
+                      reject_reason: str = "") -> None:
+        """The bound table at this generation, plus what was asked for.
+
+        Called once per generation whether or not anything moved, so the state
+        table is complete and a generation's designs can always be tied to the
+        box they were drawn from.
+        """
+        get(self.node.execute.chia_remote(
+            "INSERT OR REPLACE INTO bound_states (sweep_id, generation, "
+            "bounds_json) VALUES (?,?,?)",
+            (self.sweep_id, generation, json.dumps(bounds, sort_keys=True))))
+        for seq, c in enumerate(changes):
+            old = bounds.get(c.get("param"), [None, None, None])
+            get(self.node.execute.chia_remote(
+                "INSERT OR REPLACE INTO bound_changes (sweep_id, generation, "
+                "seq, param, old_low, old_high, new_low, new_high, why, "
+                "rationale, accepted, reject_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (self.sweep_id, generation, seq, c.get("param"),
+                 old[0], old[1], c.get("low"), c.get("high"),
+                 c.get("why", ""), rationale,
+                 1 if accepted else 0, reject_reason)))
+
+    def bound_history(self) -> list[dict]:
+        """Accepted bound moves so far, oldest first, for the next prompt."""
+        return get(self.node.query.chia_remote(
+            "SELECT generation, param, old_low, old_high, new_low, new_high, "
+            "why, accepted, reject_reason FROM bound_changes "
+            "WHERE sweep_id = ? ORDER BY generation, seq", (self.sweep_id,)))
+
+    def template_args_seen(self) -> list[str]:
+        """Every design this sweep actually evaluated, as its template args.
+
+        The archive holds only the elites -- one design per occupied cell --
+        so it cannot say whether a parameter's range was explored and rejected
+        or never visited at all.  That distinction is the whole question the
+        bounds agent is being asked, so it gets the full evaluated set.
+        """
+        rows = get(self.node.query.chia_remote(
+            "SELECT template_args FROM variants "
+            "WHERE sweep_id = ? AND template_args != ''", (self.sweep_id,)))
+        return [r["template_args"] for r in rows]
 
     def snapshot_archive(self, generation: int, archive) -> None:
         best = archive.best()

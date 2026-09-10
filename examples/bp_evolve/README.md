@@ -56,11 +56,11 @@ promotion gates in `evaluator.py` never call an LLM.
 | `cbp_ng.py` | `CbpNgNode` — Tier-0 build and run, the primitive CHIA did not have |
 | `archive.py` | the MAP-Elites archive and the Pareto front |
 | `evaluator.py` | `build_fn` / `run_fn` / `result_mapper_fn`, the promotion gates, and the port-fidelity check |
-| `agents.py` | Design / Port / Repair, and the offline control that replaces them |
+| `agents.py` | Design / Port / Repair, the offline control that replaces them, and the two agents that never write a predictor: `design_params` and `tune_bounds` |
 | `gem5_bp.py` | installs a predictor into a gem5 checkout: source, SimObject, SConscript |
-| `db.py` | the lineage DB: every variant, its depth scores, and what it came from |
+| `db.py` | the lineage DB: every variant, its depth scores, what it came from, and the bounds the search ran under |
 | `bp_evolve_loop.py` | the driver |
-| `prompts/` | the four prompt templates |
+| `prompts/` | the six prompt templates |
 | `ports/` | `tage_core.h.in` — the algorithm — plus one thin adapter per simulator |
 | `tools/` | `cbp2champsim.cpp` and the script that converts and verifies a trace set |
 | `gem5/` | the depth-sweep config script and the SE-mode workloads |
@@ -99,6 +99,65 @@ sizes.**
 smoke test only. Without it the Tier-0 tasks queue forever against an
 autoscaler that cannot satisfy them, which looks like a hang rather than a
 misconfiguration.
+
+### The params arm
+
+```bash
+python examples/bp_evolve/bp_evolve_loop.py --arm params ...
+```
+
+The middle arm, and the reason there are three. `--arm offline` asks whether
+the harness works; `--arm main` asks whether a model can invent a prediction
+algorithm. Neither answers the question in between: **given a fixed algorithm,
+does a model choose its parameters better than an RNG does?**
+
+`--arm params` holds everything else constant — same seed TAGE, same template,
+same bounds, same MAP-Elites grid, same uniform-over-occupied-cells parent
+selection, same inner traces — and swaps out only who picks the eight integers.
+The model returns numbers, never source; `render_params` clips them to the
+bounds table and renders the same template the offline arm renders. A proposal
+therefore cannot fail to compile, so there is no repair-round confound, and
+there is no path by which the algorithm can drift. Repair and the LLM ports are
+disabled on this arm for that reason (`source_llm` in `bp_evolve_loop.py`).
+
+**The two arms are not the same operator, and a comparison that does not say so
+is misleading.** The offline arm perturbs exactly two parameters per proposal.
+The model moves as many as it likes — six, four and two in the first three
+proposals of the sweep in `## Status`. So the arms differ in the choice *and*
+in the step size, and what is being measured is "model as a mutation operator",
+not "model picks better values for the same move". Constraining the model to
+two parameters would be the cleaner experiment, and would also forbid the move
+it reached for immediately: changing `LOGP1` and `LOGG` together to cross two
+latency tiers at once.
+
+### The audit arm
+
+```bash
+python examples/bp_evolve/bp_evolve_loop.py --arm offline --tune-bounds \
+    --occupancy-db <an earlier sweep's bp_evolve.db> ...
+```
+
+`--tune-bounds` lets an agent move the walls in `agents._TAGE_PARAMS` before
+each generation. It never writes a predictor. Composed with `--arm offline`
+the designs stay deterministic, so any change in the trajectory is the bounds
+and nothing else — that is the point of composing them.
+
+`validate_bounds` is the only thing standing between this agent and a silently
+wrong result. `ports/tage_core.h.in` computes `TAGW - LOGLINEINST` and
+`LOGB - LOGLINEINST` as `uint64_t`; if `LOGLB-2` reaches `TAGW` or `LOGB` the
+subtraction wraps, the tag mask becomes `~0`, every tag compare passes, and the
+design still builds, runs and scores. A predictor that appears to work while
+its tags do nothing is worse than one that fails to compile.
+
+`--occupancy-db` folds an earlier sweep's evaluated designs into the prompt, and
+it is not a convenience. The archive holds only the elites — one design per
+occupied cell — which cannot distinguish *a range that was explored and scored
+badly* from *a range nothing ever visited*. Without the occupancy table the
+agent conflates the two, and it does so consistently: over five cold-context
+calls on the same archive it narrowed `GHIST` from `[40,400]` every time,
+calling the rest dead space, when across 204 evaluated designs `GHIST` had
+never once left 95-104. The mutation operator had simply never gone there.
+See `## Status` for what the table changed.
 
 ### Before the first cluster run
 
@@ -141,6 +200,29 @@ directory that is full of traces on the machine that matters.
 Start with `--no-tier1`: a Tier-0-only search is a complete experiment and needs
 only the `cbp_ng` pool. Add ChampSim and gem5 once the search is producing a
 front worth promoting.
+
+### The held-out check
+
+```bash
+python examples/bp_evolve/bp_evolve_loop.py --score-held-out \
+    --archive <archive.json> --inner-traces 126 ...
+```
+
+Every VFS a sweep reports is in-sample. The search receives feedback from 126
+of the 168 traces and gets forty generations to fit them; the other 42 never
+enter the loop. `--score-held-out` rebuilds each elite from its own source and
+template args, runs it on those 42, and reports Kendall tau between the inner
+ranking and the held-out one.
+
+**The scores are not the question and will not match — the two trace sets are
+different. The question is whether the *ordering* survives.** A front that
+reorders on unseen traces is a search that fitted its own subset, and the fix
+for that is the search, not another sweep.
+
+Results print as each elite lands rather than being gathered and printed at the
+end. This is a full pass over 42 traces per elite and it runs for hours; an
+earlier attempt was killed part-way and left nothing behind, because every
+finished elite was still sitting in a list waiting for the slowest one.
 
 ### Running it on GCP
 
@@ -442,6 +524,16 @@ machine and the loop runs all three tiers through them.
   variant with its parent, its template arguments, its full depth sweep and its
   cross-tier tau. `--score-held-out` rebuilds the archived front from its own
   recorded source and re-runs it.
+* The params arm runs the same cascade end to end with a model choosing the
+  parameters, and the model is demonstrably reading the archive rather than
+  perturbing at random. Its recorded rationales name the cell they are aiming
+  at and cite the previous generation's measured result to get there -- one
+  proposal held the second-level configuration fixed to preserve `P2=2` while
+  pushing `LOGP1` alone across the `P1` threshold; the next observed that a
+  design with `NUMG=5, LOGG=10` had still come out at `P2=2` and dropped every
+  parameter to its floor. It also leaves the box the RNG never left: the offline
+  arm's 204 designs used nine `GHIST` values between 95 and 104, and the params
+  arm reached 40, 60, 200, 250, 300 and 400 within two generations.
 
 **Not yet run:**
 
@@ -651,3 +743,35 @@ Every one of these was invisible to any check short of running the thing.
   either side puts the real gap at 2–6%. Two lessons: a gate that compares two
   harnesses is not measuring what it names, and a "systematic" constant that
   has only ever been measured once is a guess.
+* **The bounds agent read "never visited" as "explored and rejected."** Given
+  only the archive — which holds elites, one per occupied cell — five
+  cold-context calls on the same generation-39 front narrowed `GHIST` from
+  `[40,400]` five times out of five, describing the rest as dead space. Across
+  the 204 designs the sweep actually evaluated, `GHIST` had never left 95-104:
+  100 appeared 43 times, and the nine values ever tried spanned nine of the
+  range's 361. The agent was not wrong about the elites; it was answering a
+  question the elites cannot answer. On the same evidence it also split 3/6
+  between "every elite *uses* `LOGLB=7`, so lock it at `[7,7]`" and "every
+  design is *pinned at the ceiling* 7, so raise it" — the same observation,
+  two framings, in its own wording.
+
+  Adding an occupancy table (all 204 designs, all eight parameters treated
+  alike, no parameter named in prose) moved every one of those: `LOGLB`
+  ceiling raised 3/6 → 5/5, `LOGLB` locked at 7 2/6 → 0/5, `GHIST` narrowed
+  6/6 → 0/5. Three caveats belong with that result. The ceiling only ever moved
+  to 8, never near the arithmetic cliff at 11 that `validate_bounds` guards.
+  This was not a blind test — `LOGLB` was known to be the interesting parameter
+  when the prompt was written — so both prompt versions and both sets of
+  numbers have to be reported together. And the `GHIST` step size is a defect
+  in the mutation operator that no prompt change fixes.
+* **The held-out check passed, and passed too easily to mean much on its own.**
+  The generation-39 front's seven elites re-scored on the 42 traces no feedback
+  came from give Kendall tau `+1.000`: no pair reorders, at any depth from 3 to
+  30. But the held-out penalty is nearly a constant — mean `-0.0287`, standard
+  deviation `0.0019` — while the elites are spread over `0.2538` of VFS, so the
+  designs are separated by 134x the jitter that would have to reorder them. With
+  n=7 that ordering was never in much danger. The honest reading is **no
+  evidence the search fitted its 126 traces**, not "generalises well" — and the
+  fact that the two trace sets behave so alike suggests a random split does not
+  make the held-out set an out-of-distribution test at all. Splitting by
+  workload class would.
