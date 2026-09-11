@@ -49,7 +49,6 @@ gates in `evaluator.py` never call an LLM.
                     │ 1. PROPOSE    │  sequential, so the seed fixes the run
                     │               │
                     │  arm=offline  →  RNG perturbs exactly 2 of 8 params
-                    │  arm=params   →  LLM chooses all 8 params
                     │  arm=main     →  LLM writes HARCOM source
                     └───────┬───────┘
                             │  proposal = {source, template_args, rationale}
@@ -150,10 +149,9 @@ TAGE, same template, same bounds, same grid, same parent selection, same traces.
 | arm | proposes | writes source | answers |
 |---|---|---|---|
 | `--arm offline` | RNG perturbs exactly 2 of 8 params | no (renders template) | does the cascade work? |
-| `--arm params` | LLM chooses all 8 params | no (renders template) | does a model pick parameters better than an RNG? |
 | `--arm main` | LLM writes HARCOM | yes | can a model invent an algorithm? |
 
-`--tune-bounds` is orthogonal to all three: an agent moves the walls in
+`--tune-bounds` is orthogonal to both: an agent moves the walls in
 `agents._TAGE_PARAMS` before each generation and **never proposes a design**.
 Composed with `--arm offline` the designs stay deterministic, so any change in
 the trajectory is the bounds and nothing else.
@@ -205,7 +203,7 @@ to the two trace-bound tiers.
 | `cbp_ng` | Tier-0 build and run | every arm |
 | `champsim` | Tier-1 port and run | every arm |
 | `gem5` | Tier-2 depth sweep | every arm |
-| `llm` | the agents | `--arm params`, `--arm main`, `--tune-bounds` |
+| `llm` | the agents | `--arm main`, `--tune-bounds` |
 
 ---
 
@@ -218,12 +216,12 @@ to the two trace-bound tiers.
 | `archive.py` | the MAP-Elites archive and the Pareto front |
 | `evaluator.py` | `build_fn` / `run_fn` / `result_mapper_fn`, the promotion gates, and the port-fidelity check |
 | `harcom_lint.py` | the lint gate: illegal HARCOM (repairable) vs. reaching around the cost model (withdrawn) |
-| `agents.py` | Design / Port / Repair, the offline control that replaces them, and the two agents that never write a predictor: `design_params` and `tune_bounds` |
+| `agents.py` | Design / Port / Repair, the offline control that replaces them, and `tune_bounds`, the agent that moves the search-space bounds and never writes a predictor |
 | `cbp_ng.py` | `CbpNgNode` — Tier-0 build and run, the primitive CHIA did not have |
 | `gem5_bp.py` | installs a predictor into a gem5 checkout: source, SimObject, SConscript |
 | `db.py` | the lineage DB: every variant, its depth scores, what it came from, and the bounds the search ran under |
 | `ports/` | `tage_core.h.in` — the algorithm — plus one thin adapter per simulator |
-| `prompts/` | six templates: `design`, `design_params`, `tune_bounds`, `repair`, `port_champsim`, `port_gem5` |
+| `prompts/` | five templates: `design`, `tune_bounds`, `repair`, `port_champsim`, `port_gem5` |
 | `tools/` | `cbp2champsim.cpp`, `port_selfcheck.py`, and the trace converter/verifier |
 | `gem5/` | the depth-sweep config script and the SE-mode workloads |
 | `docs/engineering-notes.md` | measurements, traps, and what the loop has caught |
@@ -292,12 +290,9 @@ that is full of traces on the machine that matters.
 Start with `--no-tier1`: a Tier-0-only search is a complete experiment and needs
 only the `cbp_ng` pool.
 
-### The other arms
+### The other modes
 
 ```bash
-# model picks the parameters; algorithm fixed
-python bp_evolve_loop.py --arm params ...
-
 # agent moves the search-space bounds; never proposes a design
 python bp_evolve_loop.py --arm offline --tune-bounds \
     --occupancy-db <an earlier sweep's bp_evolve.db> ...

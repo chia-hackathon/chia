@@ -290,15 +290,6 @@ def run_sweep(args) -> int:
         resume_from = args.resume_from
         print(f"overridden: continuing at generation {resume_from}")
     llm = None if args.arm == "offline" else agents.make_llm("bp_evolve_design")
-    # Everything downstream that would EDIT SOURCE -- repair and the ports --
-    # is off in the params arm, exactly as it is offline. The arm's premise is
-    # that the algorithm is fixed and only the eight numbers move; a repair
-    # round rewriting HARCOM, or a model hand-porting a design it never wrote,
-    # would put an uncontrolled variable back into the one comparison built to
-    # have none. A rendered design cannot fail to compile anyway, so repair
-    # should never fire here -- and if it does, that is a renderer bug to see,
-    # not to paper over with a model.
-    source_llm = None if args.arm in ("offline", "params") else llm
     # The bounds agent is a separate handle even when a design agent exists:
     # they are two different jobs with two different prompts, and sharing one
     # context would let the design it just wrote argue for the box it wants.
@@ -426,7 +417,7 @@ def run_sweep(args) -> int:
                         pool.submit(
                             _evaluate_core, variant, cbp_node=cbp_node,
                             traces=inner, archive=archive, parent=parent,
-                            llm=source_llm, cbp_root=args.cbp_root)
+                            llm=llm, cbp_root=args.cbp_root)
                         for _vid, variant, parent in proposals]
                     for (vid, _v, _p), fut in zip(proposals, futs):
                         try:
@@ -459,8 +450,7 @@ def run_sweep(args) -> int:
                   f"VFS {best.vfs:.4f}")
 
             if args.tier1 and evaluations:
-                _promote(evaluations, archive, db, gen, source_llm, args,
-                         promo_state)
+                _promote(evaluations, archive, db, gen, llm, args, promo_state)
 
         # -- the headline result -------------------------------------------
         _report(archive, db, held_out, args)
@@ -475,24 +465,6 @@ def _propose(arm, llm, parent, archive, rng, *, feedback, generation, vid,
         p = agents.offline_design(parent.source, parent.struct_name, rng,
                                   parent_args=offline_args
                                   or _parse_template_args(parent.template_args))
-        p["source"] = agents.rename_struct(parent.source, parent.struct_name, vid)
-        p["struct_name"] = vid
-        return p
-    if arm == "params":
-        # Same template, same bounds, same renderer as the offline arm; the
-        # model chooses the numbers instead of the RNG, and nothing else moves.
-        parent_args = (offline_args
-                       or _parse_template_args(parent.template_args)
-                       or {k: v[2] for k, v in agents._TAGE_PARAMS.items()})
-        reply = agents.design_params(
-            llm, parent_args=parent_args,
-            parent_summary=parent.summary(),
-            archive_summary=_bounds_archive_summary(archive),
-            feedback=feedback, generation=generation)
-        p = agents.render_params(parent.source, parent.struct_name,
-                                 reply["params"], reply.get("rationale", ""))
-        if p["clipped"]:
-            print(f"[gen {generation}] {vid}: clipped {', '.join(p['clipped'])}")
         p["source"] = agents.rename_struct(parent.source, parent.struct_name, vid)
         p["struct_name"] = vid
         return p
@@ -1230,19 +1202,11 @@ def main(argv=None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--selftest", action="store_true",
                    help="check scoring, lint gate and one real build/run, then exit")
-    p.add_argument("--arm", choices=["main", "offline", "params"],
-                   default="main",
+    p.add_argument("--arm", choices=["main", "offline"], default="main",
                    help="'offline' replaces the design agent with deterministic "
                         "template-parameter mutation -- the harness control. "
-                        "'params' is the middle arm: the model picks the eight "
-                        "template parameters but writes no source, so the "
-                        "algorithm is fixed and the design is rendered from the "
-                        "same template. It is not the same operator as "
-                        "'offline' -- that one moves exactly two parameters per "
-                        "proposal and this one moves as many as it chooses -- so "
-                        "the comparison is of mutation operators, not of values "
-                        "chosen for one fixed move. 'main' hands the model the "
-                        "HARCOM source and lets it change the algorithm.")
+                        "'main' hands the model the HARCOM source and lets it "
+                        "change the algorithm.")
     p.add_argument("--generations", type=int, default=C.GENERATIONS)
     p.add_argument("--variants-per-generation", type=int,
                    default=C.VARIANTS_PER_GENERATION)

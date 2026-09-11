@@ -314,16 +314,6 @@ machine and the loop runs all three tiers through them.
   variant with its parent, its template arguments, its full depth sweep and its
   cross-tier tau. `--score-held-out` rebuilds the archived front from its own
   recorded source and re-runs it.
-* The params arm runs the same cascade end to end with a model choosing the
-  parameters, and the model is demonstrably reading the archive rather than
-  perturbing at random. Its recorded rationales name the cell they are aiming
-  at and cite the previous generation's measured result to get there -- one
-  proposal held the second-level configuration fixed to preserve `P2=2` while
-  pushing `LOGP1` alone across the `P1` threshold; the next observed that a
-  design with `NUMG=5, LOGG=10` had still come out at `P2=2` and dropped every
-  parameter to its floor. It also leaves the box the RNG never left: the offline
-  arm's 204 designs used nine `GHIST` values between 95 and 104, and the params
-  arm reached 40, 60, 200, 250, 300 and 400 within two generations.
 
 **Not yet run:**
 
