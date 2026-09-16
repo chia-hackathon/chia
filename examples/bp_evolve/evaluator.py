@@ -321,8 +321,7 @@ def run_fn_tier0(
     # reorders itself by which trace happened to be longest is one that cannot
     # be diffed against a previous run.
     order = sorted(range(len(traces)),
-                   key=lambda i: -(_trace_lengths().get(
-                       os.path.basename(traces[i])) or 0))
+                   key=lambda i: -(_trace_length(traces[i]) or 0))
     refs = [
         cbp_node.run_cbp.chia_remote(
             binary, traces[i],
@@ -399,6 +398,20 @@ def _trace_lengths() -> dict:
     return _TRACE_LENGTHS
 
 
+def _trace_length(trace: str) -> int | None:
+    """Measured instruction count for a CBP or ChampSim trace path.
+
+    trace_lengths.json is keyed by the CBP name (``X_trace.gz``); the ChampSim
+    conversion of the same trace is ``X_trace.champsimtrace.gz``
+    (tools/cbp2champsim.cpp, convert_all.sh).  Looking the ChampSim name up
+    as-is missed every time, so Tier 1 always fell back to the global window.
+    """
+    name = os.path.basename(trace)
+    if name.endswith(".champsimtrace.gz"):
+        name = name[: -len(".champsimtrace.gz")] + ".gz"
+    return _trace_lengths().get(name)
+
+
 def tier1_window_for(trace: str,
                      warmup: int = C.WARMUP_INSTRUCTIONS) -> tuple[int, bool]:
     """How many instructions Tier 1 should simulate on this trace.
@@ -414,7 +427,7 @@ def tier1_window_for(trace: str,
     program several times) or truncates the long ones (throwing away 90% of the
     workload).  Neither failure announces itself in the MPKI.
     """
-    n = _trace_lengths().get(os.path.basename(trace))
+    n = _trace_length(trace)
     if not n:
         return C.TIER1_SIM_INSTRUCTIONS, False
     return max(1, n - warmup - C.TIER1_TAIL_MARGIN), True
@@ -440,7 +453,7 @@ def cbp_run_timeout_for(trace: str) -> int:
     thing tier1_window_for does and for the same reason: guessing a number here
     would be worse than admitting the set is not measured.
     """
-    n = _trace_lengths().get(os.path.basename(trace))
+    n = _trace_length(trace)
     if not n:
         return C.CBP_RUN_TIMEOUT_S
     return max(C.CBP_RUN_TIMEOUT_S,

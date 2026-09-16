@@ -139,6 +139,9 @@ class LineageDB:
     def __init__(self, db_path: str):
         self.node = SQLiteNode(db_path, pin_to_current_node=True)
         self.sweep_id: int | None = None
+        # Generations below this, completed by an EARLIER sweep in this same
+        # database, count as this sweep's own past.  0 adopts nothing.
+        self.adopted_before = 0
 
     def __enter__(self):
         self.node.__enter__()
@@ -240,12 +243,63 @@ class LineageDB:
                  c.get("why", ""), rationale,
                  1 if accepted else 0, reject_reason)))
 
+    # -- one search across several sweep rows --------------------------------
+    #
+    # The bounds live in process memory, so a driver restart used to reset them
+    # to the defaults and hand the agent an empty history: the resumed sweep
+    # silently searched a different box than the one its archive was built in.
+    # Adopting fixes that.  A resumed bounds-tuning sweep takes over every
+    # generation an earlier sweep in this database COMPLETED before the resume
+    # point -- the bound table, the moves and the designs evaluated -- and
+    # restores the table from them.
+    #
+    # A generation belongs to the sweep that wrote its archive snapshot.  The
+    # snapshot is the last thing a generation writes and the bound row the
+    # first, so that owner is the sweep that recorded all of it, and a
+    # generation a dying sweep only started (bounds recorded, variants partly
+    # recorded, no snapshot) is ignored; the resumed sweep reruns it.
+
+    _LINEAGE = ("(t.sweep_id = ? OR (t.generation < ? AND t.sweep_id = ("
+                "SELECT MAX(a.sweep_id) FROM archive_snapshots a "
+                "WHERE a.generation = t.generation AND a.sweep_id < ?)))")
+
+    def _lineage_params(self) -> tuple:
+        return (self.sweep_id, self.adopted_before, self.sweep_id)
+
+    def adopt_earlier_sweeps(self, before_generation: int) -> None:
+        """Count earlier sweeps' completed generations below this as our own."""
+        self.adopted_before = before_generation
+
+    def adopted_bounds(self) -> tuple[int, dict, list[dict]] | None:
+        """The newest adopted generation's bound table and its accepted moves.
+
+        ``bound_states`` holds the table a generation STARTED from; the table
+        it ran under is that plus the moves accepted on it, which the caller
+        applies.  None when nothing was adopted.
+        """
+        rows = get(self.node.query.chia_remote(
+            "SELECT t.sweep_id, t.generation, t.bounds_json FROM bound_states t "
+            "WHERE t.sweep_id < ? AND t.generation < ? AND t.sweep_id = ("
+            "SELECT MAX(a.sweep_id) FROM archive_snapshots a "
+            "WHERE a.generation = t.generation AND a.sweep_id < ?) "
+            "ORDER BY t.generation DESC LIMIT 1",
+            (self.sweep_id, self.adopted_before, self.sweep_id)))
+        if not rows:
+            return None
+        sid, gen = rows[0]["sweep_id"], rows[0]["generation"]
+        changes = get(self.node.query.chia_remote(
+            "SELECT param, new_low AS low, new_high AS high FROM bound_changes "
+            "WHERE sweep_id = ? AND generation = ? AND accepted = 1 "
+            "ORDER BY seq", (sid, gen)))
+        return gen, json.loads(rows[0]["bounds_json"]), changes
+
     def bound_history(self) -> list[dict]:
         """Accepted bound moves so far, oldest first, for the next prompt."""
         return get(self.node.query.chia_remote(
             "SELECT generation, param, old_low, old_high, new_low, new_high, "
-            "why, accepted, reject_reason FROM bound_changes "
-            "WHERE sweep_id = ? ORDER BY generation, seq", (self.sweep_id,)))
+            "why, accepted, reject_reason FROM bound_changes t "
+            f"WHERE {self._LINEAGE} ORDER BY generation, seq",
+            self._lineage_params()))
 
     def template_args_seen(self) -> list[str]:
         """Every design this sweep actually evaluated, as its template args.
@@ -256,8 +310,9 @@ class LineageDB:
         bounds agent is being asked, so it gets the full evaluated set.
         """
         rows = get(self.node.query.chia_remote(
-            "SELECT template_args FROM variants "
-            "WHERE sweep_id = ? AND template_args != ''", (self.sweep_id,)))
+            "SELECT template_args FROM variants t "
+            f"WHERE {self._LINEAGE} AND template_args != ''",
+            self._lineage_params()))
         return [r["template_args"] for r in rows]
 
     def snapshot_archive(self, generation: int, archive) -> None:

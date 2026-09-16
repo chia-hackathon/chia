@@ -295,12 +295,15 @@ def run_sweep(args) -> int:
     # context would let the design it just wrote argue for the box it wants.
     bounds_llm = (agents.make_llm("bp_evolve_bounds", resume_session=False)
                   if args.tune_bounds else None)
+    tuning_bounds = args.tune_bounds or args.bounds_rule is not None
 
     with CbpNgNode(require_colocated=False) as cbp_node, \
             LineageDB(str(C.OUT_DIR / "bp_evolve.db")) as db:
 
         db.start_sweep(started, args.arm, C.SEED_PREDICTOR, args.generations,
                        len(inner), C.DEPTH_SWEEP, notes=args.notes)
+        if tuning_bounds and args.resume_archive:
+            _restore_bounds(db, resume_from)
 
         # -- generation 0: the seed itself ---------------------------------
         #
@@ -347,9 +350,10 @@ def run_sweep(args) -> int:
             # Before anything is proposed, so every variant in this generation
             # is drawn from one table and the recorded bounds are exactly the
             # ones it was built under.
-            if bounds_llm is not None:
+            if tuning_bounds:
                 _tune_bounds(bounds_llm, archive, db, gen,
-                             args.occupancy_db or ())
+                             args.occupancy_db or (),
+                             rule_threshold=args.bounds_rule)
 
             evaluations = []
 
@@ -537,6 +541,36 @@ def _bounds_archive_summary(archive: Archive, limit: int = 12) -> str:
     return "\n".join(lines)
 
 
+def _occupancy_values(db, extra_dbs=()) -> dict[str, list[int]]:
+    """Every evaluated design's value of each parameter, this sweep and
+    ``extra_dbs`` alike.  The numbers behind `_bounds_occupancy`'s table, and
+    all the rule-based bounds arm is allowed to see."""
+    import sqlite3
+
+    args = list(db.template_args_seen())
+    for path in extra_dbs:
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            args += [r[0] for r in conn.execute(
+                "SELECT template_args FROM variants WHERE template_args != ''")]
+            conn.close()
+        except Exception as exc:
+            print(f"occupancy: skipping {path} ({exc})")
+
+    order = agents._TAGE_ORDER
+    values = {k: [] for k in order}
+    for a in args:
+        parts = a.split(",")
+        if len(parts) != len(order):
+            continue
+        for k, v in zip(order, parts):
+            try:
+                values[k].append(int(v))
+            except ValueError:
+                pass
+    return values
+
+
 def _bounds_occupancy(db, extra_dbs=()) -> str:
     """Where the evaluated designs actually sit inside each bound.
 
@@ -560,34 +594,12 @@ def _bounds_occupancy(db, extra_dbs=()) -> str:
     own table is empty at its first generation, which is exactly when the
     agent's first move is being measured.
     """
-    import sqlite3
-
-    args = []
     try:
-        args += db.template_args_seen()
+        values = _occupancy_values(db, extra_dbs)
     except Exception as exc:                    # a sweep older than the method
         return f"(unavailable: {exc})"
-    for path in extra_dbs:
-        try:
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-            args += [r[0] for r in conn.execute(
-                "SELECT template_args FROM variants WHERE template_args != ''")]
-            conn.close()
-        except Exception as exc:
-            print(f"occupancy: skipping {path} ({exc})")
 
     order = agents._TAGE_ORDER
-    values = {k: [] for k in order}
-    for a in args:
-        parts = a.split(",")
-        if len(parts) != len(order):
-            continue
-        for k, v in zip(order, parts):
-            try:
-                values[k].append(int(v))
-            except ValueError:
-                pass
-
     n = len(values[order[0]])
     if not n:
         return "(no designs evaluated yet)"
@@ -627,7 +639,42 @@ def _bounds_history(db) -> str:
     return "\n".join(lines)
 
 
-def _tune_bounds(bounds_llm, archive, db, gen, occupancy_dbs=()) -> None:
+def _bounds_after(before: dict, changes: list) -> dict:
+    """The bound table `changes` asks for, before the guard has looked at it."""
+    proposed = {k: list(v) for k, v in before.items()}
+    for c in changes:
+        param = c["param"]
+        proposed[param] = [int(c["low"]), int(c["high"]), proposed[param][2]]
+        # A default left outside its own bounds is the agent's arithmetic
+        # slipping, not its intent; pull it in rather than reject the move.
+        lo, hi, dflt = proposed[param]
+        proposed[param][2] = max(lo, min(hi, dflt))
+    return proposed
+
+
+def _restore_bounds(db, resume_from: int) -> None:
+    """Pick up the bounds where an earlier sweep in this database left them.
+
+    Without this a restarted bounds-tuning sweep reverts to the default table
+    and an empty history, and nothing in the log says so.
+    """
+    db.adopt_earlier_sweeps(resume_from)
+    adopted = db.adopted_bounds()
+    if adopted is None:
+        print(f"bounds: no earlier sweep in this database completed a "
+              f"generation before {resume_from}; starting from the defaults")
+        return
+    gen, before, changes = adopted
+    agents.apply_bounds(_bounds_after(before, changes))
+    moved = {k: v[:2] for k, v in agents.bounds_snapshot().items()
+             if v[:2] != list(agents.DEFAULT_TAGE_PARAMS[k][:2])}
+    print(f"bounds: restored the table generation {gen} ran under "
+          f"(differs from the defaults in {moved or 'nothing'}), and adopted "
+          f"the earlier sweeps' generations below {resume_from}")
+
+
+def _tune_bounds(bounds_llm, archive, db, gen, occupancy_dbs=(),
+                 rule_threshold=None) -> None:
     """Let the agent move `agents._TAGE_PARAMS` before this generation runs.
 
     Everything is recorded -- the table as it stood, the change asked for, and
@@ -635,18 +682,25 @@ def _tune_bounds(bounds_llm, archive, db, gen, occupancy_dbs=()) -> None:
     retried: it is the observation that the agent went for a dimension the
     guard defends, and it belongs in the same table as the accepted ones.
 
+    With ``rule_threshold`` set the move comes from `agents.rule_bounds`
+    instead of the agent, and everything after that is identical.
+
     Failures here never stop the sweep.  The bounds are a perturbation on top
     of a search that is complete without them, so an agent that times out
     costs one generation of tuning, not the run.
     """
     before = agents.bounds_snapshot()
     try:
-        reply = agents.tune_bounds(
-            bounds_llm,
-            archive_summary=_bounds_archive_summary(archive),
-            occupancy=_bounds_occupancy(db, occupancy_dbs),
-            history=_bounds_history(db),
-            generation=gen)
+        if rule_threshold is not None:
+            reply = agents.rule_bounds(_occupancy_values(db, occupancy_dbs),
+                                       threshold=rule_threshold)
+        else:
+            reply = agents.tune_bounds(
+                bounds_llm,
+                archive_summary=_bounds_archive_summary(archive),
+                occupancy=_bounds_occupancy(db, occupancy_dbs),
+                history=_bounds_history(db),
+                generation=gen)
     except Exception as exc:
         print(f"gen {gen}: bounds agent failed ({exc}); bounds unchanged")
         db.record_bounds(gen, before, [], accepted=False,
@@ -660,14 +714,7 @@ def _tune_bounds(bounds_llm, archive, db, gen, occupancy_dbs=()) -> None:
         db.record_bounds(gen, before, [], accepted=True, rationale=rationale)
         return
 
-    proposed = {k: list(v) for k, v in before.items()}
-    for c in changes:
-        param = c["param"]
-        proposed[param] = [int(c["low"]), int(c["high"]), proposed[param][2]]
-        # A default left outside its own bounds is the agent's arithmetic
-        # slipping, not its intent; pull it in rather than reject the move.
-        lo, hi, dflt = proposed[param]
-        proposed[param][2] = max(lo, min(hi, dflt))
+    proposed = _bounds_after(before, changes)
 
     ok, why_not = agents.validate_bounds(proposed)
     if not ok:
@@ -908,23 +955,39 @@ def _run_tier2(elites, archive, db, gen, llm, args, state):
             ev.variant.gem5_source = ported["source"]
             ev.variant.gem5_impl = ported.get("impl")
 
-            outcomes, artifacts = build_fn(
-                ev.variant, [Tier.GEM5], gem5_node=g5_node,
-                gem5_root=args.gem5_root)
-            ev.tiers[Tier.GEM5] = outcomes[Tier.GEM5]
-            if Tier.GEM5 not in artifacts:
-                print(f"[gen {gen}] {ev.variant.variant_id}: gem5 build failed: "
-                      f"{outcomes[Tier.GEM5].build_diagnostics[:300]}")
+            # Tier 2 is corroboration: it never writes the archive, so nothing
+            # it does may end the search.  It used to, because the failure
+            # arrives as a RayTaskError out of get() and only the port call
+            # above was guarded.  On 2026-09-12 the two arms of the bounds
+            # experiment shared one gem5 checkout -- the pool has four slots
+            # and one writable tree -- and while one arm's scons relinked
+            # gem5.opt, the other's run died on ENOENT for the binary and took
+            # a whole sweep with it, twelve generations from the end.  The
+            # checkout is still shared; this only makes losing the race cost a
+            # depth sweep instead of a search.
+            try:
+                outcomes, artifacts = build_fn(
+                    ev.variant, [Tier.GEM5], gem5_node=g5_node,
+                    gem5_root=args.gem5_root)
+                ev.tiers[Tier.GEM5] = outcomes[Tier.GEM5]
+                if Tier.GEM5 not in artifacts:
+                    print(f"[gen {gen}] {ev.variant.variant_id}: gem5 build failed: "
+                          f"{outcomes[Tier.GEM5].build_diagnostics[:300]}")
+                    db.record_evaluation(ev)
+                    continue
+
+                ev.tiers[Tier.GEM5] = run_fn_tier2(
+                    ev.variant, artifacts[Tier.GEM5],
+                    list(C.GEM5_WORKLOADS), C.GEM5_DEPTHS,
+                    gem5_node=g5_node,
+                    outdir_root=args.gem5_outdir,
+                    config_script=gem5_bp.gem5_config_path(args.gem5_root),
+                    workload_dir=args.gem5_workload_dir)
+            except Exception as e:
+                print(f"[gen {gen}] {ev.variant.variant_id}: Tier 2 raised "
+                      f"{type(e).__name__}, skipping it: {e}"[:400])
                 db.record_evaluation(ev)
                 continue
-
-            ev.tiers[Tier.GEM5] = run_fn_tier2(
-                ev.variant, artifacts[Tier.GEM5],
-                list(C.GEM5_WORKLOADS), C.GEM5_DEPTHS,
-                gem5_node=g5_node,
-                outdir_root=args.gem5_outdir,
-                config_script=gem5_bp.gem5_config_path(args.gem5_root),
-                workload_dir=args.gem5_workload_dir)
             # Cached from Tier 1 -- the mapper re-runs the port check on
             # every call, and it must see the same evidence both times.
             port_mpki, port_note = _port_selfcheck(ev, state)
@@ -1262,6 +1325,13 @@ def main(argv=None) -> int:
                         "that is the interesting combination: the designs stay "
                         "deterministic, so any change in the trajectory is the "
                         "bounds and nothing else.")
+    p.add_argument("--bounds-rule", type=float, default=None, metavar="SHARE",
+                   nargs="?", const=agents.RULE_BOUNDS_THRESHOLD,
+                   help="the audit arm's baseline: move the bounds by rule "
+                        "instead of by agent -- widen by one step every bound "
+                        "at least SHARE of the evaluated designs sit on "
+                        f"(default {agents.RULE_BOUNDS_THRESHOLD}). Same "
+                        "inputs, guard and record as --tune-bounds.")
     p.add_argument("--occupancy-db", action="append", metavar="PATH",
                    help="an earlier sweep's bp_evolve.db, read-only, folded "
                         "into the occupancy table the bounds agent is shown. "
@@ -1271,6 +1341,8 @@ def main(argv=None) -> int:
                         "design has ever been evaluated. Repeatable.")
     p.add_argument("--notes", default="")
     args = p.parse_args(argv)
+    if args.tune_bounds and args.bounds_rule is not None:
+        p.error("--tune-bounds and --bounds-rule are two arms; pick one")
 
     if args.selftest:
         return selftest(args)

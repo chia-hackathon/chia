@@ -244,6 +244,8 @@ _TAGE_PARAMS = {
     "GHIST1": (4, 10, 6),    # first-level history
 }
 _TAGE_ORDER = ("LOGLB", "NUMG", "LOGG", "LOGB", "TAGW", "GHIST", "LOGP1", "GHIST1")
+# The table as shipped; `_TAGE_PARAMS` is the live one and the bounds arms move it.
+DEFAULT_TAGE_PARAMS = dict(_TAGE_PARAMS)
 
 # ---------------------------------------------------------------------------
 # The search space itself, as an object of study
@@ -363,6 +365,56 @@ def tune_bounds(llm, *, archive_summary: str, history: str, generation: int,
         GENERATION=str(generation),
     )
     return _ask_json(llm, prompt, _validate_bounds_reply, tools)
+
+
+# The baseline the bounds agent has to beat.  Without it an agent that widens
+# LOGLB has only done the obvious thing -- "designs are piling up on the
+# ceiling, raise it" -- and nothing says it did better than a threshold would.
+# The rule sees exactly what the agent sees (the occupancy table, as numbers)
+# and makes exactly that obvious move: a bound on which at least `threshold`
+# of all evaluated designs sit is widened by one step, and nothing is ever
+# narrowed.  Its reply goes through the same guard and the same record.
+RULE_BOUNDS_THRESHOLD = 0.25
+
+
+def rule_bounds(values: dict[str, list[int]], *,
+                threshold: float = RULE_BOUNDS_THRESHOLD) -> dict:
+    """Widen every bound that at least ``threshold`` of the designs sit on.
+
+    ``values`` maps each parameter to the value every evaluated design took.
+    Returns a reply shaped like :func:`tune_bounds`'s.
+    """
+    changes, skipped = [], []
+    table = bounds_snapshot()
+    for k in _TAGE_ORDER:
+        v = values.get(k) or []
+        if not v:
+            continue
+        low, high, _ = _TAGE_PARAMS[k]
+        at_lo = sum(1 for x in v if x <= low) / len(v)
+        at_hi = sum(1 for x in v if x >= high) / len(v)
+        new_low = low - 1 if at_lo >= threshold and low > 1 else low
+        new_high = high + 1 if at_hi >= threshold else high
+        if (new_low, new_high) == (low, high):
+            continue
+        # The rule does not know to raise TAGW's floor along with LOGLB's
+        # ceiling, so a move the guard would refuse is dropped here rather
+        # than sinking the rule's other moves with it.
+        trial = dict(table, **{k: [new_low, new_high,
+                                   max(new_low, min(new_high, table[k][2]))]})
+        if not validate_bounds(trial)[0]:
+            skipped.append(k)
+            continue
+        table = trial
+        changes.append({
+            "param": k, "low": new_low, "high": new_high,
+            "why": (f"{at_lo:.0%} of {len(v)} designs at low, "
+                    f"{at_hi:.0%} at high; threshold {threshold:.0%}")})
+    rationale = (f"rule: widen by one step every bound at least "
+                 f"{threshold:.0%} of evaluated designs sit on")
+    if skipped:
+        rationale += f"; not moved, the guard would refuse it: {', '.join(skipped)}"
+    return {"changes": changes, "rationale": rationale}
 
 
 # Which of those survive the port.  LOGP1 and GHIST1 size the P1 gshare, and
