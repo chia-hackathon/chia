@@ -16,7 +16,7 @@ digraph bp_evolve_loop {
     label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="5" CELLPADDING="2">
       <TR>
         <TD BORDER="2" COLOR="#d0a020" BGCOLOR="#fbf3d5" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Inputs</FONT></TD>
-        <TD BORDER="2" COLOR="#2b6cd4" BGCOLOR="#eaf1fd" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Agent</FONT></TD>
+        <TD BORDER="2" COLOR="#2b6cd4" BGCOLOR="#eaf1fd" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Proposer</FONT></TD>
         <TD BORDER="2" COLOR="#23a455" BGCOLOR="#eafaf0" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">CHIA node</FONT></TD>
         <TD BORDER="2" COLOR="#a020a0" BGCOLOR="#f9eefb" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Build</FONT></TD>
         <TD BORDER="2" COLOR="#e0398b" BGCOLOR="#fdeef4" WIDTH="14" HEIGHT="12"></TD><TD ALIGN="LEFT"><FONT POINT-SIZE="13">Simulate</FONT></TD>
@@ -40,7 +40,7 @@ digraph bp_evolve_loop {
             label=<<B>Prompt template</B><BR/><FONT POINT-SIZE="14">HARCOM idioms,<BR/>mux, not <FONT FACE="Courier">if</FONT></FONT>>];
 
       agent [fillcolor="#eaf1fd", color="#2b6cd4",
-             label=<<B>Design agent</B><BR/><FONT POINT-SIZE="14">parent from<BR/>the archive</FONT>>];
+             label=<<B>Proposer</B><BR/><FONT POINT-SIZE="14">offline arm<BR/>or LLM arm</FONT>>];
       arch  [shape=cylinder, style="filled", fillcolor="#f2f4f6", color="#5b6b7a",
              label=<<B>MAP&#8209;Elites archive</B><BR/><FONT POINT-SIZE="14">EPI &#215; p1 &#215; p2</FONT>>];
 
@@ -72,14 +72,14 @@ digraph bp_evolve_loop {
       trcs [shape=cylinder, style="filled", fillcolor="#f2f4f6", color="#5b6b7a",
             label=<<B>Traces</B><BR/><FONT POINT-SIZE="14">tier 0 / tier 1</FONT>>];
       bins [shape=cylinder, style="filled", fillcolor="#f2f4f6", color="#5b6b7a",
-            label=<<B>Workloads</B><BR/><FONT POINT-SIZE="14">AArch64, gem5</FONT>>];
+            label=<<B>Workloads</B><BR/><FONT POINT-SIZE="14">x86 SE, 3 kernels</FONT>>];
 
       t0 [shape=box3d, style="filled", fillcolor="#fdeef4", color="#e0398b", penwidth=1.5,
           label=<<B>Tier&#8209;0 CBP&#8209;NG</B><BR/><FONT POINT-SIZE="14">every variant<BR/>VFS, EPI, p1/p2</FONT>>];
       t1 [shape=box3d, style="filled", fillcolor="#fdeef4", color="#e0398b", penwidth=1.5,
-          label=<<B>Tier&#8209;1 ChampSim</B><BR/><FONT POINT-SIZE="14">Pareto front<BR/>MPKI &#177;5%</FONT>>];
+          label=<<B>Tier&#8209;1 ChampSim</B><BR/><FONT POINT-SIZE="14">Pareto front<BR/>port check &#177;10%</FONT>>];
       t2 [shape=box3d, style="filled", fillcolor="#fdeef4", color="#e0398b", penwidth=1.5,
-          label=<<B>Tier&#8209;2 gem5 O3</B><BR/><FONT POINT-SIZE="14">elites only<BR/>IPC vs depth</FONT>>];
+          label=<<B>Tier&#8209;2 gem5 O3</B><BR/><FONT POINT-SIZE="14">1 per generation<BR/>IPC at 4 depths</FONT>>];
 
       edb  [shape=cylinder, style="filled", fillcolor="#f2f4f6", color="#5b6b7a", label=<<B>Lineage DB</B>>];
 

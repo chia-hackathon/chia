@@ -1,10 +1,15 @@
-% What VFS Rewards: An Audit of the CBP-NG Scoring Function
+% What Are Agents Climbing? Auditing the CBP-NG Score inside a Design Loop
 % Build:  dot -Tpdf loop.dot -o loop.pdf   (once, or when loop.dot changes)
-%         pdflatex vfs_report && pdflatex vfs_report
+%         pdflatex vfs_report && pdflatex vfs_report   (or: tectonic vfs_report.tex)
 % Needs:  IEEEtran.cls, amsmath, booktabs, graphicx, pgfplots (all standard;
 %         all on Overleaf), and loop.pdf beside this file.
-% If pgfplots is unavailable, comment out Fig. 2 -- nothing else depends on it.
-% xdvipdfmx warns that loop.pdf is PDF 1.7; the figure embeds correctly.
+% Target: A^3 workshop / CHIA hackathon, 4 pages excluding references.
+% The 9-page long version is in git history (commit 59fd1b5).
+%
+% Numbers for other work (Table I, Fig. 2) are the authors' own reported
+% IPC/CPI/EPI, pushed through the official vfs.py formula: Fan and Dang reproduce
+% their reported VFS to 4 decimals; MORSL reports no CPI, so its CPI (0.04324) is
+% back-solved from its VFS; Pallan's Table I reproduces 0.9346 (reported 0.9345).
 \documentclass[conference]{IEEEtran}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
@@ -20,415 +25,168 @@
 
 \begin{document}
 
-\title{What VFS Rewards: An Audit of the CBP-NG\\Scoring Function under Automated Search}
+\title{What Are Agents Climbing? Auditing the CBP-NG\\Score inside a Design Loop}
 
-\author{\IEEEauthorblockN{CHIA Branch-Predictor Evolution Study}
-\IEEEauthorblockA{\textit{Automated hardware/software co-design with CHIA}\\
-Generated from sweep \texttt{bp\_evolve}, generations 0--39}}
+\author{\IEEEauthorblockN{JianYu Shen}
+\IEEEauthorblockA{\textit{SiFive}\\
+jian-yu.shen@sifive.com}
+\and
+\IEEEauthorblockN{WeiCheng Lin}
+\IEEEauthorblockA{\textit{National Yang Ming Chiao Tung University}\\
+410011max@gmail.com}}
 
 \maketitle
 
 \begin{abstract}
-The Championship Branch Prediction Next Generation (CBP-NG) contest replaces
-raw misprediction rate with \vfs{}, a voltage-frequency-scaled speedup that
-folds prediction throughput, misprediction cost and predictor energy into a
-single number. We treat \vfs{} not as a ranking device but as an
-\emph{optimization target}, and ask what an automated search actually finds
-when \vfs{} is the only signal it receives. We built a three-tier evaluation
-cascade on CHIA---CBP-NG for scoring, ChampSim for port fidelity, gem5 for a
-pipeline-depth sweep---and ran forty generations of MAP-Elites over the
-template parameters of the shipped TAGE predictor, scoring 116 designs on all
-126 inner traces of the official set. Three results follow. First, over the
-scored population \vfs{} correlates strongly with prediction throughput
-($r=+0.949$) and with first-level predictor latency ($r=-0.899$), and
-essentially not at all with accuracy ($r=-0.113$ against \mpki{} spanning
-$5.08$--$10.08$). Second, the gem5 tier does not discriminate: core IPC at the
-shipped depth varies by $0.60\%$ across 39 promoted designs, and its apparent
-agreement with Tier-1 \mpki{} ($r=-0.705$) is carried by a single point and
-falls to $-0.168$ when it is removed. Third, whether the depth-nine
-ranking is depth-robust is decided entirely by whether the archive happens to
-hold an accuracy outlier. At generation ten it held one, and every discordant
-pair beyond depth twelve involved that single design; by generation
-thirty-nine the search had evicted it, the archived \mpki{} spread had narrowed
-to $5.17$--$5.62$, and rank agreement is exact at every depth from six to thirty.
-Accuracy governs depth robustness, and accuracy is exactly what the depth-nine
-score does not measure. The inner-loop ranking of the final archive survives
-the 42 held-out traces exactly (Kendall $\tau=+1.000$), though with seven elites
-and a near-constant held-out penalty that test was never seriously at risk.
+Coding agents can already optimize the CBP-NG branch prediction score. A recent
+autonomous campaign tuned the reference TAGE predictor to a \vfs{} of 0.9345 and
+concluded that, under this metric, throughput matters more than accuracy. The
+winning entries, however, reached 0.974--0.994 by a different route. This paper
+asks what an automated search is actually optimizing when it climbs \vfs{},
+using a three-tier loop on CHIA (CBP-NG, a ChampSim port check, and gem5) to
+explore 116 TAGE configurations with MAP-Elites. Our
+central finding is that throughput dominance is a property of the operating
+region rather than of the metric: the throughput elasticity of \vfs{} lies
+between $+0.28$ and $+0.68$ for every design that parameter search reaches, yet
+falls to between $-0.02$ and $+0.06$ at the winning entries, where accuracy
+matters $1.5$--$7\times$ more. We further show that an evaluation tier must be
+validated before its verdicts are trusted, since our gem5 tier separated designs
+by only 0.60\%, and that whether a ranking survives a change in pipeline depth
+is governed by accuracy, the very term the search learned to discount. Finally,
+an LLM given control of the search-space bounds matches the best design found
+with fixed bounds and wastes fewer evaluations than a threshold rule, although
+it justifies some of its choices with a mutation mechanism the loop does not
+have.
 \end{abstract}
-
-\begin{IEEEkeywords}
-branch prediction, CBP-NG, design-space exploration, quality diversity,
-MAP-Elites, simulation methodology, agentic co-design
-\end{IEEEkeywords}
 
 \section{Introduction}
 
-A scoring function used to rank a fixed slate of contest entries and a scoring
-function used to \emph{steer} an automated search are not the same artifact.
-The first needs only to order designs a human already thought worth
-submitting. The second is climbed: whatever it rewards, a search will supply,
-including rewards its designers did not intend to offer. This paper audits the
-CBP-NG scoring function in the second role.
+Agentic and evolutionary design loops~\cite{alphaevolve,archgym} promise to
+automate a growing share of architecture research, but a loop can only be as
+good as the objective it optimizes. Search is notoriously literal: it finds what
+a score rewards, which is not always what the score's designers
+intended~\cite{lehman2020surprising,amodei2016concrete}. Branch prediction offers
+an unusually clean setting in which to study this gap. The Next-Generation
+Championship in Branch Prediction (CBP-NG)~\cite{cbpng} provides a simulator,
+168 traces, and a reference TAGE predictor~\cite{seznec2006tage,seznec2011tage}
+written in HARCOM~\cite{harcom}, a restricted dialect of C++ from which each
+predictor's latency and energy are derived. Entries are ranked by
+\vfs{}~\cite{vfsmetric}, a score designed to correct a long-standing weakness of
+misprediction rate, which favors predictors too slow or too power-hungry to
+build~\cite{jimenez2000delay,jimenez2003reconsidering}.
 
-\subsection{CBP-NG}
-The Championship Branch Prediction Next Generation contest distributes a
-simulator, a set of 168 instruction traces, and a reference predictor written
-in \emph{HARCOM}, a restricted C++ subset in which storage is declared as typed
-RAM arrays with explicit read and write ports and every value carries a
-timestamp as well as a bit pattern, so that a predictor's latency and energy
-are derived from its source rather than asserted by its author.
-Entries are ranked by \vfs{}---Voltage-Frequency-Scaled speedup---which
-combines three measured quantities: how many predictions the design delivers
-per cycle, how many cycles it loses to mispredictions at an assumed pipeline
-depth, and how much dynamic energy it spends per instruction. \vfs{} is a
-deliberate improvement on ranking by misprediction rate alone, which rewards
-predictors that cannot be built.
+Coding agents have already been turned loose on this objective.
+Pallan~\cite{pallan} directed two agents through more than 2,300 configurations
+of the reference TAGE. The campaign reached 0.9345, attributed most of its gain
+to a single change in block length, and concluded that throughput dominates
+accuracy under \vfs{}; it then plateaued without discovering a new architecture.
+The three winning entries~\cite{koizumi,fan,dang}, by contrast, reached
+0.974--0.994 with ahead-pipelined designs. This contrast raises the question
+that motivates our work: is the lesson the agents learned a property of \vfs{}
+itself, or only of the region of the design space in which they searched?
 
-Two properties of the harness shape everything that follows, and both are
-easy to miss from the contest rules alone. The predictor is called once per
-\emph{instruction} rather than once per branch, and it may declare that a run
-of consecutive instructions shares a single lookup, so the quantity the score
-calls throughput is a front-end bandwidth rather than a core IPC. And because
-HARCOM derives delay and energy from the circuit a design implies, the two
-prediction latencies it reports are charged twice: once against that
-bandwidth, and again against every misprediction. Section~\ref{sec:harness}
-develops both. Our question is what the resulting metric rewards.
+We answer this question by auditing both the score and the loop that optimizes
+it, and we make three contributions. First, we derive the elasticities of
+\vfs{} in closed form and show that throughput dominance holds only on one flank
+of the score, the flank on which every parameter-search design lies, and that it
+reverses at each winning entry. Second, we propose two checks that a loop's
+evaluators should pass before an agent optimizes against them: each tier must
+separate the population it evaluates, and the resulting ranking must be stable
+across pipeline depths. Third, we report a paired experiment in which an LLM
+controls the search space rather than the design. Candidate designs are
+deliberately produced by a non-LLM operator, so that what we measure is the
+objective rather than a model's priors. The loop, which connects three
+toolchains through a shared lineage database on CHIA~\cite{chia}, is open source.
 
-\subsection{ChampSim}
-ChampSim is a trace-driven out-of-order core simulator widely used in branch
-and cache prediction research. It models a real reorder buffer, so a
-mispredicted branch costs what the machine's actual occupancy makes it cost. We
-use ChampSim as a \emph{port-fidelity} tier: a design that scores well in
-CBP-NG must be re-expressed against ChampSim's branch-predictor interface and
-must reproduce its CBP-NG conditional \mpki{} within tolerance. This catches
-the failure mode in which a CBP-NG design scores well because of something the
-CBP-NG harness permits and no core would. The port is not free of structural
-differences from the original---ChampSim offers no prediction-block hook, and
-exposes one branch at a time---so the tolerance has to be the measured width
-of those differences rather than a round number. Section~\ref{sec:ports}
-reports how we measured it.
-
-\subsection{gem5}
-gem5's O3 model is an execution-driven, cycle-level core in which pipeline
-depth is a parameter rather than a constant. CBP-NG charges misprediction at a
-\emph{fixed} nine-stage penalty. Whether a ranking obtained under that
-assumption survives a machine that is deeper or shallower is an empirical
-question, and gem5 is where we ask it, sweeping depth over
-$\{3,6,9,12,16,20,25,30\}$.
-
-\subsection{CHIA}
-CHIA is an open-source framework for agentic hardware/software co-design that
-expresses a workflow as a graph of typed nodes over a Ray-based runtime, with
-each node type pinned to its own container image and its own pool of cluster
-resources. It is what makes a three-simulator cascade practical: CBP-NG
-scoring, ChampSim porting and gem5 depth sweeps are three incompatible
-toolchains, and CHIA runs them as one flow with independently scaled pools
-(\texttt{cbp\_ng}, \texttt{champsim}, \texttt{gem5}), a single lineage
-database, and the same graph running on a workstation or across cloud VMs.
-Fig.~\ref{fig:loop} is the graph we actually run.
-
-\section{Related Work}
-
-\textbf{Branch predictor championships.} The CBP series has driven predictor
-research for two decades, and the TAGE family~\cite{seznec2006tage,seznec2011tage} remains the reference against which entries are measured. The
-metric has evolved from misprediction rate toward cost-aware scoring precisely
-because rate alone is unphysical; CBP-NG's \vfs{} is the current endpoint of
-that evolution.
-
-\textbf{Simulator fidelity.} A long line of work establishes that
-simulator-relative conclusions do not transfer freely: ChampSim, gem5 and
-custom harnesses disagree in magnitude and sometimes in
-order~\cite{gem5,champsim,akram2019survey}. Cross-simulator validation is
-recommended practice, but is usually performed once, on a final design, rather
-than being wired into the search that produced it.
-
-\textbf{Automated architecture search.} Design-space exploration by
-evolutionary and learned methods is well established, and MAP-Elites and
-quality-diversity search~\cite{mouret2015illuminating,cully2015robots} are
-attractive here because they retain a front of behaviorally distinct designs
-rather than collapsing to a single optimum. Recent work applies large language
-models to hardware design generation and repair; our harness supports an LLM
-arm, but every number in this paper comes from the \emph{offline} control arm,
-which mutates template parameters with no model in the loop.
-
-\section{What the Existing Setting Lacks}
-
-Three gaps motivate this study.
-
-\textbf{The metric is never audited as an objective.} \vfs{} is validated as a
-ranking of submitted entries. Nobody has reported what a search does when \vfs{}
-is the sole gradient---which of its three inputs actually carries the
-optimizer, and which are decorative. A term that changes the score by a few
-parts per thousand is not a design pressure, however principled its derivation.
-
-\textbf{Cross-simulator checks are terminal, not structural.} Validation
-usually happens once at the end. But the useful question is whether the
-\emph{ranking} the cheap tier produces survives the expensive one, and that
-question can only be asked if the expensive tier is inside the loop, scoring
-the same lineage.
-
-\textbf{Depth is assumed, not swept.} CBP-NG's nine-stage penalty is a fixed
-constant in the scoring path. A predictor that wins at depth nine may or may
-not win at depth twenty-five, and no contest result reports which.
-
-\section{What We Achieve}
-
-\begin{enumerate}
-\item A \textbf{three-tier evaluation cascade} on CHIA in which CBP-NG scoring,
-ChampSim port verification and a gem5 depth sweep run as one flow over one
-lineage database, so every design carries all three tiers' verdicts.
-\item A \textbf{numerical audit of \vfs{}} over a search-generated population,
-identifying which of its inputs the score is actually sensitive to.
-\item A \textbf{depth-robustness analysis} that does not merely report that the
-depth-nine ranking degrades, but isolates \emph{which design} makes it degrade
-and \emph{why}.
-\item A \textbf{re-scoring identity} that lets the full depth sweep be
-recomputed from counters measured once, making an eight-depth sweep free
-relative to one CBP-NG pass.
-\end{enumerate}
-
-\section{Methodology}
+\section{The Design Loop}
 
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{loop.pdf}
-\caption{The loop, as a CHIA graph. A design agent draws a parent uniformly
-from the occupied cells of the MAP-Elites archive and proposes a variant;
-\texttt{build\_fn} puts it through the HARCOM lint gate and then builds it
-three ways; \texttt{run\_fn} runs the tiers and decides what is promoted;
-\texttt{result\_mapper\_fn} folds the tier results into a behavior descriptor
-and writes them back. Tier~0 scores every variant, Tier~1 re-expresses the
-Pareto front against ChampSim and checks that the port still mispredicts at
-the same rate, and Tier~2 sweeps pipeline depth in gem5 for the elites. The
-three toolchains are incompatible and are pinned to separate container images
-and separate cluster pools; the lineage database is what they share.}
+\caption{The design loop as a CHIA graph. A proposer draws a parent uniformly
+from the occupied cells of the MAP-Elites archive and emits a variant, which
+\texttt{build\_fn} lints and builds for all three toolchains. \texttt{run\_fn}
+then executes the evaluation tiers and gates promotion, and
+\texttt{result\_mapper\_fn} folds the results into a behavior descriptor. Each
+toolchain runs in its own container image and cluster pool; the lineage
+database is the only state they share.}
 \label{fig:loop}
 \end{figure*}
 
-\subsection{The CBP-NG harness}
-\label{sec:harness}
-What CBP-NG measures is not what a core simulator measures, and the difference
-is the subject of this paper, so it is worth stating precisely.
+Fig.~\ref{fig:loop} shows the loop as a graph of CHIA nodes, each bound to its
+own image and machine pool, through which candidates pass three evaluation tiers
+of increasing cost.
 
-\textbf{The interface is per instruction, not per branch.} The harness walks
-the correct-path instruction stream and calls the predictor's first- and
-second-level predict methods once for \emph{every} instruction, branch or not.
-A design may declare that consecutive instructions share one lookup; the
-instructions covered by a single lookup form a \emph{prediction block}, and the
-harness retires exactly one block per cycle. A block ends at a taken branch, at
-a second-level misprediction, or when the design releases it. Prediction
-throughput $T$ is therefore instructions per block-cycle. It is a front-end
-bandwidth, and the direct way to raise it is to cover more instructions per
-lookup---not to predict better.
+Tier~0 scores every variant in the CBP-NG simulator. The harness invokes the
+predictor once per instruction, but a design may declare that consecutive
+instructions share a single lookup, called a \emph{block}. Because one block
+retires per cycle, prediction throughput $T$ measures front-end bandwidth, and
+the most direct way to raise it is to cover more instructions per lookup.
+HARCOM charges every operation the delay and energy of its circuit (ASAP5,
+300\,ps clock), which yields the latencies $p_1$ and $p_2$ of the two
+prediction levels and the energy per instruction \epi{}. Since CBP-NG imposes no
+storage budget, the triple $(\epi{},p_1,p_2)$ is the entire cost model, and we
+use it as the archive's behavior grid.
 
-\textbf{Latency and energy are derived, not declared.} Each operation on a
-HARCOM value charges the propagation delay of the gate network it implies and
-the switching energy of the capacitance it drives, and storage must be declared
-as a RAM array with an explicit port count, so a table read costs what a table
-of that shape with that many ports costs. The device parameters are those of
-the ASAP5 5\,nm predictive PDK at $V_{DD}=0.75$\,V. The clock is pinned at
-$300$\,ps, so the picoseconds accumulated on each level's critical path become
-the cycle latencies $p_1$ and $p_2$, and the femtojoules accumulated after
-warm-up, divided by correct-path instructions, become \epi{}. A design cannot
-assert that it is fast or cheap; it can only be.
+Tier~1 checks that a design survives translation to other simulators. A single
+template renders the algorithm both as a ChampSim~\cite{champsim} module and as
+a gem5~\cite{gem5} \texttt{BPredUnit}, and a design is promoted only if the
+rendered port, replayed over Tier~0's 126 search traces, reproduces its
+conditional \mpki{} to within 10\%. Tier~2 then runs one promoted design per
+generation on gem5's O3 core at pipeline depths $D\in\{6,9,16,25\}$, using x86
+syscall emulation on three kernels for $5\times10^6$ instructions each.
 
-\textbf{The three numbers are coupled.} $p_1$ and $p_2$ enter the cycle count
-behind $T$ \emph{and} the misprediction penalty $C$ of Eq.~\eqref{eq:cpi}: a
-slow second level lengthens the penalty on every misprediction, and a first
-level slower than one cycle stretches every block. Nothing else constrains a
-design---CBP-NG imposes no storage budget---so $(\epi{}, p_1, p_2)$ is the
-entire cost model, which is why the archive is binned on those three and not
-on \vfs{}.
+The search itself uses MAP-Elites~\cite{mouret2015illuminating}, which
+preserves behaviorally distinct designs rather than a single incumbent. Each
+proposal perturbs two of eight TAGE template parameters within declared ranges,
+so the operator can resize the predictor but never change its algorithm. We ran
+40 generations of three variants each, splitting the 168 traces into 126 for
+search and 42 held out and simulating each to completion after $10^6$ warm-up
+instructions. The best of the 116 designs improved by only 0.35\% over the last
+26 generations. The held-out traces were used once, after search, in a rank test
+declared in advance to signal overfitting at Kendall $\tau<0.6$.
 
-\subsection{Nomenclature}
-Three distinct quantities are called ``IPC'' in this pipeline, and conflating
-them invalidates everything downstream. Table~\ref{tab:nomen} separates them.
+\section{What the Score Rewards}
 
-\begin{table}[t]
-\caption{Quantities that share a name.}
-\label{tab:nomen}
-\centering\footnotesize
-\begin{tabular}{@{}lll@{}}
-\toprule
-Symbol & Meaning & Observed range \\
-\midrule
-$T$ & CBP-NG prediction throughput & $3.61$--$6.87$ \\
-$\text{IPC}_{1}$ & ChampSim core IPC & $1.124$--$1.126$ \\
-$\text{IPC}_{2}$ & gem5 O3 core IPC (depth 9) & $0.8867$--$0.8920$ \\
-$C$ & cycles lost to mispredictions & $0.048$--$0.105$ \\
-$w=TC$ & wrong-path per retired instr. & $0.182$--$0.686$ \\
-$\epi{}$ & predictor energy per instruction & $957$--$2337$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-$T$ is a \emph{throughput}, not a core IPC: it is how many predictions the
-predictor supplies per cycle. $C$ is a \emph{penalty}, not a period: it is
-cycles lost to mispredictions per correct-path instruction. \epi{} is
-normalized so the reference predictor scores $1000$. The product $w=TC$ is the
-quantity that actually appears in the score, and it has a physical reading of
-its own, developed next.
-
-\subsection{The scoring function: inputs and speedup}
-A design reaches the score as exactly three numbers---$T$, $C$ and \epi{}---so
-everything \vfs{} can possibly reward is a function of those three. The
-constants are $\rho=0.05$, $T_{\text{ref}}=8$, $C_{\text{ref}}=0.0315$,
-$\epi{}_{\text{ref}}=1000$ and a technology parameter $\alpha=1.625$, from
-which two further constants are \emph{derived} rather than chosen:
+To understand what an optimizer climbs, we must first see how \vfs{} views a
+design. The score depends on only three quantities: throughput $T$,
+misprediction cost $C$ (cycles lost per instruction), and \epi{}, each measured
+against a hypothetical reference core with $T_\text{ref}=8$,
+$C_\text{ref}=0.0315$, and $\epi{}_\text{ref}=1000$. The misprediction cost is
 \begin{equation}
-\gamma=\frac{2}{\alpha-1}=3.2, \qquad
-\beta=\frac{4\alpha}{(\alpha-1)^{2}}=16.64 .
-\label{eq:consts}
+C = \text{mpi}\,\bigl(D + p_2 - \max(1,\min(p_1,p_2))\bigr),
+\label{eq:cpi}
 \end{equation}
-Sections~\ref{sec:tech} and \ref{sec:norm} show where both come from; they are
-not free parameters, and a reader who treats them as tuning knobs will
-misread the metric.
-
-The first derived quantity is
+where $D=9$ is the pipeline depth. Letting $w=TC$ denote the wrong-path
+instructions fetched per retired instruction, the speedup term can be rewritten
+as a ratio of \emph{useful} fetch bandwidth,
 \begin{equation}
-w \;=\; T\,C, \qquad w_{\text{ref}} = T_{\text{ref}}C_{\text{ref}} = 0.252 .
-\label{eq:wpi}
-\end{equation}
-Despite appearances this is not an abstract product. If the machine loses $C$
-cycles per correct-path instruction and fetches $T$ instructions in each of
-them, it fetched $TC$ \emph{wrong-path} instructions that were later squashed.
-So $w$ is the fetch amplification: the reference core fetches $1.252$
-instructions for every one it retires, and roughly a fifth of its front-end
-work is discarded. Naming $w$ correctly matters, because it makes the speedup
-term collapse to one idea. Written as in the reference implementation,
-\begin{equation}
-S \;=\; \frac{T}{T_{\text{ref}}}\cdot\frac{1+w_{\text{ref}}}{1+w},
+S = \frac{T/(1+w)}{T_\text{ref}/(1+w_\text{ref})},
 \label{eq:speedup}
 \end{equation}
-it looks like a throughput ratio with a correction bolted on. Regrouped, it is
-a single ratio,
+and the score becomes
 \begin{equation}
-S \;=\; \frac{T/(1+w)}{T_{\text{ref}}/(1+w_{\text{ref}})},
-\label{eq:speedup2}
-\end{equation}
-of \emph{useful} instructions per cycle---total fetch bandwidth divided by
-fetch amplification. $S$ is therefore an honest architectural speedup at fixed
-frequency. Accuracy is not absent from it, but it enters only through the
-denominator $1+w$, where $w\!\ll\!1$: over our entire population $w$ ranges
-over $0.182$--$0.686$, so even the worst design in the study loses about a
-quarter of $S$ to the accuracy term, while $T$ scales $S$ proportionally.
-
-\subsection{The technology model behind $\alpha$, $\beta$ and $\gamma$}
-\label{sec:tech}
-The trailing bracket of the score,
-\begin{equation}
-F(P) \;=\; \alpha\left(1-\frac{2}{1+\sqrt{1+\beta/P}}\right),
-\label{eq:fp}
-\end{equation}
-is usually quoted without interpretation. It is in fact one voltage--frequency
-curve, written backwards. Substituting $u=\sqrt{1+\beta/P}$ and eliminating $u$
-against the fixed-power-envelope constraint $P\,V^{2}F=1$---power is
-capacitance-limited, so a design drawing normalized power $P$ at nominal
-voltage may be clocked only as fast as its energy budget allows---gives, with
-$\beta$ as in \eqref{eq:consts}, the closed form
-\begin{equation}
-\frac{f}{f_{0}} \;=\; \alpha-\frac{\alpha-1}{V/V_{0}} .
-\label{eq:fv}
-\end{equation}
-Equation~\eqref{eq:fv} is the classical first-order delay model
-$\text{delay}\propto V/(V-V_{\text{th}})$, and it fixes the meaning of every
-constant in \eqref{eq:consts}:
-\begin{itemize}\itemsep2pt
-\item \textbf{$\alpha$ is a frequency ceiling.} As $V\!\to\!\infty$,
-$f/f_{0}\to\alpha$. No amount of voltage buys more than $1.625\times$ the
-reference clock.
-\item \textbf{$V_{0}$ is the calibration point.} At $V=V_{0}$,
-\eqref{eq:fv} returns $f=f_{0}$ exactly.
-\item \textbf{$(\alpha-1)/\alpha=0.3846$ is the implied threshold voltage.}
-Below $0.385\,V_{0}$ the model gives $f\le0$.
-\item \textbf{$\beta$ is not free.} It is the unique value for which
-$F(1)=1$: at reference power the design gets exactly the reference clock. We
-verified this and the inversion \eqref{eq:fv} numerically over
-$P\in[0.25,4]$, recovering $P V^{2}F=1$ to machine precision.
-\end{itemize}
-Note that $F$ \emph{decreases} in $P$. This is the correct sign: $P$ is the
-power the design would draw at nominal frequency, so a hungrier design must be
-clocked down to fit the same envelope.
-
-The same curve explains $\gamma$, which appears as $S^{\gamma}$ in the energy
-term. Energy per operation scales as $V^{2}$, and inverting \eqref{eq:fv} to
-$V(f)=(\alpha-1)/(\alpha-f)$ gives
-\begin{equation}
-\left.\frac{\mathrm{d}\ln V^{2}}{\mathrm{d}\ln f}\right|_{f=1}
-=\frac{2}{\alpha-1}=\gamma .
-\label{eq:gamma}
-\end{equation}
-So $S^{\gamma}$ charges the non-predictor part of the core the
-\emph{DVFS-equivalent} energy of running $S$ times faster---what the speedup
-would have cost had it been bought with voltage instead of with prediction.
-Two consequences deserve stating. First, this is why the energy term is
-superlinear at all: without it, a faster front end would be nearly free.
-Second, \eqref{eq:gamma} is a first-order identity at $f=1$ only, and the
-approximation degrades away from the reference point: at $S=0.72$, typical of
-our seed, $S^{\gamma}=0.350$ against an exact $V^{2}=0.477$, so the model
-\emph{understates} the core energy of a slow design by a third. Every design
-in this study sits in that regime.
-
-\subsection{Normalization: $\rho$ and $\lambda$}
-\label{sec:norm}
-The normalized energy per instruction is
-\begin{equation}
-E \;=\; \left(\frac{\epi{}}{\epi{}_{\text{ref}}}\rho + \lambda S^{\gamma}\right)
-        \!\left(1+\frac{w}{2}\right),
-\label{eq:energy}
-\end{equation}
-with $\rho=0.05$ the predictor's share of core energy and $\lambda$ the
-remaining core's share. The factor $(1+w/2)$ charges wrong-path work at half
-the energy of a retired instruction, which is where $w$ re-enters. The value
-\begin{equation}
-\lambda \;=\; \bigl(1+w_{\text{ref}}/2\bigr)^{-1}-\rho \;=\; 0.838099
-\label{eq:lambda}
-\end{equation}
-is pure normalization and carries no physics: it is chosen so that the two
-shares, scaled by the wrong-path factor, come to exactly unity at the
-reference point, $(0.05+0.838099)\times1.126=1.000000$.
-
-\subsection{What the score is}
-Writing $P=S\,E$---a speedup times an energy per instruction, hence a
-power---the score is
-\begin{equation}
-\vfs{} \;=\; S\;\alpha\left(1-\frac{2}{1+\sqrt{1+\beta/(S E)}}\right)
-       \;=\; S\cdot F(P).
+\vfs{} = S\cdot F(SE),\quad
+F(P)=\alpha\Bigl(1-\frac{2}{1+\sqrt{1+\beta/P}}\Bigr),
 \label{eq:vfs}
 \end{equation}
-In words: \emph{the architectural speedup at fixed frequency, times the clock
-frequency that this design's power bill actually permits}. That is what
-``voltage-frequency-scaled'' names. The construction has two calibration
-properties that we verified exactly and that are essential to reading any
-\vfs{} number:
-\begin{enumerate}\itemsep2pt
-\item \textbf{The reference predictor scores $1.000000$.} Substituting
-$(T,C,\epi{})=(8,0.0315,1000)$ yields $S=1$, $E=1$, $P=1$, $F=1$ and
-$\vfs{}=1$ to every digit. A score below one therefore means \emph{worse than
-the CBP-NG reference}, not merely low.
-\item \textbf{The reference sits at the maximum of its own curve.} Holding $C$
-and \epi{} at reference values and sweeping $T$, \vfs{} is maximized at
-$T=8.05$---the reference throughput---and \emph{falls} beyond it, because
-$S^{\gamma}$ eventually outruns the linear gain.
-\end{enumerate}
-Property~2 is the design intent of the whole metric: at the reference
-operating point the elasticity of \vfs{} with respect to raw throughput is
-only $+0.008$, so a contestant cannot win by widening the front end. The
-metric is deliberately flat there.
+where $E=(\rho\,\epi{}/\epi{}_\text{ref}+\lambda S^{\gamma})(1+w/2)$ and
+$\rho=0.05$ is the predictor's share of core energy~\cite{vfsmetric}.
 
-\subsection{Which term carries the optimizer}
-\label{sec:elast}
-Whether that intent survives depends entirely on where a design sits, and this
-is the pivot of the paper. Table~\ref{tab:elast} reports the elasticities
-$\partial\ln\vfs{}/\partial\ln x$ at the reference point, at the seed, and at
-three archived designs spanning the range of $T$ the search reached;
-Fig.~\ref{fig:tcurve} plots the underlying curve.
+The constants are not arbitrary. $F$ follows from the delay model
+$f/f_0=\alpha-(\alpha-1)V_0/V$ under a fixed power envelope $PV^2f=1$, so
+$\alpha=1.625$ is a frequency ceiling, $\beta$ is the value for which $F(1)=1$,
+and $\gamma=2/(\alpha-1)=3.2$ makes $S^\gamma$ the DVFS energy of running $S$
+times faster. \vfs{} is thus the speedup at fixed frequency multiplied by the
+clock rate its power budget permits. Our reimplementation reproduces the
+reference score, every stored score, and other entries' reported scores
+(Table~\ref{tab:elast}).
 
 \begin{table}[t]
-\caption{Elasticity of \vfs{}: the percentage change in \vfs{} produced by a
-one-percent change in each input. Computed at the reference point, at the seed
-and at three designs from the generation-39 archive.}
+\caption{Elasticity $\partial\ln\vfs{}/\partial\ln x$ at reported operating
+points. Other entries use the points given in their papers (168 traces, each
+under its own settings); ours are measured on the 126 search traces.
+$^\dagger$\,$C$ is back-solved from the reported \vfs{}.}
 \label{tab:elast}
 \centering\footnotesize
 \begin{tabular}{@{}lrrrrr@{}}
@@ -437,10 +195,14 @@ Design & \vfs{} & $T$ & $\partial T$ & $\partial C$ & $\partial\epi{}$ \\
 \midrule
 reference & $1.0000$ & $8.00$ & $+0.008$ & $-0.035$ & $-0.013$ \\
 \midrule
-gen037\_2 & $0.9288$ & $6.87$ & $+0.278$ & $-0.135$ & $-0.024$ \\
-gen025\_0 & $0.9003$ & $6.59$ & $+0.324$ & $-0.165$ & $-0.023$ \\
-gen000\_seed & $0.8784$ & $5.80$ & $+0.410$ & $-0.149$ & $-0.024$ \\
-gen029\_2 & $0.6750$ & $3.67$ & $+0.677$ & $-0.138$ & $-0.040$ \\
+MORSL$^\dagger$~\cite{koizumi} (1st) & $0.9935$ & $8.65$ & $-0.007$ & $-0.048$ & $-0.007$ \\
+Fan~\cite{fan} (2nd) & $0.9921$ & $8.89$ & $-0.015$ & $-0.051$ & $-0.005$ \\
+Dang~\cite{dang} (3rd) & $0.9742$ & $8.62$ & $+0.056$ & $-0.082$ & $-0.016$ \\
+\midrule
+Pallan~\cite{pallan} & $0.9345$ & $6.84$ & $+0.275$ & $-0.130$ & $-0.021$ \\
+ours, best & $0.9288$ & $6.87$ & $+0.278$ & $-0.135$ & $-0.024$ \\
+seed TAGE & $0.8784$ & $5.80$ & $+0.410$ & $-0.149$ & $-0.024$ \\
+ours, low $T$ & $0.6750$ & $3.67$ & $+0.677$ & $-0.138$ & $-0.040$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -448,544 +210,304 @@ gen029\_2 & $0.6750$ & $3.67$ & $+0.677$ & $-0.138$ & $-0.040$ \\
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}
-\begin{axis}[width=\columnwidth,height=4.6cm,
+\begin{axis}[width=\columnwidth,height=3.9cm,
   xlabel={prediction throughput $T$}, ylabel={\vfs{}},
-  xmin=3,xmax=14, ymin=0.55,ymax=1.04,
-  legend style={font=\tiny,at={(0.98,0.03)},anchor=south east,draw=none},
+  xmin=3,xmax=12, ymin=0.55,ymax=1.04,
+  legend columns=1,
+  legend style={font=\tiny,at={(0.02,0.97)},anchor=north west,draw=none,fill=white},
   tick label style={font=\scriptsize}, label style={font=\scriptsize},
   grid=major, grid style={gray!20}]
 \addplot[thick] coordinates
  {(3.0,0.6264) (4.0,0.7707) (5.0,0.8774) (6.0,0.9483) (7.0,0.9875) (7.5,0.9968)
   (8.0,1.0000) (8.5,0.9979) (9.0,0.9912) (10.0,0.9664) (11.0,0.9301)
-  (12.0,0.8864) (13.0,0.8385) (14.0,0.7889)};
-\addlegendentry{reference $C,\epi{}$}
+  (12.0,0.8864)};
+\addlegendentry{ref.\ $C,\epi{}$}
 \addplot[thick,dashed] coordinates
  {(3.0,0.5908) (4.0,0.7216) (5.0,0.8204) (6.0,0.8905) (7.0,0.9360) (8.0,0.9614)
-  (9.0,0.9707) (9.5,0.9704) (10.0,0.9674) (11.0,0.9547) (12.0,0.9350)
-  (13.0,0.9105) (14.0,0.8826)};
+  (9.0,0.9707) (9.5,0.9704) (10.0,0.9674) (11.0,0.9547) (12.0,0.9350)};
 \addlegendentry{seed $C,\epi{}$}
+\addplot[only marks,mark=*,mark size=1.4pt] coordinates {(5.80,0.8784) (6.87,0.9288)};
+\addlegendentry{ours}
+\addplot[only marks,mark=square*,mark size=1.4pt,gray] coordinates {(6.844,0.9345)};
+\addlegendentry{Pallan}
+\addplot[only marks,mark=triangle*,mark size=2pt,red!70!black] coordinates
+ {(8.617,0.9742) (8.647,0.9935) (8.893,0.9921)};
+\addlegendentry{winners}
 \addplot[gray,dotted,very thick,forget plot] coordinates {(3.61,0.55) (3.61,1.04)};
 \addplot[gray,dotted,very thick,forget plot] coordinates {(6.87,0.55) (6.87,1.04)};
 \end{axis}
 \end{tikzpicture}
-\caption{\vfs{} against prediction throughput $T$, holding $C$ and \epi{}
-fixed. The curve peaks at $T\!=\!8.05$ (reference) and $T\!=\!9.20$ (seed) and
-declines beyond. Dotted lines bracket the range our search actually explored,
-$T\in[3.61,6.87]$: the entire population lives on the steep uphill flank,
-where throughput dominates every other term.}
+\caption{\vfs{} as a function of $T$ with $C$ and \epi{} held fixed (lines),
+together with reported designs (marks). The dotted lines bracket every design
+our search produced; the winning entries lie beyond the knee.}
 \label{fig:tcurve}
 \end{figure}
 
-Two readings follow. At the reference point the metric behaves as designed:
-throughput is worth almost nothing ($+0.008$), and accuracy, at $-0.035$, is
-the largest of the three. But \emph{our population never reached that point}.
-Every design we scored has $T\in[3.61,6.87]$, far down the uphill flank of
-Fig.~\ref{fig:tcurve}, where the throughput elasticity is $+0.28$ to $+0.68$
-and exceeds the accuracy elasticity in every one of the 116 designs, by a
-factor of $1.2$ to $5.2$. Concretely,
-from the seed a $10\%$ reduction in misprediction cost is worth $+1.49\%$
-\vfs{}, while a $10\%$ increase in throughput is worth $+3.63\%$ and a $10\%$
-reduction in predictor energy is worth $+0.24\%$. Even an oracle predictor
-($C\!\to\!0$) buys only $+14.6\%$, less than twice what simply reaching the
-reference throughput would buy ($+9.5\%$).
+\subsection{Throughput dominance is a regime}
 
-This is the mechanism behind every result in Section~\ref{sec:res}. \vfs{} is
-not intrinsically a throughput metric; it is one \emph{in the regime where
-every realistic HARCOM predictor operates}, because the flat region that makes
-it balanced sits at a front-end width that none of the designs reach. An
-optimizer placed in that regime will climb width, and ours did.
+With the score in closed form, we can ask how sensitive it is to each input,
+and Table~\ref{tab:elast} shows that the answer depends on where a design sits.
+When $C$ and
+\epi{} are held at their reference values, \vfs{} peaks at $T=8.05$. At that
+peak the throughput elasticity is only $+0.008$ and accuracy ($-0.035$) is the
+largest term; near the reference, the score is intentionally insensitive to
+additional width.
 
-\subsection{Aggregation and the re-scoring identity}
-Per trace, with $p_1,p_2$ the first- and second-level predictor latencies in
-cycles, cycles are accumulated as
-\begin{equation}
-\text{cyc} =
-\begin{cases}
-N_p\max(1,p_2), & p_2\le p_1\\[2pt]
-N_p\max(1,p_1)+N_d p_2-N_e\max(1,p_1), & p_2>p_1
-\end{cases}
-\end{equation}
-for $N_p$ predictions, $N_d$ divergences and $N_e$ divergences at end of trace,
-and $T$ is the harmonic mean of $N_{\text{inst}}/\text{cyc}$ over traces. The
-misprediction cost is
-\begin{equation}
-C \;=\; \text{mpi}\,\bigl(D + p_2 - \max(1,\min(p_1,p_2))\bigr),
-\label{eq:cpi}
-\end{equation}
-where $D$ is pipeline depth and $\text{mpi}$ is mispredictions per instruction.
-Equation~\eqref{eq:cpi} is the \emph{only} place $D$ appears. Consequently the
-entire depth sweep is a closed-form re-scoring of counters measured once: eight
-depths cost one CBP-NG pass, not eight. Our reimplementation reproduces
-every stored \vfs{} in the study exactly---maximum absolute deviation $0$ over
-all scored designs---and reproduces the stored depth sweep exactly.
+The picture changes on the rising flank of Fig.~\ref{fig:tcurve}. Every design
+our search produced lies in $T\in[3.61,6.87]$, with throughput elasticities
+between $+0.28$ and $+0.68$, and in all 116 the throughput term exceeds the
+accuracy term by a factor of $1.2$--$5.2$. Pallan's campaign occupied the same
+region: the sensitivities he reports at $T=6.84$ ($+2.4\%$, $+1.4\%$, and
+$+0.2\%$ \vfs{} for a 10\% change in $T$, mpi, and \epi{}) agree with
+Eq.~\eqref{eq:vfs} evaluated at that point ($+2.2$, $+1.3$, $+0.2$).
 
-\subsection{Search}
-We use MAP-Elites over a behavior grid keyed on (\epi{} band, $p_1$ latency,
-$p_2$ latency), nominally $6\times4\times6=144$ cells. Parents are drawn
-\emph{uniformly over occupied cells}, not proportionally to \vfs{}; this is
-what keeps behaviorally distinct designs alive and matters in
-Section~\ref{sec:res}. The offline arm perturbs exactly two of eight template
-parameters of the seed TAGE per proposal, clipped to declared ranges. It
-changes no algorithm: the source diff between the seed and any offline
-descendant is the struct name.
+The winning entries lie elsewhere. At their reported operating points the
+throughput elasticity falls to between $-0.015$ and $+0.056$, while the accuracy
+elasticity grows to between $-0.048$ and $-0.082$. MORSL and Fan in fact sit
+almost exactly at the throughput that maximizes \vfs{} for their own $C$ and
+\epi{} ($8.59$ and $8.78$), where further width would \emph{lower} the score.
+They reached this region through ahead-pipelining~\cite{koizumi,fan,dang}, a
+change that no resizing of the reference TAGE can express. The claim that
+throughput dominates therefore describes the region that parameter search
+explores, not \vfs{} itself, and an agent that internalizes it will keep buying
+width well past the point at which width stops paying.
 
-\subsection{Tiers, and what a port is allowed to move}
-\label{sec:ports}
-Tier~0 scores every proposal on all 126 inner traces. Tier~1 re-expresses the
-Pareto front against ChampSim, at most six designs per generation. Tier~2
-promotes at most two to gem5 and sweeps depth. The two ports share one file:
-the algorithm is rendered once from a common template and included both by the
-ChampSim branch module and by the gem5 \texttt{BPredUnit} subclass, so a
-Tier-1 and a Tier-2 result about a design are results about the same code.
+\subsection{What the flank selects}
 
-The ChampSim adapter itself is nearly nothing---predict on the way in, update
-on the way out---but two differences from the HARCOM original are structural,
-and a reader is entitled to ask whether a cross-tier comparison is comparing
-predictors or comparing translations.
+The same effect is visible within our own population. Across the 116 designs,
+\vfs{} correlates with $T$ at $r=+0.949$ but with \mpki{} at only $r=-0.113$,
+even though \mpki{} varies from $5.08$ to $10.08$. The best design,
+\texttt{gen037\_2}, differs from the seed chiefly by raising the block length
+\texttt{LOGLB} from 6 to 7, so that each lookup covers 32 instructions rather
+than 16, which is the same change Pallan's agents identified. Its \mpki{} barely
+moves ($5.338\to5.333$) while $T$ rises from $5.80$ to $6.87$. Conversely, the
+most accurate design we found (\mpki{} $5.084$) scores only $0.744$, and all
+seven final elites sit at \texttt{LOGLB}$=7$, the upper bound of the template.
 
-\textbf{The first prediction level is not ported.} In the seed design the
-second level overrides the first on every instruction, so the first level
-changes no prediction ChampSim could observe. It contributes to Tier~0's
-latency and energy accounting and to nothing else, and porting it would add a
-cost the ChampSim model cannot charge in exchange for no change in outcome.
+On this flank, accuracy behaves less like a slope that the search climbs than
+like a cliff from which it occasionally falls. Widening the block consumes
+hashed tag bits, leaving $H=\texttt{TAGW}-(\texttt{LOGLB}-2)$. The 100 designs
+with $H\ge6$ average $5.43$ \mpki{} (at most $5.97$), whereas the 16 with $H\le5$
+average $9.47$ (at least $9.00$).
 
-\textbf{Global history advances at a different granularity.} CBP-NG advances
-it once per prediction block; ChampSim exposes one branch at a time and offers
-no block hook, so the port advances it once per branch. Two correct ports of
-one predictor, fed histories that advance at different rates, compute
-different indices, and until recently the only way to see the size of that
-effect was to build ChampSim and simulate---which measures the port and the
-core model together. We now measure it alone: a simulator-free harness renders
-the shared algorithm through the same template path, compiles it, and replays
-CBP-NG traces through it over Tier~0's own window. The gap is small and
-one-sided, the port coming out \emph{better} by $2.1\%$ to $5.5\%$ over
-designs spanning $6.2$ to $14.4$ Tier-0 \mpki{} (ratios $0.979$, $0.962$,
-$0.946$, $0.945$).
-
-The promotion gate follows that measurement rather than a round number. The
-rendered algorithm must reproduce its Tier-0 \mpki{} to within $10\%$: wider
-than the $5\%$ the built-simulator comparison uses, because $5\%$ would reject
-correct ports at the bottom of the measured range, and still far tighter than
-a translation error, which moves \mpki{} by much more than $10\%$. The
-comparison is against ChampSim's \emph{conditional} \mpki{}, never the total it
-prints first---the total also charges the BTB and the return-address stack,
-which no Tier-0 number contains, and comparing totals would make every correct
-port look some $50\%$ wrong. Tiers~0 and 1 are also driven from the same
-program: the ChampSim trace is converted from the CBP-NG one, and the
-conversion is checked against the instruction and branch totals CBP-NG reports
-for itself, so a residual \mpki{} gap is about the predictor and not about
-which workload ran.
-
-\section{Experimental Setup}
-
-We ran forty generations (0--39), three variants per generation, on the
-official 168-trace CBP-NG set split 126 inner / 42 held out, with every trace
-run to its end and $10^{6}$ warm-up instructions. The sweep was configured for
-fifty generations and stopped by hand after generation 39, which completed all
-three tiers; generation 40 had written nothing. We stopped because the search
-had saturated: the best score moved twice in the last 26 generations, from
-$0.92564$ to $0.92878$ at generation 16 and to $0.92884$ at generation 37, a
-total of $+0.35\%$, and in four of the last five generations the closest
-proposal missed its cell's incumbent by less than $0.0005$. One hundred and
-eighteen designs were proposed; 116 scored and two failed at the run stage
-(\texttt{gen006\_0} and \texttt{gen007\_0}, both at the run rather than the
-build step). Forty designs reached Tier~1 and 39 reached Tier~2.
-
-The run spans five execution segments, and the boundaries matter only for
-reproducibility, not for the search: generations 0--2 ran on four
-\texttt{t2d-standard-8} cloud VMs plus a local pool; generations 3--39 ran on a
-single workstation with 16 concurrent CBP-NG slots. Within the local phase the
-driver was restarted three times---twice because a Windows Update restarted the
-host underneath the WSL2 VM---each time resuming from the newest archive
-snapshot. Because MAP-Elites' search state is the archive, and each archived
-elite stores its own template-parameter vector, the parameter walk continues
-across every such boundary; we verified that every generation-3 variant is two
-parameters from its parent, not from the seed.
-
-Two consequences of the restarts are worth recording because they affect any
-re-analysis. First, the driver derives its resume point as one past the highest
-generation represented in the archive, which under-counts whenever the last
-completed generation archived nothing: generation 14 archived nothing on its
-first execution and was therefore re-run. Both executions are in the database;
-we use the second and discard the first. Second, and consequently, variant
-identifiers are unique only within an execution segment, not across the run.
-Every join in this analysis is on (segment, identifier); joining on identifier
-alone silently merges the two generation-14 populations.
-
-\subsection{Why a quarter of the traces is held out}
-\label{sec:heldout}
-CBP-NG does not define a held-out set; the split is ours, and it exists because
-the search is a search. MAP-Elites climbs \vfs{} \emph{as measured on the
-traces it is scored on}, and it will supply whatever those particular traces
-reward---including properties of the subset rather than of prediction. Nothing
-inside the loop can tell the two apart: the archive stores the score, and the
-score was computed on the inner set. An overfit to 126 programs and a genuine
-improvement are the same number to every mechanism the loop has. The only
-instrument that separates them is a set of traces the search was never scored
-on.
-
-The partition is a seeded shuffle of the official 168 with a fixed seed, taking
-the first quarter as held out: 42 traces and $1.108\times10^{9}$ instructions
-held out, 126 traces and $3.881\times10^{9}$ instructions inner. Seeding it
-matters more than it looks. It makes the split a property of the trace
-\emph{set} rather than of when the sweep happened, so two sweeps over the same
-traces are comparable, and---because this sweep was resumed twice across a
-change of cluster---a resumed run cannot silently promote a held-out trace into
-the inner loop and quietly destroy the only evidence that would have caught an
-overfit.
-
-The test the split supports is a \emph{rank} test, not a score test. We rebuild
-each archived elite, re-score it on the 42 held-out traces, and compute
-Kendall's $\tau$ between the inner-loop ranking and the held-out ranking. The
-ordering is the right object because the ordering is what the search consumed:
-parents were selected, and designs promoted, on relative standing, not on
-absolute \vfs{}. A front that reorders itself on unseen traces was never a
-front. We report $\tau<0.6$ as an overfit to the inner subset rather than a
-result. Because the test costs a full Tier-0 pass over the whole archive, it is
-run once against the final archive rather than per generation.
-
-\textbf{Every \vfs{} value in this paper is in-sample unless it is labelled
-held-out.} The held-out scores appear only in Section~\ref{sec:heldout-res}
-and were computed once, after the search had stopped; nothing in the loop ever
-saw them.
-
-\section{Results}
+\section{Can the Evaluators Be Trusted?}
 \label{sec:res}
 
-\subsection{Finding 1: \vfs{} tracks throughput, not accuracy}
+A score is only half of what an agent optimizes; the other half is the
+machinery that measures it. Before trusting a loop's verdicts, we therefore put
+two questions to its evaluators.
 
-Over the 116 scored designs (Table~\ref{tab:corr}), \vfs{} correlates strongly
-with prediction throughput and with first-level latency, weakly with energy,
-and essentially not at all with accuracy---despite \mpki{} spanning a factor of
-two, from $5.08$ to $10.08$. At $r=-0.113$ over 116 designs the accuracy
-coefficient is nominally of the expected sign, but it accounts for $1.3\%$ of
-the variance in \vfs{} against $90\%$ for throughput: the ordering is set by
-$T$ and perturbed by nothing else that matters. This is not a small sample
-effect; it is Table~\ref{tab:elast} made visible.
+\subsection{Does each tier separate the population?}
 
-\begin{table}[t]
-\caption{Pearson correlation with \vfs{} over 116 scored designs.}
-\label{tab:corr}
-\centering\small
-\begin{tabular}{@{}lrl@{}}
-\toprule
-Quantity & $r$ & Interpretation \\
-\midrule
-Throughput $T$ & $+0.949$ & the objective \\
-$p_1$ latency & $-0.899$ & the cost of throughput \\
-\epi{} & $-0.443$ & weighted by $\rho=0.05$ \\
-$p_2$ latency & $-0.074$ & hidden behind $p_1$ \\
-\mpki{} & $\mathbf{-0.113}$ & \textbf{no signal} \\
-\bottomrule
-\end{tabular}
-\end{table}
+The answer differs sharply between our two validation tiers. The port check
+does its job. Although the rendered port departs structurally from Tier~0 (the
+first prediction level is not ported, and ChampSim advances history per branch
+rather than per block), all 40 promoted designs passed the gate with \mpki{}
+1.5--8.8\% \emph{lower} than Tier~0 (ratios 0.912--0.985), a bias consistent
+with the finer-grained history.
 
-The best design found, \texttt{gen037\_2} at $\vfs{}=0.9288$, is the seed with
-the fetch-line width \texttt{LOGLB} raised $6\!\to\!7$---which doubles
-delivered predictions per cycle from 16 to 32---plus three smaller changes: the
-bimodal table \texttt{LOGB} $12\!\to\!14$, the tag width \texttt{TAGW}
-$11\!\to\!12$, and the first-level history \texttt{GHIST1} $6\!\to\!7$. It is
-\emph{not} meaningfully more accurate than the seed---\mpki{} moves from $5.338$
-to $5.333$, a tenth of a percent---while its throughput rises from $5.80$ to
-$6.87$, and at $40.0$\,KiB against the seed's $35.0$\,KiB it buys its $5.74\%$
-score improvement almost entirely with width. It displaced
-\texttt{gen016\_2}, the best design at generation~29, by $0.00006$: the two
-share \texttt{LOGLB}, \texttt{LOGB} and $T$ to three figures, and the newer one
-differs by returning \texttt{GHIST} to the seed's $100$, taking
-\texttt{GHIST1} from $8$ back to $7$, and spending one more tag bit. Conversely the most accurate design found,
-\texttt{gen010\_2} at $\mpki{}=5.084$, spends $74.25$\,KiB, more than twice the
-seed, and scores only $\vfs{}=0.7444$.
+The gem5 tier, by contrast, cannot tell designs apart. Across the 39 designs it
+evaluated, depth-9 core IPC ranged only from $0.8867$ to $0.8920$, a spread of
+$0.60\%$ that stayed below $0.69\%$ at every depth and did not widen as the
+population grew from 10 to 39 designs. Its correlation with \vfs{} is $r=+0.06$.
+Its correlation with Tier-0 \mpki{}, $r=-0.73$, initially suggests agreement
+between simulators, but it falls to $-0.27$ once a single outlier
+(\texttt{gen005\_0}, \mpki{} $9.37$) is removed. Three short kernels are simply
+too little workload to expose a 5\% difference in \mpki{}. The broader lesson is
+that an expensive tier must first be shown to discriminate among the designs it
+will actually see; ours had the appearance of validation without its substance.
 
-The point survives at the level of the whole archive, and more sharply than at
-generation ten. Every one of the seven elites holding a cell at generation~39
-has $\texttt{LOGLB}=7$, as did every elite at generation~29: the search
-converged unanimously on the widest fetch line the template allows, in every
-corner of the behaviour space, while their \mpki{} values sit within $0.45$ of
-one another. Across the whole population 88 of 116 scored designs have
-$\texttt{LOGLB}=7$. Width is the only axis the
-score consistently pays for. Storage is not that axis either---the second-best
-elite, \texttt{gen017\_2} at $\vfs{}=0.9207$, is \emph{smaller} than the seed
-at $26.0$\,KiB.
+\subsection{Does the ranking survive other depths?}
 
-A single derived parameter explains the accuracy axis. The number of hashed tag
-bits is $H = \texttt{TAGW} - (\texttt{LOGLB}-2)$, and \mpki{} is a step
-function of it: the 100 designs with $H\ge 6$ average $5.43$ \mpki{} and never
-exceed $5.97$; the 16 with $H\le5$ average $9.47$ and never fall below $9.00$.
-Across 116 designs nothing lands in the gap. Tag aliasing is a cliff, not a
-slope, and the cliff edge is between $H=5$ and $H=6$.
-
-\subsection{Finding 2: the gem5 tier does not discriminate}
-
-Across the 39 designs promoted to Tier~2, gem5 core IPC at the shipped depth
-spans $0.8867$--$0.8920$: a total spread of $0.60\%$. Growing the promoted
-population from 10 to 29 to 39 did not improve separation; the range has not
-moved since generation~29. Tier~2 as configured cannot separate these designs,
-and this must be stated before any correlation computed on it is believed.
-
-It is worth showing why. Regressing Tier-1 \mpki{} against gem5 depth-9 IPC
-over all 39 designs gives $r=-0.705$, which reads as respectable
-cross-simulator agreement. It is not robust. Deleting \texttt{gen005\_0}
-alone (Tier-1 $\mpki{}=16.15$, the only design far from the pack) takes it to
-$-0.168$: one design out of 39 carries $47$ of the $50$ percentage points of
-variance the coefficient appears to explain. At generation~29, over 29 designs,
-deleting two points inverted the sign; with ten more designs the sign no
-longer flips under any leave-two-out deletion (range $-0.816$ to $-0.085$), but
-the magnitude is still one design's. We report it because the
-per-generation $\tau(\vfs{},\text{IPC})=+1.00$ printed by our own harness is
-likewise degenerate, computed over the single design promoted per generation,
-and should not be quoted.
-
-\subsection{Finding 3: depth robustness is governed by accuracy}
-
-We rank the seven archived elites by \vfs{} at each depth and compare against
-the shipped depth of nine by Kendall's $\tau$ over all 21 pairs. Running the
-search a further twenty-nine generations turned this measurement into a natural
-experiment, because the archive it is computed over is not the same set of
-designs it was at generation ten---not one of the seven generation-ten elites
-survives to generation~39 (Table~\ref{tab:tau}).
+Pipeline depth enters \vfs{} only through Eq.~\eqref{eq:cpi}, so the score at
+any depth can be recomputed in closed form from counters measured once. We
+exploit this property to rank the seven archived elites at each depth and
+compare the result with the ranking at $D=9$ using Kendall's $\tau$ over 21
+pairs. Table~\ref{tab:tau} reports this comparison for the archives at
+generations 10 and 39, which share no designs.
 
 \begin{table}[t]
-\caption{Rank agreement of the seven-elite ordering at depth $D$ against the
-ordering at the shipped depth $D=9$, for the archive as it stood at generation
-ten and at generation thirty-nine.}
+\caption{Kendall $\tau$ of the seven-elite ranking at depth $D$ against the
+ranking at $D=9$, with the number of discordant pairs.}
 \label{tab:tau}
-\centering\small
-\begin{tabular}{@{}rrlrl@{}}
+\centering\footnotesize
+\begin{tabular}{@{}rrrrr@{}}
 \toprule
 & \multicolumn{2}{c}{gen.\ 10 archive} & \multicolumn{2}{c}{gen.\ 39 archive} \\
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}
-$D$ & $\tau$ & Discordant & $\tau$ & Discordant \\
+$D$ & $\tau$ & disc. & $\tau$ & disc. \\
 \midrule
-3      & $+1.000$ & 0 & $+0.905$ & 1 \\
+3        & $+1.000$ & 0 & $+0.905$ & 1 \\
 6, 9, 12 & $+1.000$ & 0 & $+1.000$ & 0 \\
-16     & $+0.905$ & 1 & $+1.000$ & 0 \\
-20     & $+0.714$ & 3 & $+1.000$ & 0 \\
-25, 30 & $+0.619$ & 4 & $+1.000$ & 0 \\
+16       & $+0.905$ & 1 & $+1.000$ & 0 \\
+20       & $+0.714$ & 3 & $+1.000$ & 0 \\
+25, 30   & $+0.619$ & 4 & $+1.000$ & 0 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-At generation ten the decay was not diffuse: \emph{every} discordant pair, at
-every depth, had \texttt{gen006\_2} on one side, and removing that one design
-restored $\tau=+1.000$ at all eight depths. \texttt{gen006\_2} was precisely
-the archived elite with high \mpki{}---$9.220$ against $5.08$--$5.46$ for the
-other six. Its tag width had been cut to $\texttt{TAGW}=8$, giving $H=4$ hashed
-tag bits and eight times the tag aliasing of the seed, while its first-level
-gshare was doubled: accuracy traded for bandwidth.
+The two archives behave very differently. At generation 10, every discordant
+pair involves \texttt{gen006\_2}, the only elite with high \mpki{} ($9.22$,
+against $5.08$--$5.46$ for the rest). Its tags had been cut to $H=4$ in exchange
+for bandwidth, and it survived only because it held a cell of its own despite
+scoring below the seed; removing it restores $\tau=+1$ at every depth. By
+generation 39 this design had been evicted, the archive's \mpki{} range had
+narrowed from $1.8\times$ to $1.09\times$, and the ranking is identical from
+$D=6$ to $D=30$. Eq.~\eqref{eq:cpi} explains why: because $C$ scales with
+$\text{mpi}\cdot D$, a design with $1.7\times$ the misprediction rate loses
+ground $1.7\times$ faster as the pipeline deepens. Depth robustness is thus
+governed by accuracy, precisely the term the flank discounts, and nothing in the
+depth-9 score distinguishes the fragile archive from the robust one.
 
-By generation~39 that design is long gone. MAP-Elites evicted it in the
-ordinary way---a higher-scoring design landed in its cell---and with it went
-every inversion beyond depth three. The generation-39 archive spans $\mpki{}$
-$5.17$--$5.62$, a factor of $1.09$ rather than $1.8$, and its ranking is
-exactly stable at every depth from six to thirty. The one discordant pair
-anywhere in its column is at depth three, between \texttt{gen032\_1} and
-\texttt{gen025\_0}, whose depth-nine scores differ by $0.004$; removing either
-restores $\tau=+1.000$ throughout. The same column computed on the
-generation-29 archive, which held three different elites, is identical, down to
-a single depth-three inversion between the same cell pair: \texttt{gen032\_1}
-replaced \texttt{gen027\_2} in its cell, and inherited its crossing. The
-inversion also appears when the same designs are re-scored on the held-out
-traces (Section~\ref{sec:heldout-res}), so it is a property of the two designs
-and not of the trace subset. It is the same mechanism seen from the shallow
-side: at depth three the misprediction term of Eq.~\eqref{eq:cpi} is small, and
-the less accurate \texttt{gen025\_0} ($\mpki{}=5.62$) wins on its lower
-predictor energy (\epi{} $1243$ against $1721$); by depth six the more accurate
-\texttt{gen032\_1} ($\mpki{}=5.17$) has overtaken it and stays ahead to depth
-thirty.
+The held-out traces provide a final check. On them the generation-39 ranking is
+preserved exactly ($\tau=+1.000$), even for its closest pair (0.0012 apart).
+The result is weaker than it appears, however: every elite loses a nearly
+constant $0.0287\pm0.0019$ on the harder traces, so only near-ties could have
+swapped. The test rules out an ordering fitted to the search traces, not a
+failure to transfer to unlike workloads.
 
-The mechanism is unchanged and is now visible from both sides. By
-Eq.~\eqref{eq:cpi}, $C$ scales with $\text{mpi}\cdot D$, so a design with
-$1.7\times$ the misprediction rate loses ground $1.7\times$ faster as $D$ grows
-and must eventually cross the others; at generation ten, depth 16 was where it
-did. When the archive holds an accuracy outlier the depth-nine ranking does not
-survive a deeper machine; when it holds none, the ranking is stable to depth
-thirty. Depth robustness is a direct function of accuracy---and accuracy is
-exactly the quantity Finding 1 shows the depth-nine score does not measure.
+\section{An LLM on the Search Space}
+\label{sec:bounds}
 
-This sharpens rather than softens the concern. Nothing the search or the score
-could observe distinguishes the two archives: both were produced by the same
-operator climbing the same objective, and \vfs{} at depth nine ranked both
-without complaint. Whether the resulting ranking transfers to a different
-pipeline depth was decided by which design happened to occupy one cell of the
-behaviour space at the moment the archive was read. A metric whose
-transferability depends on the incidental composition of the population it is
-applied to cannot be checked by applying it more carefully; it has to be
-reported at more than one depth.
+These results point to a natural place for a language model. Every elite sits
+at the \texttt{LOGLB} ceiling, a bound that was never justified, which suggests
+that the shape of the search space may constrain the search as much as the
+operator does. We therefore give an LLM control of the box rather than the
+design. Before each generation, a bounds agent (Claude Opus~5) receives each
+parameter's range, the current archive, the fraction of evaluated designs lying
+on each bound, and its own earlier changes, and returns revised ranges together
+with its reasons; a validator rejects ranges under which a hashed field could
+underflow, though it never fired. The baseline is a rule that widens a bound by
+one step whenever at least 25\% of evaluated designs lie on it. Both arms resume
+from the generation-10 archive for generations 11--20 (30 proposals each) with
+the same operator and random stream, so their proposals are paired and diverge
+only where a bound clamps a mutation. The fixed-bounds run, offset by one
+generation after a restart, is compared by outcome only; Tier~2 was off.
 
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}
-\begin{axis}[width=\columnwidth,height=4.25cm,
-  xlabel={pipeline depth $D$}, ylabel={\vfs{}},
-  xmin=3,xmax=30, ymin=0.45,ymax=1.02,
-  legend style={font=\tiny,at={(0.02,0.03)},anchor=south west,draw=none,fill=none},
-  tick label style={font=\scriptsize}, label style={font=\scriptsize},
-  grid=major, grid style={gray!20}]
-\addplot[thick] coordinates
- {(3,0.9975)(6,0.9654)(9,0.9288)(12,0.8907)(16,0.8403)(20,0.7920)(25,0.7362)(30,0.6858)};
-\addlegendentry{gen037\_2 (best, \mpki{} 5.33)}
-\addplot[thick,dashed] coordinates
- {(3,0.9930)(6,0.9591)(9,0.9207)(12,0.8810)(16,0.8289)(20,0.7794)(25,0.7225)(30,0.6714)};
-\addlegendentry{gen017\_2 (\mpki{} 5.52)}
-\addplot[very thick,dotted] coordinates
- {(3,0.9765)(6,0.9414)(9,0.9041)(12,0.8665)(16,0.8177)(20,0.7717)(25,0.7186)(30,0.6708)};
-\addlegendentry{gen032\_1 (\mpki{} 5.17) -- crosses at $D=3$}
-\addplot[thick,dashdotted] coordinates
- {(3,0.9789)(6,0.9406)(9,0.9003)(12,0.8600)(16,0.8081)(20,0.7597)(25,0.7046)(30,0.6553)};
-\addlegendentry{gen025\_0 (\mpki{} 5.62)}
-\end{axis}
-\end{tikzpicture}
-\caption{\vfs{} against pipeline depth for four elites of the generation-39
-archive. Compare the generation-ten archive, where \texttt{gen006\_2}
-($\mpki{}=9.22$) started above \texttt{gen010\_2} and ended below it. With no
-accuracy outlier left, the curves are near-parallel---the residual slope
-differences are $\text{mpi}\cdot D$ in Eq.~\eqref{eq:cpi} over an \mpki{} range
-of only $1.09\times$---and the sole crossing is \texttt{gen025\_0} over
-\texttt{gen032\_1} at $D=3$.}
-\label{fig:depth}
-\end{figure}
+All three arms converge to the same optimum. By generation 20 they hold the same
+best design ($\vfs{}=0.92878$, which the fixed-bounds run later improved by just
+$0.00006$) and occupy seven cells each. Both adaptive arms raised the
+\texttt{LOGLB} ceiling to 8, but the operator moved \texttt{LOGLB} in only 4 of
+30 proposals and never upward from 7, so the experiment cannot tell whether that
+ceiling was binding.
 
-\subsection{The archive}
-
-Seven of 144 nominal cells are occupied, which reads as $4.9\%$ coverage and
-invites the conclusion that the search barely explored. That conclusion is
-wrong. Across all 116 scored designs, only two
-\epi{} bands, two $p_1$ values and two $p_2$ values were ever realized: the
-\emph{reachable} sub-grid is $2\times2\times2=8$ cells, and the search occupies
-seven of them. The grid is mis-specified for this design space---four of six
-\epi{} bands lie below any achievable predictor energy---rather than
-under-explored. Quadrupling the population did not widen it: the same eight
-cells were reachable at generations ten, twenty-nine and thirty-nine, and the
-same seven were occupied. What changed is which designs hold them---all seven
-generation-ten elites were replaced by generation~39, three of them after
-generation~29---so the coverage figure is stable while its contents are not.
-
-That churn is the diversity mechanism doing its job, and it is also how the
-archive quietly changed character. At generation ten it held \texttt{gen006\_2},
-which scored \emph{worse} than the seed ($0.7855$ vs.\ $0.8784$) and survived
-only because it occupied a different cell; the design that broke the depth
-ranking had entered through diversity, not through the score. By generation
-twenty-nine a better design had landed in that cell and evicted it. Neither
-event was directed at the depth ranking, and neither was visible in the score.
-
-\subsection{The held-out check}
-\label{sec:heldout-res}
-
-After the search stopped we rebuilt the seven generation-39 elites from their
-recorded source and scored each on the 42 held-out traces
-(Table~\ref{tab:heldout}). The inner-loop ranking survives exactly: Kendall's
-$\tau=+1.000$, all 21 pairs concordant, well clear of the $\tau<0.6$ threshold
-we set in Section~\ref{sec:heldout} before running it. It survives even where
-it is thinnest---\texttt{gen014\_1} and \texttt{gen033\_1} differ by $0.0012$
-inner and $0.0014$ held-out, in the same order. Re-scoring the held-out
-counters across depth reproduces the inner-loop picture as well: the ordering
-is stable from depth six to thirty, and the single depth-three inversion is the
-same \texttt{gen032\_1}/\texttt{gen025\_0} pair as in Table~\ref{tab:tau}.
+Where the arms differ is in how many evaluations they waste. Twenty of the 30
+paired proposals are identical. Among the ten that differ, the LLM arm leads by
+$+0.017$ to $+0.228$ in five, trails by at most $0.004$ in three, and ties in
+two, for a mean paired gain of $+0.021$ (mean \vfs{} $0.796$ against $0.775$,
+and $0.757$ with fixed bounds). The three largest gains all stem from the
+agent's clamps (Table~\ref{tab:bounds}), and one of them avoids the tag-bit
+cliff: the agent had derived $H$ from the template and cited it in its
+reasoning. With a single seed and only ten differing pairs, however, these
+results are descriptive rather than conclusive.
 
 \begin{table}[t]
-\caption{The generation-39 elites on the 126 inner traces the search was
-scored against, and on the 42 held-out traces it never saw.}
-\label{tab:heldout}
-\centering\small
-\begin{tabular}{@{}lrrr@{}}
+\caption{Paired proposals in which a bound clamp decided the outcome.}
+\label{tab:bounds}
+\centering\footnotesize
+\begin{tabular}{@{}llrr@{}}
 \toprule
-Design & inner \vfs{} & held-out \vfs{} & $\Delta$ \\
+Proposal & LLM clamp & rule \vfs{} & LLM \vfs{} \\
 \midrule
-gen037\_2 & $0.9288$ & $0.9006$ & $-0.0282$ \\
-gen017\_2 & $0.9207$ & $0.8913$ & $-0.0294$ \\
-gen032\_1 & $0.9041$ & $0.8725$ & $-0.0316$ \\
-gen025\_0 & $0.9003$ & $0.8698$ & $-0.0305$ \\
-gen014\_1 & $0.7073$ & $0.6806$ & $-0.0267$ \\
-gen033\_1 & $0.7061$ & $0.6792$ & $-0.0269$ \\
-gen029\_2 & $0.6750$ & $0.6477$ & $-0.0273$ \\
+gen014\_1 & \texttt{TAGW} $9\to10$ ($H$: $5\to6$) & $0.783$ & $0.872$ \\
+gen016\_1 & \texttt{LOGP1} $16\to14$ & $0.667$ & $0.896$ \\
+gen018\_0 & \texttt{LOGP1} $16\to14$ & $0.701$ & $0.929$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-This is weaker evidence than a perfect $\tau$ suggests, for three reasons. The
-held-out penalty is nearly a constant: every elite loses between $0.0267$ and
-$0.0316$ (mean $0.0287$, standard deviation $0.0019$), because the held-out
-traces are simply harder---held-out \mpki{} is $5.99$--$6.40$ against
-$5.17$--$5.62$ inner---and a design family this narrow pays for that almost
-identically. Against a penalty that flat, the inner spread of $0.2538$ is
-$134$ standard deviations wide, so only the two near-tied pairs could plausibly
-have swapped. Seven elites give 21 pairs, and $\tau$ over so few is coarse.
-And the split is a seeded random quarter of one trace set: it tests whether the
-search overfit to \emph{which} 126 traces it saw, not whether its ranking
-transfers to a different workload distribution. What the check rules out is
-the specific failure it was built for---an archive whose order is an artifact
-of the inner subset. It does not show the order would hold on programs unlike
-the CBP-NG set.
+The agent's reasoning deserves as much scrutiny as its outcomes. Of its 12
+changes, three widened a range and were never used, while nine narrowed ranges
+toward the current elites, an exploitative habit at odds with the diversity the
+archive exists to preserve; the rule made two changes and stopped. More revealingly, the agent
+twice narrowed \texttt{GHIST} ($[40,400]\to[70,180]\to[90,130]$) on the grounds
+that a tighter range lets ``proportional mutations'' reach further. The operator,
+however, steps by $\pm1$ or $\pm2$ regardless of range, so the change could have
+no effect, and indeed had none. The rationale was fluent and numerate, but it
+described a loop the agent could not see. An agent that shapes a search space
+should therefore be shown the operator that searches it, and the mechanism it
+claims should be checked alongside its results.
 
-\section{Threats to Validity}
+\section{Discussion and Limitations}
 
-\textbf{In-sample scores, and a narrow held-out test.} Every \vfs{} outside
-Table~\ref{tab:heldout} is measured on the 126 traces the search optimized
-against. The held-out check passes, but for the reasons in
-Section~\ref{sec:heldout-res} it constrains only the ordering of seven
-closely related designs on a random quarter of the same trace set.
+Taken together, these results suggest a concrete test for future work. Pallan's
+agents and our operator stalled on the same flank, whereas the winners escaped
+it through an algorithmic change, so the key question for an LLM that proposes
+designs is whether it can leave that flank. The throughput elasticity of its
+designs (Table~\ref{tab:elast}) measures this directly: an agent still buying
+width near $T\approx8.6$ is optimizing the lesson rather than the score.
 
-\textbf{One seed, one operator.} The offline arm resizes tables; it cannot
-invent an algorithm. Findings 1 and 3 concern the metric's response to a
-population, and that population is a parameter family. A structurally different
-predictor could move $p_2$ or \epi{} into regions we never reached. The
-operator also saturated: its last 26 generations bought $+0.35\%$.
+Our study has several limitations. The operator cannot invent algorithms, and
+our best score (0.9288) remains below Pallan's and every winner's; this paper is
+an audit, not an entry. Other entries' operating points are self-reported under
+their own settings, and MORSL's $C$ is inferred. Only $2\times2\times2$ of the
+behavior grid's 144 cells are reachable, and Table~\ref{tab:tau} compares two
+archives observationally rather than through an ablation.
 
-\textbf{Tier-2 configuration, not gem5.} Finding 2 is a statement about our
-gem5 configuration---$5\times10^{6}$ instructions, one promoted design per
-generation, SE-mode workloads---not about gem5's capability. Growing the
-promoted population from 10 to 39 did not restore discrimination, but a longer
-window or a wider promotion budget could.
+\section{Conclusion}
 
-\textbf{Small elite set, and an uncontrolled comparison.} Table~\ref{tab:tau}
-rests on seven elites and 21 pairs at each of two points in the search. We did
-not remove \texttt{gen006\_2}; MAP-Elites did, incidentally, when a
-higher-scoring design landed in its cell. The two archives therefore differ in
-more than the outlier, and the contrast between them is observational. What the
-two columns jointly support is narrower than a controlled result: an archive
-containing an accuracy outlier produced depth-dependent rankings, one without
-did not, and in both cases the discordant pairs are exactly the pairs with the
-largest \mpki{} gap.
+\vfs{} is a genuine improvement over ranking predictors by misprediction rate,
+but what it rewards depends on where a design stands: below the reference
+throughput it rewards width, and near the reference it rewards accuracy. A loop
+that experiences only the first regime will draw the wrong lesson from its own
+success. We therefore recommend that agentic searches over cost-aware metrics
+report the elasticities at the operating points they reach, demonstrate that
+each evaluation tier separates their population, and report rankings at several
+pipeline depths, which Eq.~\eqref{eq:cpi} makes essentially free. The loop is
+open source at \url{https://github.com/zxc12523/chia}.
 
-\section{Conclusions}
-
-\vfs{} is a considerable improvement on ranking predictors by misprediction
-rate, but as an optimization target it behaves as a throughput metric with
-minor corrections. An automated search given \vfs{} alone finds width, not
-accuracy: the best design we found is the seed with a wider fetch line and
-the same \mpki{} to within a tenth of a percent. Because CBP-NG assumes a fixed nine-stage penalty, and
-because misprediction cost is the only depth-dependent term, the score is
-structurally blind to the one property---accuracy---that decides whether its
-ranking survives a deeper machine. Whether that blindness bites is a property
-of the population, not of the score: the archive at generation ten contained
-one high-\mpki{} design and every rank inversion we observed involved it, while
-the archive at generation thirty-nine had evicted it and ranks identically at
-every depth from six to thirty. That ranking also holds, pair for pair, on the
-42 traces the search never saw. A practitioner reading \vfs{} at depth nine
-cannot tell which of those two situations they are in. We suggest that cost-aware predictor metrics
-be reported at more than one depth, which the re-scoring identity of
-Eq.~\eqref{eq:cpi} makes nearly free, and that automated searches over such
-metrics report which term is actually carrying the optimizer.
+\section*{Acknowledgment}
+% Required by the A^3 CFP.
+Portions of this paper's text and analysis were drafted with AI assistance
+(Claude Opus~5, Anthropic). The authors reviewed all content and take full
+responsibility for it.
 
 \balance
-\begin{thebibliography}{9}
+\begin{thebibliography}{99}
+\bibitem{cbpng} A. Lindsay, P. Michaud, R. Sheikh, M. Madhav, and A. Alameldeen,
+``The Next-Generation Championship in Branch Prediction (CBP-NG),'' held with
+ISCA 2026. Simulator: \url{https://github.com/AmpereComputing/cbp-ng}.
+\bibitem{harcom} P. Michaud, ``HARCOM: Hardware complexity model for
+microarchitecture exploration,'' CBP-NG documentation, 2026.
+\bibitem{vfsmetric} P. Michaud, ``A scoring metric for the CBP-NG
+championship,'' CBP-NG documentation, 2026.
+\bibitem{chia} A. Cui \emph{et al.}, ``CHIA: An open-source framework for
+principled, agentic AI-driven hardware/software co-design research,''
+arXiv:2606.27350, 2026.
+\bibitem{pallan} M. Pallan, ``Coding agents as design searchers: An autonomous
+TAGE tuning campaign for CBP-NG,'' in \emph{CBP-NG Workshop (ISCA)}, 2026.
+\bibitem{koizumi} T. Koizumi \emph{et al.}, ``MORSL: Minimal-overhead
+rank-based predictor with summation-free correction and lazy access,'' in
+\emph{CBP-NG Workshop (ISCA)}, 2026.
+\bibitem{fan} J. Fan, ``Enhance ahead-pipelined N-branch GShare with tagged
+tables,'' in \emph{CBP-NG Workshop (ISCA)}, 2026.
+\bibitem{dang} N. Dang and E. Rotenberg, ``An energy-efficient ahead-pipelined
+TAGE branch predictor for CBP-NG,'' in \emph{CBP-NG Workshop (ISCA)}, 2026.
 \bibitem{seznec2006tage} A. Seznec and P. Michaud, ``A case for (partially)
 tagged geometric history length branch prediction,'' \emph{J. Instruction-Level
 Parallelism}, vol. 8, 2006.
 \bibitem{seznec2011tage} A. Seznec, ``A new case for the TAGE branch
 predictor,'' in \emph{Proc. MICRO}, 2011.
+\bibitem{jimenez2000delay} D. A. Jim\'enez, S. W. Keckler, and C. Lin, ``The
+impact of delay on the design of branch predictors,'' in \emph{Proc. MICRO},
+2000.
+\bibitem{jimenez2003reconsidering} D. A. Jim\'enez, ``Reconsidering complex
+branch predictors,'' in \emph{Proc. HPCA}, 2003.
+\bibitem{champsim} N. Gober \emph{et al.}, ``The Championship Simulator:
+Architectural simulation for education and competition,'' arXiv:2210.14324, 2022.
 \bibitem{gem5} N. Binkert \emph{et al.}, ``The gem5 simulator,''
 \emph{ACM SIGARCH Comput. Archit. News}, vol. 39, no. 2, 2011.
-\bibitem{champsim} N. Gober \emph{et al.}, ``The Championship Simulator:
-Architectural simulation for education and competition,'' arXiv:2210.14324,
-2022.
-\bibitem{akram2019survey} A. Akram and L. Sawalha, ``A survey of computer
-architecture simulation techniques and tools,'' \emph{IEEE Access}, vol. 7,
-2019.
 \bibitem{mouret2015illuminating} J.-B. Mouret and J. Clune, ``Illuminating
 search spaces by mapping elites,'' arXiv:1504.04909, 2015.
-\bibitem{cully2015robots} A. Cully, J. Clune, D. Tarapore and J.-B. Mouret,
-``Robots that can adapt like animals,'' \emph{Nature}, vol. 521, 2015.
+\bibitem{alphaevolve} A. Novikov \emph{et al.}, ``AlphaEvolve: A coding agent
+for scientific and algorithmic discovery,'' arXiv:2506.13131, 2025.
+\bibitem{archgym} S. Krishnan \emph{et al.}, ``ArchGym: An open-source
+gymnasium for machine learning assisted architecture design,'' in \emph{Proc.
+ISCA}, 2023.
+\bibitem{lehman2020surprising} J. Lehman \emph{et al.}, ``The surprising
+creativity of digital evolution,'' \emph{Artificial Life}, vol. 26, no. 2, 2020.
+\bibitem{amodei2016concrete} D. Amodei \emph{et al.}, ``Concrete problems in
+AI safety,'' arXiv:1606.06565, 2016.
 \end{thebibliography}
 
 \end{document}
