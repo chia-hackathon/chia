@@ -368,6 +368,8 @@ class ClaudeCodeLLM(LLMCallBase):
         thinking: Optional[str] = "adaptive",
         max_tool_iterations: int = 100,
         dangerously_skip_permissions: bool = True,
+        disallowed_tools: Optional[List[str]] = None,
+        max_turns: Optional[int] = None,
         config=UNSET,
     ):
         super().__init__(system_message=system_message,
@@ -379,6 +381,14 @@ class ClaudeCodeLLM(LLMCallBase):
         self.timeout_seconds = timeout_seconds
         self.model = model
         self.extra_cli_args = extra_cli_args or []
+        # ``--disallowedTools`` / ``--max-turns``.  Both default to None so an
+        # existing caller builds exactly the command line it built before.
+        # ``--allowedTools`` is an allow-list for the *MCP* tools only, and
+        # ``--dangerously-skip-permissions`` waves the built-ins through, so
+        # denying one (``Task``, to stop an agent spawning sub-agents whose
+        # cost and edits the caller never sees) needs the deny-list flag.
+        self.disallowed_tools = list(disallowed_tools or [])
+        self.max_turns = max_turns
         self.logger = logging.getLogger(logging_name)
         self.log_stream = log_stream
         self.log_all = log_all
@@ -782,6 +792,12 @@ class ClaudeCodeLLM(LLMCallBase):
         ]
         if self.dangerously_skip_permissions:
             cmd.append("--dangerously-skip-permissions")
+
+        if self.disallowed_tools:
+            cmd += ["--disallowedTools", ",".join(self.disallowed_tools)]
+
+        if self.max_turns is not None:
+            cmd += ["--max-turns", str(self.max_turns)]
 
         if self.extra_cli_args:
             cmd += self.extra_cli_args
