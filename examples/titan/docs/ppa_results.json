@@ -1,0 +1,1015 @@
+{
+  "IMPORTANT": "NOT a PPA run. No synthesis tool and no PDK are installed in this deployment; no area, timing or power number was measured. These are structural RTL-proxy metrics parsed out of the generated SystemVerilog. See README.md sections 1 and 4.",
+  "flow": {
+    "synthesis_tool": null,
+    "pdk": null,
+    "clock_constraint": null,
+    "intended_flow_if_installed": {
+      "node": "examples/titan/synth_node.py::run_shuttle_tile_synthesis",
+      "tool": "Hammer + Cadence Genus (hammer.synthesis.genus, version 211)",
+      "technology": "hammer.technology.sky130 (sky130_scl stackup)",
+      "vlsi_top": "ShuttleTile",
+      "clocks": "clock/clock_uncore, period 10ns (100 MHz), uncertainty 0.5ns",
+      "blockers": [
+        "cluster.yaml node type 'vlsi' has num_workers: 0 and image: # FILL",
+        "constants.SKY130_COL_PATH == '#FILL' (TITAN_SKY130_COL_PATH unset)",
+        "no genus/yosys/openroad binary on host or in any image",
+        "no 'hammer' python package on host or in any image",
+        "no sky130 PDK collateral anywhere on the filesystem"
+      ]
+    }
+  },
+  "provenance": {
+    "date": "2026-09-17",
+    "host": "gpuserv4 (<HEAD_IP>)",
+    "ray_head": "<HEAD_IP>:6380",
+    "ray_jobs": [
+      "titan-ppa-rtl-ab-1",
+      "titan-ppa-rtl-ref-1"
+    ],
+    "build_image": "chia-chisel-build-aether-cosim:local",
+    "chipyard": "1.14.0-19-g4ab72313",
+    "submodules": {
+      "saturn": "dfe75de",
+      "rocket-chip": "70430823f",
+      "shuttle": "622f08b"
+    },
+    "chisel": "6.7.0",
+    "scala": "2.13",
+    "sbt": "1.8.2",
+    "jdk": "openjdk 20.0.2-internal",
+    "firtool": "CIRCT firtool-1.75.0 (LLVM 19.0.0git)",
+    "verilator": "5.022 2024-02-24",
+    "build_node": "nodes.build_saturn (ChiselBuildNode, BuildTarget.VERILATOR, collect_generated_src=True), identical flags for every config",
+    "ime_rtl_diff": "titan_runs/ppa/r13_round2_rtl_only.diff (RTL half of r13_round2.diff: 15 generators/** files, +844/-45 Chisel lines; the 12 riscv-isa-sim files are excluded)"
+  },
+  "configs": {
+    "baseline_ref": "REFV256D128ShuttleConfig",
+    "ime": "TitanV256D128ShuttleConfig",
+    "baseline": "GENV256D128ShuttleConfig"
+  },
+  "builds": {
+    "baseline": {
+      "label": "baseline",
+      "config": "GENV256D128ShuttleConfig",
+      "rtl_diff": null,
+      "reset": "Reset chipyard + generators/saturn@dfe75de2a8, generators/rocket-chip@70430823fc, generators/shuttle@622f08b9fd, toolchains/riscv-tools/riscv-isa-sim@9c190a07c6",
+      "build_wall_s": 163.7,
+      "build_ok": true,
+      "generated_src": {
+        "dir": "/share1/saves/max410011/hackathon/titan_runs/ppa/rtl/baseline",
+        "n_files": 667,
+        "total_bytes": 21109111
+      }
+    },
+    "ime": {
+      "label": "ime",
+      "config": "TitanV256D128ShuttleConfig",
+      "rtl_diff": "/share1/saves/max410011/hackathon/titan_runs/ppa/r13_round2_rtl_only.diff",
+      "reset": "Reset chipyard + generators/saturn@dfe75de2a8, generators/rocket-chip@70430823fc, generators/shuttle@622f08b9fd, toolchains/riscv-tools/riscv-isa-sim@9c190a07c6",
+      "apply_diff": "applied",
+      "build_wall_s": 160.0,
+      "build_ok": true,
+      "generated_src": {
+        "dir": "/share1/saves/max410011/hackathon/titan_runs/ppa/rtl/ime",
+        "n_files": 671,
+        "total_bytes": 21292329
+      }
+    },
+    "baseline_ref": {
+      "label": "baseline_ref",
+      "config": "REFV256D128ShuttleConfig",
+      "rtl_diff": null,
+      "reset": "Reset chipyard + generators/saturn@dfe75de2a8, generators/rocket-chip@70430823fc, generators/shuttle@622f08b9fd, toolchains/riscv-tools/riscv-isa-sim@9c190a07c6",
+      "build_wall_s": 164.6,
+      "build_ok": true,
+      "generated_src": {
+        "dir": "/share1/saves/max410011/hackathon/titan_runs/ppa/rtl/baseline_ref",
+        "n_files": 669,
+        "total_bytes": 21111047
+      }
+    }
+  },
+  "per_config": {
+    "baseline_ref": {
+      "n_sv_files": 668,
+      "total_sv_lines": 185097,
+      "n_modules": 681,
+      "flop_bits_sum_unique_modules": 415684,
+      "mem_array_bits_sum_unique_modules": 0,
+      "mult_ops_sum_unique_modules": 20,
+      "add_ops_sum_unique_modules": 1828,
+      "n_sram_macros": 8,
+      "sram_total_bits": 1533824,
+      "srams": [
+        {
+          "name": "array_0_ext",
+          "depth": 128,
+          "width": 256,
+          "ports": "mrw",
+          "bits": 32768
+        },
+        {
+          "name": "cc_banks_0_ext",
+          "depth": 8192,
+          "width": 64,
+          "ports": "rw",
+          "bits": 524288
+        },
+        {
+          "name": "cc_dir_ext",
+          "depth": 1024,
+          "width": 152,
+          "ports": "mrw",
+          "bits": 155648
+        },
+        {
+          "name": "data_arrays_0_ext",
+          "depth": 512,
+          "width": 512,
+          "ports": "mrw",
+          "bits": 262144
+        },
+        {
+          "name": "l2_tlb_ram_0_ext",
+          "depth": 512,
+          "width": 45,
+          "ports": "rw",
+          "bits": 23040
+        },
+        {
+          "name": "mem_ext",
+          "depth": 8192,
+          "width": 64,
+          "ports": "mrw",
+          "bits": 524288
+        },
+        {
+          "name": "tag_array_0_ext",
+          "depth": 16,
+          "width": 88,
+          "ports": "mrw",
+          "bits": 1408
+        },
+        {
+          "name": "tag_array_ext",
+          "depth": 64,
+          "width": 160,
+          "ports": "mrw",
+          "bits": 10240
+        }
+      ],
+      "hierarchy": {
+        "ShuttleTile": {
+          "flop_bits": 71719,
+          "mem_array_bits": 0,
+          "mult_ops": 39,
+          "add_ops": 2254,
+          "lines": 87769,
+          "module_instances": 668,
+          "unique_modules": 288
+        },
+        "SaturnShuttleUnit": {
+          "flop_bits": 28952,
+          "mem_array_bits": 0,
+          "mult_ops": 33,
+          "add_ops": 1730,
+          "lines": 42945,
+          "module_instances": 366,
+          "unique_modules": 159
+        },
+        "VectorBackend": {
+          "flop_bits": 16368,
+          "mem_array_bits": 0,
+          "mult_ops": 24,
+          "add_ops": 1607,
+          "lines": 30167,
+          "module_instances": 328,
+          "unique_modules": 124
+        },
+        "VectorMemUnit": {
+          "flop_bits": 7935,
+          "mem_array_bits": 0,
+          "mult_ops": 7,
+          "add_ops": 78,
+          "lines": 7485,
+          "module_instances": 17,
+          "unique_modules": 16
+        }
+      }
+    },
+    "ime": {
+      "n_sv_files": 670,
+      "total_sv_lines": 186236,
+      "n_modules": 683,
+      "flop_bits_sum_unique_modules": 416535,
+      "mem_array_bits_sum_unique_modules": 0,
+      "mult_ops_sum_unique_modules": 22,
+      "add_ops_sum_unique_modules": 1859,
+      "n_sram_macros": 8,
+      "sram_total_bits": 1533824,
+      "srams": [
+        {
+          "name": "array_0_ext",
+          "depth": 128,
+          "width": 256,
+          "ports": "mrw",
+          "bits": 32768
+        },
+        {
+          "name": "cc_banks_0_ext",
+          "depth": 8192,
+          "width": 64,
+          "ports": "rw",
+          "bits": 524288
+        },
+        {
+          "name": "cc_dir_ext",
+          "depth": 1024,
+          "width": 152,
+          "ports": "mrw",
+          "bits": 155648
+        },
+        {
+          "name": "data_arrays_0_ext",
+          "depth": 512,
+          "width": 512,
+          "ports": "mrw",
+          "bits": 262144
+        },
+        {
+          "name": "l2_tlb_ram_0_ext",
+          "depth": 512,
+          "width": 45,
+          "ports": "rw",
+          "bits": 23040
+        },
+        {
+          "name": "mem_ext",
+          "depth": 8192,
+          "width": 64,
+          "ports": "mrw",
+          "bits": 524288
+        },
+        {
+          "name": "tag_array_0_ext",
+          "depth": 16,
+          "width": 88,
+          "ports": "mrw",
+          "bits": 1408
+        },
+        {
+          "name": "tag_array_ext",
+          "depth": 64,
+          "width": 160,
+          "ports": "mrw",
+          "bits": 10240
+        }
+      ],
+      "hierarchy": {
+        "ShuttleTile": {
+          "flop_bits": 72570,
+          "mem_array_bits": 0,
+          "mult_ops": 42,
+          "add_ops": 2290,
+          "lines": 88842,
+          "module_instances": 669,
+          "unique_modules": 290
+        },
+        "SaturnShuttleUnit": {
+          "flop_bits": 29803,
+          "mem_array_bits": 0,
+          "mult_ops": 36,
+          "add_ops": 1766,
+          "lines": 43864,
+          "module_instances": 367,
+          "unique_modules": 161
+        },
+        "VectorBackend": {
+          "flop_bits": 17083,
+          "mem_array_bits": 0,
+          "mult_ops": 25,
+          "add_ops": 1630,
+          "lines": 30751,
+          "module_instances": 329,
+          "unique_modules": 126
+        },
+        "VectorMemUnit": {
+          "flop_bits": 8071,
+          "mem_array_bits": 0,
+          "mult_ops": 9,
+          "add_ops": 89,
+          "lines": 7636,
+          "module_instances": 17,
+          "unique_modules": 16
+        },
+        "MatrixMultiplyPipe": {
+          "flop_bits": 558,
+          "mem_array_bits": 0,
+          "mult_ops": 1,
+          "add_ops": 4,
+          "lines": 173,
+          "module_instances": 1,
+          "unique_modules": 1
+        }
+      }
+    },
+    "baseline": {
+      "n_sv_files": 666,
+      "total_sv_lines": 185022,
+      "n_modules": 679,
+      "flop_bits_sum_unique_modules": 417188,
+      "mem_array_bits_sum_unique_modules": 0,
+      "mult_ops_sum_unique_modules": 20,
+      "add_ops_sum_unique_modules": 1828,
+      "n_sram_macros": 8,
+      "sram_total_bits": 1533824,
+      "srams": [
+        {
+          "name": "array_0_ext",
+          "depth": 128,
+          "width": 256,
+          "ports": "mrw",
+          "bits": 32768
+        },
+        {
+          "name": "cc_banks_0_ext",
+          "depth": 8192,
+          "width": 64,
+          "ports": "rw",
+          "bits": 524288
+        },
+        {
+          "name": "cc_dir_ext",
+          "depth": 1024,
+          "width": 152,
+          "ports": "mrw",
+          "bits": 155648
+        },
+        {
+          "name": "data_arrays_0_ext",
+          "depth": 512,
+          "width": 512,
+          "ports": "mrw",
+          "bits": 262144
+        },
+        {
+          "name": "l2_tlb_ram_0_ext",
+          "depth": 512,
+          "width": 45,
+          "ports": "rw",
+          "bits": 23040
+        },
+        {
+          "name": "mem_ext",
+          "depth": 8192,
+          "width": 64,
+          "ports": "mrw",
+          "bits": 524288
+        },
+        {
+          "name": "tag_array_0_ext",
+          "depth": 16,
+          "width": 88,
+          "ports": "mrw",
+          "bits": 1408
+        },
+        {
+          "name": "tag_array_ext",
+          "depth": 64,
+          "width": 160,
+          "ports": "mrw",
+          "bits": 10240
+        }
+      ],
+      "hierarchy": {
+        "ShuttleTile": {
+          "flop_bits": 74484,
+          "mem_array_bits": 0,
+          "mult_ops": 39,
+          "add_ops": 2293,
+          "lines": 89649,
+          "module_instances": 670,
+          "unique_modules": 286
+        },
+        "SaturnShuttleUnit": {
+          "flop_bits": 31717,
+          "mem_array_bits": 0,
+          "mult_ops": 33,
+          "add_ops": 1769,
+          "lines": 44825,
+          "module_instances": 368,
+          "unique_modules": 157
+        },
+        "VectorBackend": {
+          "flop_bits": 17429,
+          "mem_array_bits": 0,
+          "mult_ops": 24,
+          "add_ops": 1646,
+          "lines": 31936,
+          "module_instances": 330,
+          "unique_modules": 122
+        },
+        "VectorMemUnit": {
+          "flop_bits": 9639,
+          "mem_array_bits": 0,
+          "mult_ops": 7,
+          "add_ops": 78,
+          "lines": 7596,
+          "module_instances": 17,
+          "unique_modules": 16
+        }
+      }
+    }
+  },
+  "comparisons": {
+    "PRIMARY_baseline_ref_vs_ime": {
+      "a": "baseline_ref (REFV256D128ShuttleConfig, pristine tree)",
+      "b": "ime (TitanV256D128ShuttleConfig, tree + IME RTL diff)",
+      "note": "Parameter-matched: both are WithShuttleVectorUnit(256,128,VectorParams.refParams) + WithSystemBusWidth(128) + WithShuttleTileBeatBytes(16) + WithNShuttleCores(1) + AbstractConfig. The delta isolates the IME RTL hunks.",
+      "scalars": {
+        "n_sv_files": {
+          "a": 668,
+          "b": 670,
+          "delta": 2,
+          "pct": 0.299
+        },
+        "total_sv_lines": {
+          "a": 185097,
+          "b": 186236,
+          "delta": 1139,
+          "pct": 0.615
+        },
+        "n_modules": {
+          "a": 681,
+          "b": 683,
+          "delta": 2,
+          "pct": 0.294
+        },
+        "flop_bits_sum_unique_modules": {
+          "a": 415684,
+          "b": 416535,
+          "delta": 851,
+          "pct": 0.205
+        },
+        "mem_array_bits_sum_unique_modules": {
+          "a": 0,
+          "b": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "mult_ops_sum_unique_modules": {
+          "a": 20,
+          "b": 22,
+          "delta": 2,
+          "pct": 10.0
+        },
+        "add_ops_sum_unique_modules": {
+          "a": 1828,
+          "b": 1859,
+          "delta": 31,
+          "pct": 1.696
+        },
+        "n_sram_macros": {
+          "a": 8,
+          "b": 8,
+          "delta": 0,
+          "pct": 0.0
+        },
+        "sram_total_bits": {
+          "a": 1533824,
+          "b": 1533824,
+          "delta": 0,
+          "pct": 0.0
+        }
+      },
+      "hierarchy": {
+        "ShuttleTile": {
+          "flop_bits": {
+            "a": 71719,
+            "b": 72570,
+            "delta": 851,
+            "pct": 1.187
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 39,
+            "b": 42,
+            "delta": 3,
+            "pct": 7.692
+          },
+          "add_ops": {
+            "a": 2254,
+            "b": 2290,
+            "delta": 36,
+            "pct": 1.597
+          },
+          "lines": {
+            "a": 87769,
+            "b": 88842,
+            "delta": 1073,
+            "pct": 1.223
+          },
+          "module_instances": {
+            "a": 668,
+            "b": 669,
+            "delta": 1,
+            "pct": 0.15
+          },
+          "unique_modules": {
+            "a": 288,
+            "b": 290,
+            "delta": 2,
+            "pct": 0.694
+          }
+        },
+        "SaturnShuttleUnit": {
+          "flop_bits": {
+            "a": 28952,
+            "b": 29803,
+            "delta": 851,
+            "pct": 2.939
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 33,
+            "b": 36,
+            "delta": 3,
+            "pct": 9.091
+          },
+          "add_ops": {
+            "a": 1730,
+            "b": 1766,
+            "delta": 36,
+            "pct": 2.081
+          },
+          "lines": {
+            "a": 42945,
+            "b": 43864,
+            "delta": 919,
+            "pct": 2.14
+          },
+          "module_instances": {
+            "a": 366,
+            "b": 367,
+            "delta": 1,
+            "pct": 0.273
+          },
+          "unique_modules": {
+            "a": 159,
+            "b": 161,
+            "delta": 2,
+            "pct": 1.258
+          }
+        },
+        "VectorBackend": {
+          "flop_bits": {
+            "a": 16368,
+            "b": 17083,
+            "delta": 715,
+            "pct": 4.368
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 24,
+            "b": 25,
+            "delta": 1,
+            "pct": 4.167
+          },
+          "add_ops": {
+            "a": 1607,
+            "b": 1630,
+            "delta": 23,
+            "pct": 1.431
+          },
+          "lines": {
+            "a": 30167,
+            "b": 30751,
+            "delta": 584,
+            "pct": 1.936
+          },
+          "module_instances": {
+            "a": 328,
+            "b": 329,
+            "delta": 1,
+            "pct": 0.305
+          },
+          "unique_modules": {
+            "a": 124,
+            "b": 126,
+            "delta": 2,
+            "pct": 1.613
+          }
+        },
+        "VectorMemUnit": {
+          "flop_bits": {
+            "a": 7935,
+            "b": 8071,
+            "delta": 136,
+            "pct": 1.714
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 7,
+            "b": 9,
+            "delta": 2,
+            "pct": 28.571
+          },
+          "add_ops": {
+            "a": 78,
+            "b": 89,
+            "delta": 11,
+            "pct": 14.103
+          },
+          "lines": {
+            "a": 7485,
+            "b": 7636,
+            "delta": 151,
+            "pct": 2.017
+          },
+          "module_instances": {
+            "a": 17,
+            "b": 17,
+            "delta": 0,
+            "pct": 0.0
+          },
+          "unique_modules": {
+            "a": 16,
+            "b": 16,
+            "delta": 0,
+            "pct": 0.0
+          }
+        },
+        "MatrixMultiplyPipe": {
+          "flop_bits": {
+            "a": 0,
+            "b": 558,
+            "delta": 558,
+            "pct": null
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 0,
+            "b": 1,
+            "delta": 1,
+            "pct": null
+          },
+          "add_ops": {
+            "a": 0,
+            "b": 4,
+            "delta": 4,
+            "pct": null
+          },
+          "lines": {
+            "a": 0,
+            "b": 173,
+            "delta": 173,
+            "pct": null
+          },
+          "module_instances": {
+            "a": 0,
+            "b": 1,
+            "delta": 1,
+            "pct": null
+          },
+          "unique_modules": {
+            "a": 0,
+            "b": 1,
+            "delta": 1,
+            "pct": null
+          }
+        }
+      },
+      "modules_only_in_b": [
+        "Arbiter2_VectorWrite",
+        "Arbiter8_ScalarWrite",
+        "MatrixMultiplyPipe"
+      ],
+      "modules_only_in_a": [
+        "Arbiter7_ScalarWrite"
+      ]
+    },
+    "SECONDARY_baseline_GEN_vs_ime": {
+      "a": "baseline (GENV256D128ShuttleConfig = constants.BASELINE_CONFIG)",
+      "b": "ime (TitanV256D128ShuttleConfig)",
+      "note": "NOT parameter-matched. GENV256D128ShuttleConfig uses VectorParams.genParams (Split issue structure, vlifqEntries 16, vlrobEntries 16, vliqEntries 4, vsiqEntries 6) while the Titan config uses refParams (Shared issue, vlifqEntries 8, vlrobEntries 4). Deltas here mix the IME change with that microarchitectural difference and must NOT be read as an IME cost.",
+      "scalars": {
+        "n_sv_files": {
+          "a": 666,
+          "b": 670,
+          "delta": 4,
+          "pct": 0.601
+        },
+        "total_sv_lines": {
+          "a": 185022,
+          "b": 186236,
+          "delta": 1214,
+          "pct": 0.656
+        },
+        "n_modules": {
+          "a": 679,
+          "b": 683,
+          "delta": 4,
+          "pct": 0.589
+        },
+        "flop_bits_sum_unique_modules": {
+          "a": 417188,
+          "b": 416535,
+          "delta": -653,
+          "pct": -0.157
+        },
+        "mem_array_bits_sum_unique_modules": {
+          "a": 0,
+          "b": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "mult_ops_sum_unique_modules": {
+          "a": 20,
+          "b": 22,
+          "delta": 2,
+          "pct": 10.0
+        },
+        "add_ops_sum_unique_modules": {
+          "a": 1828,
+          "b": 1859,
+          "delta": 31,
+          "pct": 1.696
+        },
+        "n_sram_macros": {
+          "a": 8,
+          "b": 8,
+          "delta": 0,
+          "pct": 0.0
+        },
+        "sram_total_bits": {
+          "a": 1533824,
+          "b": 1533824,
+          "delta": 0,
+          "pct": 0.0
+        }
+      },
+      "hierarchy": {
+        "ShuttleTile": {
+          "flop_bits": {
+            "a": 74484,
+            "b": 72570,
+            "delta": -1914,
+            "pct": -2.57
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 39,
+            "b": 42,
+            "delta": 3,
+            "pct": 7.692
+          },
+          "add_ops": {
+            "a": 2293,
+            "b": 2290,
+            "delta": -3,
+            "pct": -0.131
+          },
+          "lines": {
+            "a": 89649,
+            "b": 88842,
+            "delta": -807,
+            "pct": -0.9
+          },
+          "module_instances": {
+            "a": 670,
+            "b": 669,
+            "delta": -1,
+            "pct": -0.149
+          },
+          "unique_modules": {
+            "a": 286,
+            "b": 290,
+            "delta": 4,
+            "pct": 1.399
+          }
+        },
+        "SaturnShuttleUnit": {
+          "flop_bits": {
+            "a": 31717,
+            "b": 29803,
+            "delta": -1914,
+            "pct": -6.035
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 33,
+            "b": 36,
+            "delta": 3,
+            "pct": 9.091
+          },
+          "add_ops": {
+            "a": 1769,
+            "b": 1766,
+            "delta": -3,
+            "pct": -0.17
+          },
+          "lines": {
+            "a": 44825,
+            "b": 43864,
+            "delta": -961,
+            "pct": -2.144
+          },
+          "module_instances": {
+            "a": 368,
+            "b": 367,
+            "delta": -1,
+            "pct": -0.272
+          },
+          "unique_modules": {
+            "a": 157,
+            "b": 161,
+            "delta": 4,
+            "pct": 2.548
+          }
+        },
+        "VectorBackend": {
+          "flop_bits": {
+            "a": 17429,
+            "b": 17083,
+            "delta": -346,
+            "pct": -1.985
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 24,
+            "b": 25,
+            "delta": 1,
+            "pct": 4.167
+          },
+          "add_ops": {
+            "a": 1646,
+            "b": 1630,
+            "delta": -16,
+            "pct": -0.972
+          },
+          "lines": {
+            "a": 31936,
+            "b": 30751,
+            "delta": -1185,
+            "pct": -3.711
+          },
+          "module_instances": {
+            "a": 330,
+            "b": 329,
+            "delta": -1,
+            "pct": -0.303
+          },
+          "unique_modules": {
+            "a": 122,
+            "b": 126,
+            "delta": 4,
+            "pct": 3.279
+          }
+        },
+        "VectorMemUnit": {
+          "flop_bits": {
+            "a": 9639,
+            "b": 8071,
+            "delta": -1568,
+            "pct": -16.267
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 7,
+            "b": 9,
+            "delta": 2,
+            "pct": 28.571
+          },
+          "add_ops": {
+            "a": 78,
+            "b": 89,
+            "delta": 11,
+            "pct": 14.103
+          },
+          "lines": {
+            "a": 7596,
+            "b": 7636,
+            "delta": 40,
+            "pct": 0.527
+          },
+          "module_instances": {
+            "a": 17,
+            "b": 17,
+            "delta": 0,
+            "pct": 0.0
+          },
+          "unique_modules": {
+            "a": 16,
+            "b": 16,
+            "delta": 0,
+            "pct": 0.0
+          }
+        },
+        "MatrixMultiplyPipe": {
+          "flop_bits": {
+            "a": 0,
+            "b": 558,
+            "delta": 558,
+            "pct": null
+          },
+          "mem_array_bits": {
+            "a": 0,
+            "b": 0,
+            "delta": 0,
+            "pct": null
+          },
+          "mult_ops": {
+            "a": 0,
+            "b": 1,
+            "delta": 1,
+            "pct": null
+          },
+          "add_ops": {
+            "a": 0,
+            "b": 4,
+            "delta": 4,
+            "pct": null
+          },
+          "lines": {
+            "a": 0,
+            "b": 173,
+            "delta": 173,
+            "pct": null
+          },
+          "module_instances": {
+            "a": 0,
+            "b": 1,
+            "delta": 1,
+            "pct": null
+          },
+          "unique_modules": {
+            "a": 0,
+            "b": 1,
+            "delta": 1,
+            "pct": null
+          }
+        }
+      },
+      "modules_only_in_b": [
+        "Arbiter2_VectorWrite",
+        "Arbiter8_ScalarWrite",
+        "DCEQueue_4",
+        "DCEQueue_5",
+        "DCEQueue_9",
+        "IssueQueue_3",
+        "MatrixMultiplyPipe"
+      ],
+      "modules_only_in_a": [
+        "Arbiter7_ScalarWrite",
+        "DCEQueue_12",
+        "DCEQueue_8"
+      ]
+    }
+  }
+}

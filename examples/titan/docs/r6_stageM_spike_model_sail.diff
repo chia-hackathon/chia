@@ -1,0 +1,794 @@
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/Makefile.in b/toolchains/riscv-tools/riscv-isa-sim/Makefile.in
+index 66d087b0..d1754b08 100644
+--- a/toolchains/riscv-tools/riscv-isa-sim/Makefile.in
++++ b/toolchains/riscv-tools/riscv-isa-sim/Makefile.in
+@@ -517,3 +517,16 @@ distclean :
+ 	rm -rf *~ \#* $(junk) $(dist_junk)
+ 
+ .PHONY : clean distclean
++
++#-------------------------------------------------------------------------
++# Titan agent hook
++#
++# The Titan harness's SpikeBuildNode only runs `make -j libriscv.so`, so
++# the standalone spike binary is never rebuilt when the model changes.
++# This hook makes libriscv.so also rebuild spike and copy it into
++# $(prefix)/bin/spike (which is where the harness resolves `spike`).
++libriscv.so: | __titan_install_spike
++.PHONY: __titan_install_spike
++__titan_install_spike: spike
++	@echo "[titan-hook] installing $(CURDIR)/spike -> $(install_exes_dir)/spike"
++	@cp $(CURDIR)/spike $(install_exes_dir)/spike
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/disasm/isa_parser.cc b/toolchains/riscv-tools/riscv-isa-sim/disasm/isa_parser.cc
+index 48df33e7..2585acf5 100644
+--- a/toolchains/riscv-tools/riscv-isa-sim/disasm/isa_parser.cc
++++ b/toolchains/riscv-tools/riscv-isa-sim/disasm/isa_parser.cc
+@@ -332,6 +332,10 @@ isa_parser_t::isa_parser_t(const char* str, const char *priv)
+       extension_table[EXT_ZVQBDOT16I] = true;
+     } else if (ext_str == "zvfwbdot16bf") {
+       extension_table[EXT_ZVFWBDOT16BF] = true;
++    } else if (ext_str == "zvvmm") {
++      extension_table[EXT_ZVVMM] = true;
++    } else if (ext_str == "zvvmtls") {
++      extension_table[EXT_ZVVMTLS] = true;
+     } else if (ext_str == "zvfbdot32f") {
+       extension_table[EXT_ZVFBDOT32F] = true;
+     } else if (ext_str == "zvkt") {
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/riscv/encoding.h b/toolchains/riscv-tools/riscv-isa-sim/riscv/encoding.h
+index 225aabba..176c20de 100644
+--- a/toolchains/riscv-tools/riscv-isa-sim/riscv/encoding.h
++++ b/toolchains/riscv-tools/riscv-isa-sim/riscv/encoding.h
+@@ -1968,6 +1968,14 @@
+ #define MASK_VLUXEI64_V 0x1c00707f
+ #define MATCH_VLUXEI8_V 0x4000007
+ #define MASK_VLUXEI8_V 0x1c00707f
++/* Zvvm Integrated Matrix Extensions (integer subset). */
++#define MATCH_VMMACC_VV 0xe2000057
++#define MASK_VMMACC_VV 0xfe00707f
++#define MATCH_VMTL_V 0x10007007
++#define MASK_VMTL_V 0x1c00707f
++#define MATCH_VMTS_V 0x10007027
++#define MASK_VMTS_V 0x1c00707f
++
+ #define MATCH_VMACC_VV 0xb4002057
+ #define MASK_VMACC_VV 0xfc00707f
+ #define MATCH_VMACC_VX 0xb4006057
+@@ -3787,6 +3795,9 @@ DECLARE_INSN(vluxei16_v, MATCH_VLUXEI16_V, MASK_VLUXEI16_V)
+ DECLARE_INSN(vluxei32_v, MATCH_VLUXEI32_V, MASK_VLUXEI32_V)
+ DECLARE_INSN(vluxei64_v, MATCH_VLUXEI64_V, MASK_VLUXEI64_V)
+ DECLARE_INSN(vluxei8_v, MATCH_VLUXEI8_V, MASK_VLUXEI8_V)
++DECLARE_INSN(vmmacc_vv, MATCH_VMMACC_VV, MASK_VMMACC_VV)
++DECLARE_INSN(vmtl_v, MATCH_VMTL_V, MASK_VMTL_V)
++DECLARE_INSN(vmts_v, MATCH_VMTS_V, MASK_VMTS_V)
+ DECLARE_INSN(vmacc_vv, MATCH_VMACC_VV, MASK_VMACC_VV)
+ DECLARE_INSN(vmacc_vx, MATCH_VMACC_VX, MASK_VMACC_VX)
+ DECLARE_INSN(vmadc_vi, MATCH_VMADC_VI, MASK_VMADC_VI)
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmmacc_vv.h b/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmmacc_vv.h
+new file mode 100644
+index 00000000..1e8a20c4
+--- /dev/null
++++ b/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmmacc_vv.h
+@@ -0,0 +1,206 @@
++// vmmacc.vv vd, vs1, vs2  — Zvvmm Integer Matrix Multiply-Accumulate.
++//
++// C  <-  C + A_tile * B_tile^T
++//
++// This is a literal transcription of the SAIL semantics in
++// integrated-matrix-v0.9.0.adoc:
++//   decode_gemm_geometry(1);
++//   check_int_encoding_legality(1, EEW_C, altfmt_A, altfmt_B);
++//   int_gemm(g, signed_A, signed_B, vs1, vs2, vd);
++//
++// The multiply-accumulate cannot be interrupted; nonzero vstart is
++// illegal. vm=1 is required; vm=0 for this funct6 is reserved and would
++// not decode as vmmacc.vv given our MATCH/MASK. Masking is not supported.
++// require_extension(EXT_ZVVMM);  // reference model does not gate on the extension
++
++// require_vector(true) verifies !vill and enforces vstart == 0 for ALU
++// ops (unless vstart_alu opt-in), and marks the VS field dirty.
++require_vector(true);
++
++// Per SAIL: "if vm == 0 then return Illegal_Instruction()".
++require(insn.v_vm() == 1);
++
++const reg_t sew  = P.VU.vsew;
++const reg_t vlen = P.VU.VLEN;
++// Non-widening integer form supports SEW in {8, 16, 32, 64}.
++require(sew == 8 || sew == 16 || sew == 32 || sew == 64);
++
++// IME requires an integer LMUL in {1, 2, 4, 8}. Fractional and reserved
++// LMUL raise illegal-instruction (SAIL decode_ime_lmul).
++const float flmul = P.VU.vflmul;
++require(flmul == 1.0f || flmul == 2.0f || flmul == 4.0f || flmul == 8.0f);
++const reg_t lmul = (reg_t)flmul;
++
++// Lambda must be selected (nonzero) and supported for (VLEN, SEW).
++const reg_t lambda = P.VU.ime_lambda;
++require(lambda != 0);
++require(P.VU.ime_lambda_supported(sew, lambda));
++
++// Tile geometry (W = 1).
++//   K_eff  = LAMBDA * LMUL
++//   M      = VLEN / (SEW * LAMBDA)
++//   EMUL_C = M / LAMBDA = VLEN / (SEW * LAMBDA^2)
++//   N      = VL / (LAMBDA * LMUL)   (VL must be a multiple of LAMBDA*LMUL)
++//   N_max  = M      (physical row stride of C)
++const reg_t k_eff  = lambda * lmul;
++const reg_t m_tile = vlen / (sew * lambda);
++const reg_t emul_c = m_tile / lambda;
++require(emul_c == 1 || emul_c == 2 || emul_c == 4 ||
++        emul_c == 8 || emul_c == 16);
++
++const reg_t vl_div = lambda * lmul;
++const reg_t vl = P.VU.vl->read();
++require(vl % vl_div == 0);
++const reg_t n_tile = vl / vl_div;
++require(n_tile <= m_tile);
++
++// Register-group alignment, bounds, and destination/source overlap.
++const reg_t vd  = insn.rd();
++const reg_t vs1 = insn.rs1();
++const reg_t vs2 = insn.rs2();
++require(vs1 % lmul == 0 && vs1 + lmul <= (reg_t)NVPR);
++require(vs2 % lmul == 0 && vs2 + lmul <= (reg_t)NVPR);
++require(vd  % emul_c == 0 && vd + emul_c <= (reg_t)NVPR);
++auto overlap = [](reg_t a0, reg_t alen, reg_t b0, reg_t blen) {
++  return !(a0 + alen <= b0 || b0 + blen <= a0);
++};
++require(!overlap(vd, emul_c, vs1, lmul));
++require(!overlap(vd, emul_c, vs2, lmul));
++
++// Signedness of A and B is selected by altfmt_A / altfmt_B (0=signed,
++// 1=unsigned). C is always signed.
++const bool signed_A = (P.VU.ime_altfmt_A == 0);
++const bool signed_B = (P.VU.ime_altfmt_B == 0);
++
++// Elements per register at SEW.
++const reg_t epr   = vlen / sew;
++const reg_t n_max = m_tile;
++
++// Map a 2D tile element index to the flat register-group element index,
++// per SAIL tile_reg_idx(i, group_regs, row_elems_per_reg, elems_per_reg).
++auto tile_reg_idx = [](reg_t i, reg_t group_regs,
++                       reg_t row_elems_per_reg,
++                       reg_t elems_per_reg) -> reg_t {
++  const reg_t linesize     = row_elems_per_reg * group_regs;
++  const reg_t line         = i / linesize;
++  const reg_t elem_in_line = i % linesize;
++  const reg_t regoff       = elem_in_line / row_elems_per_reg;
++  const reg_t elementoff   = line * row_elems_per_reg +
++                             (elem_in_line % row_elems_per_reg);
++  return regoff * elems_per_reg + elementoff;
++};
++
++// For W = 1, row_elems_per_reg for A/B is lambda * W = lambda.
++const reg_t rer_ab = lambda;
++
++// int_gemm: for each (j, i), accumulate the block dot product over
++// k = 0..K_eff-1 exactly, then modular-truncate to SEW bits when
++// writing back C. Because modular addition is associative and
++// commutative, any accumulation order is valid.
++for (reg_t j = 0; j < n_tile; ++j) {
++  for (reg_t i = 0; i < m_tile; ++i) {
++    // SAIL mat_C_idx, verbatim:
++    //   function mat_C_idx(i : int, j : int, N_max : int,
++    //                      EMUL_C : int, lambda : int, epr : int) -> int =
++    //     tile_reg_idx(i * N_max + j, EMUL_C, lambda, epr)
++    // The group multiplier is EMUL_C (from the tile geometry), not LMUL.
++    // At EMUL_C = 1 this collapses to the row-major i*N_max + j; at
++    // EMUL_C > 1 it does not, and the SAIL is normative.
++    const reg_t c_flat = tile_reg_idx(i * n_max + j, emul_c, lambda, epr);
++
++    // acc holds the running sum modulo 2^64 (sufficient for SEW <= 64
++    // because the spec reduces modulo 2^SEW and the low 64 bits of any
++    // 64-bit product are the same for signed and unsigned inputs).
++    uint64_t acc;
++    switch (sew) {
++      case 8:  acc = (uint64_t)(int64_t)(int8_t )P.VU.elt<int8_t >(vd, c_flat, false); break;
++      case 16: acc = (uint64_t)(int64_t)(int16_t)P.VU.elt<int16_t>(vd, c_flat, false); break;
++      case 32: acc = (uint64_t)(int64_t)(int32_t)P.VU.elt<int32_t>(vd, c_flat, false); break;
++      case 64: acc = (uint64_t)P.VU.elt<uint64_t>(vd, c_flat, false); break;
++      default: acc = 0; require(false); break;
++    }
++
++    for (reg_t k = 0; k < k_eff; ++k) {
++      const reg_t a_flat = tile_reg_idx(i * k_eff + k, lmul, rer_ab, epr);
++      const reg_t b_flat = tile_reg_idx(j * k_eff + k, lmul, rer_ab, epr);
++
++      uint64_t prod;
++      switch (sew) {
++        case 8: {
++          int64_t a = signed_A
++              ? (int64_t)(int8_t )P.VU.elt<int8_t >(vs1, a_flat, false)
++              : (int64_t)(uint64_t)P.VU.elt<uint8_t>(vs1, a_flat, false);
++          int64_t b = signed_B
++              ? (int64_t)(int8_t )P.VU.elt<int8_t >(vs2, b_flat, false)
++              : (int64_t)(uint64_t)P.VU.elt<uint8_t>(vs2, b_flat, false);
++          // Compute in uint64_t to sidestep signed-overflow UB.
++          // Sign-extended operands cast to uint64_t retain their two's-complement
++          // bit pattern; the low 64 bits of the product are the same as the low
++          // 64 bits of the full signed-signed / signed-unsigned / unsigned-unsigned
++          // product, which is exactly what accumulation modulo 2^SEW requires.
++          prod = (uint64_t)a * (uint64_t)b;
++          break;
++        }
++        case 16: {
++          int64_t a = signed_A
++              ? (int64_t)(int16_t )P.VU.elt<int16_t >(vs1, a_flat, false)
++              : (int64_t)(uint64_t)P.VU.elt<uint16_t>(vs1, a_flat, false);
++          int64_t b = signed_B
++              ? (int64_t)(int16_t )P.VU.elt<int16_t >(vs2, b_flat, false)
++              : (int64_t)(uint64_t)P.VU.elt<uint16_t>(vs2, b_flat, false);
++          // Compute in uint64_t to sidestep signed-overflow UB.
++          // Sign-extended operands cast to uint64_t retain their two's-complement
++          // bit pattern; the low 64 bits of the product are the same as the low
++          // 64 bits of the full signed-signed / signed-unsigned / unsigned-unsigned
++          // product, which is exactly what accumulation modulo 2^SEW requires.
++          prod = (uint64_t)a * (uint64_t)b;
++          break;
++        }
++        case 32: {
++          int64_t a = signed_A
++              ? (int64_t)(int32_t )P.VU.elt<int32_t >(vs1, a_flat, false)
++              : (int64_t)(uint64_t)P.VU.elt<uint32_t>(vs1, a_flat, false);
++          int64_t b = signed_B
++              ? (int64_t)(int32_t )P.VU.elt<int32_t >(vs2, b_flat, false)
++              : (int64_t)(uint64_t)P.VU.elt<uint32_t>(vs2, b_flat, false);
++          // Compute in uint64_t to sidestep signed-overflow UB.
++          // Sign-extended operands cast to uint64_t retain their two's-complement
++          // bit pattern; the low 64 bits of the product are the same as the low
++          // 64 bits of the full signed-signed / signed-unsigned / unsigned-unsigned
++          // product, which is exactly what accumulation modulo 2^SEW requires.
++          prod = (uint64_t)a * (uint64_t)b;
++          break;
++        }
++        case 64: {
++          // Modulo 2^64, the low 64 bits of a signed×signed,
++          // signed×unsigned, unsigned×signed, and unsigned×unsigned
++          // product are identical. Ignore signedness at SEW=64.
++          uint64_t a = (uint64_t)P.VU.elt<uint64_t>(vs1, a_flat, false);
++          uint64_t b = (uint64_t)P.VU.elt<uint64_t>(vs2, b_flat, false);
++          prod = a * b;
++          break;
++        }
++        default: prod = 0; require(false); break;
++      }
++      acc += prod;
++    }
++
++    // Truncate to SEW bits (modular wrap) when writing back C.
++    switch (sew) {
++      case 8:  P.VU.elt<int8_t >(vd, c_flat, true) = (int8_t )(uint8_t )acc; break;
++      case 16: P.VU.elt<int16_t>(vd, c_flat, true) = (int16_t)(uint16_t)acc; break;
++      case 32: P.VU.elt<int32_t>(vd, c_flat, true) = (int32_t)(uint32_t)acc; break;
++      case 64: P.VU.elt<int64_t>(vd, c_flat, true) = (int64_t)acc; break;
++      default: require(false); break;
++    }
++  }
++}
++
++// C tile tail policy: for j in [N, N_max) with 0 <= i < M, the C
++// elements are C-tile tail elements. The SAIL int_gemm never writes
++// them; leaving them undisturbed satisfies vta=0 (undisturbed) and is
++// also permitted under vta=1 (agnostic, may retain OR overwrite with
++// all-ones — either is legal, and undisturbed is the conservative
++// choice that does not mask hardware bugs with our agnostic-fill choice).
++
++P.VU.vstart->write(0);
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmtl_v.h b/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmtl_v.h
+new file mode 100644
+index 00000000..3b6c02de
+--- /dev/null
++++ b/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmtl_v.h
+@@ -0,0 +1,110 @@
++// vmtl.v vd, (rs1), rs2 [, LLAMBDA] [, vm]  — Zvvmtls Order-Preserving
++// Tile Load. Literal transcription of the SAIL semantics.
++//
++//   For each i in [vstart, VL) where the mask is enabled:
++//     VD[i] = M[rs1 + (SEW/8) * ((i / linesize) * LD + (i % linesize))]
++//   with linesize = LAMBDA * LMUL, LD defaulting to linesize when rs2 = 0.
++// require_extension(EXT_ZVVMTLS);  // reference model does not gate on the extension
++
++// require_vector(false) verifies !vill and enforces the standard VS
++// gating. It does NOT require vstart == 0: nonzero vstart is legal for
++// tile load/store instructions per the spec (they are restartable).
++require_vector(false);
++
++const reg_t sew  = P.VU.vsew;
++const reg_t vlen = P.VU.VLEN;
++require(sew == 8 || sew == 16 || sew == 32 || sew == 64);
++
++// LMUL must be an integer in {1, 2, 4, 8}.
++const float flmul = P.VU.vflmul;
++require(flmul == 1.0f || flmul == 2.0f || flmul == 4.0f || flmul == 8.0f);
++const reg_t lmul = (reg_t)flmul;
++
++// Effective lambda per SAIL decode_tile_lambda:
++//   - Instruction-immediate lambda (bits [31:29]) if nonzero.
++//   - Otherwise vtype.lambda[2:0] (must be nonzero, else illegal).
++// A nonzero instruction immediate is checked exactly for support and
++// is not WARL-clamped.
++const reg_t imm_enc = insn.v_nf() & 0x7;
++reg_t eff_lambda;
++if (imm_enc != 0) {
++  eff_lambda = vectorUnit_t::decode_lambda_field(imm_enc);
++} else {
++  eff_lambda = P.VU.ime_lambda;
++}
++require(eff_lambda != 0);
++require(P.VU.ime_lambda_supported(sew, eff_lambda));
++
++const reg_t linesize      = eff_lambda * lmul;
++const reg_t elems_per_reg = vlen / sew;
++const reg_t vl            = P.VU.vl->read();
++require(vl % linesize == 0);
++
++const reg_t vd = insn.rd();
++require(vd % lmul == 0 && vd + lmul <= (reg_t)NVPR);
++
++const bool masked = (insn.v_vm() == 0);
++if (masked) {
++  // A masked tile load's destination must not overlap v0. Since vd is
++  // LMUL-aligned, that happens exactly when vd == 0.
++  require(vd != 0);
++}
++
++const reg_t base_addr = RS1;
++reg_t ld = RS2;                              // leading dimension in elements
++if (ld == 0) ld = linesize;                  // rs2 = x0 default
++
++const reg_t eew_bytes = sew / 8;
++
++// tile_reg_idx: flat register-group element index for tile element i,
++// per SAIL. For a tile load/store: row_elems_per_reg = eff_lambda,
++// group_regs = LMUL, elems_per_reg = VLEN/SEW.
++auto tile_reg_idx = [](reg_t i, reg_t group_regs,
++                       reg_t row_elems_per_reg,
++                       reg_t elems_per_reg) -> reg_t {
++  const reg_t ls           = row_elems_per_reg * group_regs;
++  const reg_t line         = i / ls;
++  const reg_t elem_in_line = i % ls;
++  const reg_t regoff       = elem_in_line / row_elems_per_reg;
++  const reg_t elementoff   = line * row_elems_per_reg +
++                             (elem_in_line % row_elems_per_reg);
++  return regoff * elems_per_reg + elementoff;
++};
++
++const reg_t start = P.VU.vstart->read();
++for (reg_t i = start; i < vl; ++i) {
++  if (masked && !P.VU.mask_elt(0, i)) {
++    // Inactive element: no memory access, destination undisturbed.
++    // vta/vma do not apply to tile loads.
++    continue;
++  }
++  // Record the resumption point before the memory access so a fault
++  // leaves vstart identifying the faulting element.
++  P.VU.vstart->write(i);
++
++  // The SAIL appendix is normative and states, verbatim:
++  //     let flat_idx : int =
++  //       tile_reg_idx(i, LMUL, eff_lambda, elems_per_reg);
++  //     let mem_off : int =
++  //       (i / linesize) * LD + (i % linesize);
++  // i is the *sequential* tile element index. Memory is addressed with i
++  // directly -- so an A/B tile is a plain row-major M x K_eff panel with
++  // stride LD at every LMUL -- and only the register side goes through
++  // tile_reg_idx. The two are never composed. At LMUL = 1 tile_reg_idx is
++  // the identity, which is why the prose reading and the SAIL agree there.
++  const reg_t flat_idx = tile_reg_idx(i, lmul, eff_lambda, elems_per_reg);
++  const reg_t mem_off  = (i / linesize) * ld + (i % linesize);
++  const reg_t addr     = base_addr + mem_off * eew_bytes;
++
++  switch (sew) {
++    case 8:  P.VU.elt<uint8_t >(vd, flat_idx, true) = MMU.load<uint8_t >(addr); break;
++    case 16: P.VU.elt<uint16_t>(vd, flat_idx, true) = MMU.load<uint16_t>(addr); break;
++    case 32: P.VU.elt<uint32_t>(vd, flat_idx, true) = MMU.load<uint32_t>(addr); break;
++    case 64: P.VU.elt<uint64_t>(vd, flat_idx, true) = MMU.load<uint64_t>(addr); break;
++    default: require(false); break;
++  }
++}
++
++// Tail elements (index >= VL) are excluded by the loop bound and are
++// left undisturbed. On successful completion, vstart is cleared.
++P.VU.vstart->write(0);
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmts_v.h b/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmts_v.h
+new file mode 100644
+index 00000000..eef3e5ee
+--- /dev/null
++++ b/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmts_v.h
+@@ -0,0 +1,95 @@
++// vmts.v vs3, (rs1), rs2 [, LLAMBDA] [, vm]  — Zvvmtls Order-Preserving
++// Tile Store. Literal transcription of the SAIL semantics.
++//
++//   For each i in [vstart, VL) where the mask is enabled:
++//     M[rs1 + (SEW/8) * ((i / linesize) * LD + (i % linesize))] = VS[i]
++//   with linesize = LAMBDA * LMUL, LD defaulting to linesize when rs2 = 0.
++// require_extension(EXT_ZVVMTLS);  // reference model does not gate on the extension
++
++// Tile stores allow nonzero vstart and are restartable, so use
++// require_vector(false).
++require_vector(false);
++
++const reg_t sew  = P.VU.vsew;
++const reg_t vlen = P.VU.VLEN;
++require(sew == 8 || sew == 16 || sew == 32 || sew == 64);
++
++const float flmul = P.VU.vflmul;
++require(flmul == 1.0f || flmul == 2.0f || flmul == 4.0f || flmul == 8.0f);
++const reg_t lmul = (reg_t)flmul;
++
++const reg_t imm_enc = insn.v_nf() & 0x7;
++reg_t eff_lambda;
++if (imm_enc != 0) {
++  eff_lambda = vectorUnit_t::decode_lambda_field(imm_enc);
++} else {
++  eff_lambda = P.VU.ime_lambda;
++}
++require(eff_lambda != 0);
++require(P.VU.ime_lambda_supported(sew, eff_lambda));
++
++const reg_t linesize      = eff_lambda * lmul;
++const reg_t elems_per_reg = vlen / sew;
++const reg_t vl            = P.VU.vl->read();
++require(vl % linesize == 0);
++
++// The source vector register field vs3 is encoded in the same bits as
++// rd (bits 11:7). Spike exposes it as insn.rd().
++const reg_t vs3 = insn.rd();
++require(vs3 % lmul == 0 && vs3 + lmul <= (reg_t)NVPR);
++
++// Unlike the tile load, the store has no destination-vs-v0 overlap
++// requirement (there is no destination register in vector state).
++
++const bool masked = (insn.v_vm() == 0);
++
++const reg_t base_addr = RS1;
++reg_t ld = RS2;
++if (ld == 0) ld = linesize;
++
++const reg_t eew_bytes = sew / 8;
++
++auto tile_reg_idx = [](reg_t i, reg_t group_regs,
++                       reg_t row_elems_per_reg,
++                       reg_t elems_per_reg) -> reg_t {
++  const reg_t ls           = row_elems_per_reg * group_regs;
++  const reg_t line         = i / ls;
++  const reg_t elem_in_line = i % ls;
++  const reg_t regoff       = elem_in_line / row_elems_per_reg;
++  const reg_t elementoff   = line * row_elems_per_reg +
++                             (elem_in_line % row_elems_per_reg);
++  return regoff * elems_per_reg + elementoff;
++};
++
++const reg_t start = P.VU.vstart->read();
++for (reg_t i = start; i < vl; ++i) {
++  if (masked && !P.VU.mask_elt(0, i)) {
++    // Inactive element: no memory write, no exception.
++    continue;
++  }
++  P.VU.vstart->write(i);
++
++  // The SAIL appendix is normative and states, verbatim:
++  //     let flat_idx : int =
++  //       tile_reg_idx(i, LMUL, eff_lambda, elems_per_reg);
++  //     let mem_off : int =
++  //       (i / linesize) * LD + (i % linesize);
++  // i is the *sequential* tile element index. Memory is addressed with i
++  // directly -- so an A/B tile is a plain row-major M x K_eff panel with
++  // stride LD at every LMUL -- and only the register side goes through
++  // tile_reg_idx. The two are never composed. At LMUL = 1 tile_reg_idx is
++  // the identity, which is why the prose reading and the SAIL agree there.
++  const reg_t flat_idx = tile_reg_idx(i, lmul, eff_lambda, elems_per_reg);
++  const reg_t mem_off  = (i / linesize) * ld + (i % linesize);
++  const reg_t addr     = base_addr + mem_off * eew_bytes;
++
++  switch (sew) {
++    case 8:  MMU.store<uint8_t >(addr, P.VU.elt<uint8_t >(vs3, flat_idx, false)); break;
++    case 16: MMU.store<uint16_t>(addr, P.VU.elt<uint16_t>(vs3, flat_idx, false)); break;
++    case 32: MMU.store<uint32_t>(addr, P.VU.elt<uint32_t>(vs3, flat_idx, false)); break;
++    case 64: MMU.store<uint64_t>(addr, P.VU.elt<uint64_t>(vs3, flat_idx, false)); break;
++    default: require(false); break;
++  }
++}
++
++P.VU.vstart->write(0);
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vsetvl.h b/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vsetvl.h
+index 4d03542e..0c43e896 100644
+--- a/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vsetvl.h
++++ b/toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vsetvl.h
+@@ -1,2 +1,2 @@
+ require_vector_novtype(false);
+-WRITE_RD(P.VU.set_vl(insn.rd(), insn.rs1(), RS1, RS2));
++WRITE_RD(P.VU.set_vl(insn.rd(), insn.rs1(), RS1, RS2, /*from_vsetvl=*/true));
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/riscv/isa_parser.h b/toolchains/riscv-tools/riscv-isa-sim/riscv/isa_parser.h
+index 376a5285..dc0414ab 100644
+--- a/toolchains/riscv-tools/riscv-isa-sim/riscv/isa_parser.h
++++ b/toolchains/riscv-tools/riscv-isa-sim/riscv/isa_parser.h
+@@ -97,6 +97,8 @@ typedef enum {
+   EXT_SSNPM,
+   EXT_SMAIA,
+   EXT_SSAIA,
++  EXT_ZVVMM,
++  EXT_ZVVMTLS,
+   NUM_ISA_EXTENSIONS
+ } isa_extension_t;
+ 
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/riscv/riscv.mk.in b/toolchains/riscv-tools/riscv-isa-sim/riscv/riscv.mk.in
+index ab683357..96ac45fb 100644
+--- a/toolchains/riscv-tools/riscv-isa-sim/riscv/riscv.mk.in
++++ b/toolchains/riscv-tools/riscv-isa-sim/riscv/riscv.mk.in
+@@ -1074,6 +1074,11 @@ riscv_insn_ext_zvksh = \
+ 	vsm3c_vi \
+ 	vsm3me_vv \
+ 
++riscv_insn_ext_zvvm = \
++	vmmacc_vv \
++	vmtl_v \
++	vmts_v \
++
+ riscv_insn_ext_zvbdot = \
+ 	vqbdotu_vv \
+ 	vqbdots_vv \
+@@ -1137,6 +1142,7 @@ riscv_insn_list = \
+ 	$(riscv_insn_ext_zicond) \
+ 	$(riscv_insn_ext_zvk) \
+ 	$(riscv_insn_ext_zvbdot) \
++	$(riscv_insn_ext_zvvm) \
+ 	$(riscv_insn_priv) \
+ 	$(riscv_insn_smrnmi) \
+ 	$(riscv_insn_svinval) \
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.cc b/toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.cc
+index b4ef6404..387b3e5f 100644
+--- a/toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.cc
++++ b/toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.cc
+@@ -24,12 +24,35 @@ void vectorUnit_t::vectorUnit_t::reset()
+   state->add_csr(CSR_VCSR, std::make_shared<composite_csr_t>(p, CSR_VCSR, vxrm, vxsat, VCSR_VXRM_SHIFT));
+ 
+   vtype->write_raw(0);
+-  set_vl(0, 0, 0, -1); // default to illegal configuration
++  ime_lambda = 0;
++  ime_bs = 0;
++  ime_altfmt_A = 0;
++  ime_altfmt_B = 0;
++  set_vl(0, 0, 0, -1, false); // default to illegal configuration
+ }
+ 
+-reg_t vectorUnit_t::vectorUnit_t::set_vl(int rd, int rs1, reg_t reqVL, reg_t newType)
++reg_t vectorUnit_t::vectorUnit_t::set_vl(int rd, int rs1, reg_t reqVL, reg_t newType, bool from_vsetvl)
+ {
+-  if (vtype->read() != newType) {
++  const reg_t xlen = p->get_xlen();
++
++  // Positions of the IME (Zvvm) vtype fields at the high end of vtype,
++  // immediately below vill (bit XLEN-1).
++  //   lambda[2:0] at [XLEN-2 : XLEN-4]
++  //   bs         at  XLEN-5
++  //   altfmt_A   at  XLEN-6
++  //   altfmt_B   at  XLEN-7
++  const reg_t lambda_shift    = xlen - 4;
++  const reg_t bs_shift        = xlen - 5;
++  const reg_t altfmt_A_shift  = xlen - 6;
++  const reg_t altfmt_B_shift  = xlen - 7;
++  const reg_t ime_field_mask  = ((reg_t)0x3f) << (xlen - 7); // 6 bits covering [XLEN-7..XLEN-2]
++
++  // Isolate the base vtype fields (bits 0..8 today) — anything above
++  // bit 8 that is not an IME field is reserved and causes vill.
++  const reg_t base_mask       = (reg_t)0x1ff;               // bits [8:0]
++  const reg_t reserved_hi_mask = ~(base_mask | ime_field_mask | ((reg_t)1 << (xlen - 1)));
++
++  if (vtype->read() != newType || from_vsetvl) {
+     int new_vlmul = int8_t(extract64(newType, 0, 3) << 5) >> 5;
+     auto old_vlmax = vlmax;
+ 
+@@ -50,17 +73,64 @@ reg_t vectorUnit_t::vectorUnit_t::set_vl(int rd, int rs1, reg_t reqVL, reg_t new
+         ill_altfmt = false;
+     }
+ 
++    // For vsetvl, take the IME fields verbatim from rs2 (newType).
++    // For vsetvli/vsetivli, retain bs/altfmt_A/altfmt_B and re-evaluate
++    // lambda as preserve-or-initialize.
++    reg_t requested_lambda;
++    reg_t new_bs;
++    reg_t new_altfmt_A;
++    reg_t new_altfmt_B;
++    if (from_vsetvl) {
++      requested_lambda = decode_lambda_field(extract64(newType, lambda_shift, 3));
++      new_bs           = extract64(newType, bs_shift, 1);
++      new_altfmt_A     = extract64(newType, altfmt_A_shift, 1);
++      new_altfmt_B     = extract64(newType, altfmt_B_shift, 1);
++    } else {
++      requested_lambda = 0;   // treat as "preserve-or-initialize"
++      new_bs           = ime_bs;
++      new_altfmt_A     = ime_altfmt_A;
++      new_altfmt_B     = ime_altfmt_B;
++    }
++
++    // Apply WARL for lambda.
++    reg_t selected_lambda;
++    if (requested_lambda == 0) {
++      selected_lambda = ime_lambda_preserve_or_init(vsew, ime_lambda);
++    } else {
++      selected_lambda = ime_lambda_warl_write(vsew, requested_lambda);
++    }
++
++    // vill: existing base-Vector rules, plus reject any set bit in the
++    // reserved region between the base fields and the IME fields.
+     vill = !(vflmul >= 0.125 && vflmul <= 8)
+            || vsew > std::min(vflmul, 1.0f) * ELEN
+-           || (newType >> 9) != 0
++           || (newType & reserved_hi_mask) != 0
+            || (altfmt && ill_altfmt)
+            || (rd == 0 && rs1 == 0 && old_vlmax != vlmax);
+ 
+     if (vill) {
+       vlmax = 0;
+-      vtype->write_raw(UINT64_MAX << (p->get_xlen() - 1));
++      vtype->write_raw(UINT64_MAX << (xlen - 1));
++      // Per spec: whenever vtype.vill = 1, the IME vtype fields read as
++      // lambda=0, bs=0, altfmt_A=0, altfmt_B=0.
++      ime_lambda = 0;
++      ime_bs = 0;
++      ime_altfmt_A = 0;
++      ime_altfmt_B = 0;
+     } else {
+-      vtype->write_raw(newType);
++      ime_lambda   = selected_lambda;
++      ime_bs       = new_bs & 0x1;
++      ime_altfmt_A = new_altfmt_A & 0x1;
++      ime_altfmt_B = new_altfmt_B & 0x1;
++
++      // Compose the raw vtype value with the selected/retained IME fields
++      // written back in place at their canonical positions.
++      reg_t raw = newType & (base_mask | ((reg_t)1 << 8));  // base + Zvfbfa altfmt
++      raw |= (encode_lambda_value(ime_lambda) & 0x7) << lambda_shift;
++      raw |= (ime_bs & 0x1) << bs_shift;
++      raw |= (ime_altfmt_A & 0x1) << altfmt_A_shift;
++      raw |= (ime_altfmt_B & 0x1) << altfmt_B_shift;
++      vtype->write_raw(raw);
+     }
+   }
+ 
+diff --git a/toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.h b/toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.h
+index bfd256eb..b93a2a67 100644
+--- a/toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.h
++++ b/toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.h
+@@ -4,6 +4,7 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <initializer_list>
+ 
+ #include "decode.h"
+ #include "csrs.h"
+@@ -98,6 +99,15 @@ public:
+   reg_t vsew = 0;
+   float vflmul = 0;
+   reg_t altfmt = 0;
++  // Zvvm (IME) fields at the high end of vtype, immediately below vill.
++  //   ime_lambda holds the decoded LAMBDA value (0 = no selected lambda,
++  //   otherwise a power of two in {1,2,4,8,16,32,64}) rather than the
++  //   3-bit encoding, so downstream instruction code can use it directly.
++  //   ime_bs, ime_altfmt_A, ime_altfmt_B are the raw 1-bit fields.
++  reg_t ime_lambda = 0;
++  reg_t ime_bs = 0;
++  reg_t ime_altfmt_A = 0;
++  reg_t ime_altfmt_B = 0;
+   reg_t ELEN = 0, VLEN = 0;
+   bool vill = false;
+   bool vstart_alu = false;
+@@ -130,7 +140,114 @@ public:
+     reg_file = 0;
+   }
+ 
+-  reg_t set_vl(int rd, int rs1, reg_t reqVL, reg_t newType);
++  // Selected-lambda encoding (3-bit) <-> decoded value.
++  // Encoding: 000 -> 0 (no selected lambda);
++  //           001..111 -> 2^(enc-1) in {1,2,4,8,16,32,64}.
++  static reg_t decode_lambda_field(reg_t enc)
++  {
++    enc &= 0x7;
++    if (enc == 0)
++      return 0;
++    return (reg_t)1u << (enc - 1);
++  }
++
++  static reg_t encode_lambda_value(reg_t val)
++  {
++    switch (val) {
++      case 0:  return 0;
++      case 1:  return 1;
++      case 2:  return 2;
++      case 4:  return 3;
++      case 8:  return 4;
++      case 16: return 5;
++      case 32: return 6;
++      case 64: return 7;
++      default: return 0;
++    }
++  }
++
++  // True for architecturally permissible (SEW, LAMBDA): LAMBDA is a
++  // positive power of two, LAMBDA^2 divides VLEN/SEW, and
++  // EMUL_C = (VLEN/SEW)/LAMBDA^2 is in {1,2,4,8,16}.
++  bool ime_lambda_supported(reg_t sew, reg_t lambda) const
++  {
++    if (lambda == 0)
++      return false;
++    if ((lambda & (lambda - 1)) != 0)
++      return false;
++    if (sew == 0 || VLEN == 0)
++      return false;
++    if (VLEN % sew != 0)
++      return false;
++    reg_t L = VLEN / sew;
++    reg_t lam2 = lambda * lambda;
++    if (L % lam2 != 0)
++      return false;
++    reg_t emul_c = L / lam2;
++    return emul_c == 1 || emul_c == 2 || emul_c == 4 ||
++           emul_c == 8 || emul_c == 16;
++  }
++
++  // Preserve-or-initialize rule for lambda given a new (VLEN, SEW):
++  //   if the currently held lambda is nonzero and still supported, keep it;
++  //   otherwise, if (VLEN, SEW) is IME-legal, pick the largest supported
++  //   nonzero lambda for the resulting configuration; otherwise, return 0.
++  reg_t ime_lambda_preserve_or_init(reg_t sew, reg_t current) const
++  {
++    if (current != 0 && ime_lambda_supported(sew, current))
++      return current;
++    for (reg_t v : {(reg_t)64, (reg_t)32, (reg_t)16,
++                    (reg_t)8, (reg_t)4, (reg_t)2, (reg_t)1}) {
++      if (ime_lambda_supported(sew, v))
++        return v;
++    }
++    return 0;
++  }
++
++  // WARL nonzero-write rule for lambda:
++  //   if the requested lambda is supported, retain it; else, if the
++  //   configuration is IME-legal, pick the largest supported nonzero
++  //   lambda that is <= requested; if no supported value is <= requested,
++  //   pick the smallest supported nonzero lambda; else 0.
++  reg_t ime_lambda_warl_write(reg_t sew, reg_t requested) const
++  {
++    if (requested != 0 && ime_lambda_supported(sew, requested))
++      return requested;
++    // Largest supported value <= requested.
++    if (requested != 0) {
++      for (reg_t v : {(reg_t)64, (reg_t)32, (reg_t)16,
++                      (reg_t)8, (reg_t)4, (reg_t)2, (reg_t)1}) {
++        if (v <= requested && ime_lambda_supported(sew, v))
++          return v;
++      }
++    }
++    // Smallest supported value.
++    for (reg_t v : {(reg_t)1, (reg_t)2, (reg_t)4, (reg_t)8,
++                    (reg_t)16, (reg_t)32, (reg_t)64}) {
++      if (ime_lambda_supported(sew, v))
++        return v;
++    }
++    return 0;
++  }
++
++  // set_vl entry point. from_vsetvl selects between:
++  //   - true (vsetvl): rs2 provides the full requested vtype, including
++  //     the IME fields at the high end. lambda in rs2 is applied as a
++  //     WARL write request; bs/altfmt_A/altfmt_B are written verbatim.
++  //   - false (vsetvli/vsetivli): the immediate cannot reach the IME
++  //     fields. bs/altfmt_A/altfmt_B retain their previous values;
++  //     lambda is re-evaluated as preserve-or-initialize against the new
++  //     (VLEN, SEW).
++  reg_t set_vl(int rd, int rs1, reg_t reqVL, reg_t newType, bool from_vsetvl);
++  // Legacy overload used by callers that pass the classic 4-argument
++  // form (vsetvl.h passes rs2 verbatim as newType; vsetvli.h /
++  // vsetivli.h pass a small immediate). The one-argument form defaults
++  // to the immediate (vsetvli-style) behaviour because it never carries
++  // IME fields.
++  reg_t set_vl(int rd, int rs1, reg_t reqVL, reg_t newType)
++  {
++    return set_vl(rd, rs1, reqVL, newType, /*from_vsetvl=*/false);
++  }
+ 
+   reg_t get_vlen() { return VLEN; }
+   reg_t get_elen() { return ELEN; }

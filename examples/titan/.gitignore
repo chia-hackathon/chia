@@ -1,0 +1,22 @@
+# --- local-only files, never committed -------------------------------------
+
+# The real cluster descriptor: carries this deployment's head IP, container
+# names and absolute /share1 paths.  Commit cluster.yaml.example instead and
+# derive your own copy from it.
+cluster.yaml
+
+# Third-party specification text.  The RISC-V Integrated Matrix Extension
+# (IME) v0.9.0 AsciiDoc source is NOT redistributed here -- fetch your own
+# copy and drop it at specs/ime/integrated-matrix-v0.9.0.adoc.  See README.md
+# ("規格放置").  The generated instructions.json and extract_spec.py next to
+# it ARE committed, so the package imports without the .adoc present.
+specs/ime/*.adoc
+
+# Loop scratch
+*.bak-*
+__pycache__/
+*.pyc
+*.pyo
+titan_logs/
+*.log
+results.json.tmp

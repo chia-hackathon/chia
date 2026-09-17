@@ -1,0 +1,875 @@
+<title>Titan 驗證報告</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700&family=IBM+Plex+Mono:wght@400;500&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ground:#ECEEF0;
+  --surface:#FFFFFF;
+  --surface-2:#F4F6F7;
+  --line:#D2D8DC;
+  --ink:#111619;
+  --ink-2:#3E4A52;
+  --muted:#6B7880;
+  --accent:#0F5C73;
+  --accent-soft:#DCEAEE;
+  --pass:#2E6F4E;
+  --fail:#9E2B2B;
+  --warn:#8A6518;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1316;
+    --surface:#161C20;
+    --surface-2:#1C2429;
+    --line:#2A343A;
+    --ink:#E3E8EA;
+    --ink-2:#B3BFC5;
+    --muted:#85939B;
+    --accent:#5FB8CE;
+    --accent-soft:#12333D;
+    --pass:#63BE92;
+    --fail:#DE8686;
+    --warn:#D2AC5A;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1316;
+  --surface:#161C20;
+  --surface-2:#1C2429;
+  --line:#2A343A;
+  --ink:#E3E8EA;
+  --ink-2:#B3BFC5;
+  --muted:#85939B;
+  --accent:#5FB8CE;
+  --accent-soft:#12333D;
+  --pass:#63BE92;
+  --fail:#DE8686;
+  --warn:#D2AC5A;
+}
+
+*{box-sizing:border-box}
+
+body{
+  background:var(--ground);
+  color:var(--ink);
+  font-family:"Source Serif 4","Noto Sans TC","PingFang TC","Microsoft JhengHei",Georgia,serif;
+  font-size:17px;
+  line-height:1.72;
+  -webkit-font-smoothing:antialiased;
+}
+
+.page{
+  max-width:1180px;
+  margin:0 auto;
+  padding:64px 28px 128px;
+}
+
+h1,h2,h3,h4{
+  font-family:Archivo,"Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;
+  font-weight:700;
+  line-height:1.28;
+  color:var(--ink);
+  margin:0;
+}
+h1{font-size:2.35rem;letter-spacing:-0.01em}
+h2{font-size:1.5rem;font-weight:600;margin:0 0 4px}
+h3{font-size:1.1rem;font-weight:600;margin:0 0 6px}
+h4{font-size:0.95rem;font-weight:600;margin:0 0 4px}
+
+p{margin:0 0 1.05em}
+
+.prose{max-width:72ch}
+.prose p, .prose li{color:var(--ink-2)}
+.prose strong{font-weight:600;color:var(--ink)}
+
+code,.mono,.label,th,td,.num{
+  font-family:"IBM Plex Mono","SFMono-Regular",Consolas,monospace;
+}
+code{
+  font-size:0.85em;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-radius:3px;
+  padding:0.05em 0.34em;
+  color:var(--ink);
+  word-break:break-word;
+}
+pre{
+  font-family:"IBM Plex Mono",Consolas,monospace;
+  font-size:0.8rem;
+  line-height:1.6;
+  background:var(--surface-2);
+  border:1px solid var(--line);
+  border-left:3px solid var(--accent);
+  padding:14px 16px;
+  overflow-x:auto;
+  margin:0 0 1.05em;
+  color:var(--ink-2);
+}
+pre code{background:none;border:0;padding:0;font-size:1em}
+
+.label{
+  font-size:0.68rem;
+  font-weight:500;
+  letter-spacing:0.12em;
+  text-transform:uppercase;
+  color:var(--muted);
+}
+
+/* ---------- masthead ---------- */
+.masthead{border-bottom:1px solid var(--line);padding-bottom:36px;margin-bottom:44px}
+.masthead .label{display:block;margin-bottom:14px}
+.masthead h1{margin-bottom:18px;max-width:20ch}
+.deck{max-width:72ch;font-size:1.06rem;color:var(--ink-2)}
+.meta-row{
+  display:flex;flex-wrap:wrap;gap:6px 32px;
+  margin-top:26px;
+  font-family:"IBM Plex Mono",Consolas,monospace;
+  font-size:0.76rem;
+  color:var(--muted);
+}
+.meta-row span strong{color:var(--ink-2);font-weight:500}
+
+/* ---------- sections ---------- */
+section{margin:0 0 68px}
+.sec-head{
+  border-top:2px solid var(--ink);
+  padding-top:14px;
+  margin-bottom:26px;
+}
+.sec-head .label{display:block;margin-bottom:8px}
+.sec-head p{margin:10px 0 0;max-width:72ch;color:var(--ink-2)}
+
+/* ---------- stage spine ---------- */
+.spine-wrap{overflow-x:auto;padding-bottom:6px;margin-bottom:14px}
+.spine{display:flex;gap:0;min-width:900px;border:1px solid var(--line);background:var(--surface)}
+.stage{
+  flex:1 1 0;
+  padding:20px 18px 22px;
+  border-right:1px solid var(--line);
+  display:flex;flex-direction:column;gap:8px;
+}
+.stage:last-child{border-right:0}
+.stage .step{
+  font-family:"IBM Plex Mono",Consolas,monospace;
+  font-size:0.68rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--accent);
+}
+.stage .nm{font-family:Archivo,"Noto Sans TC","PingFang TC",sans-serif;font-weight:600;font-size:1rem}
+.stage .cnt{
+  font-family:"IBM Plex Mono",Consolas,monospace;
+  font-variant-numeric:tabular-nums;
+  font-size:1.5rem;font-weight:500;color:var(--pass);line-height:1.1;
+}
+.stage .judge{font-size:0.82rem;color:var(--muted);line-height:1.5}
+
+/* ---------- tables ---------- */
+.tbl-wrap{overflow-x:auto;border:1px solid var(--line);background:var(--surface);margin:0 0 12px}
+table{border-collapse:collapse;width:100%;font-size:0.8rem;font-variant-numeric:tabular-nums}
+caption{
+  caption-side:top;text-align:left;padding:12px 16px 0;
+  font-family:"IBM Plex Mono",Consolas,monospace;
+  font-size:0.7rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);
+}
+th,td{padding:8px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+thead th{
+  background:var(--surface-2);
+  font-weight:500;font-size:0.7rem;letter-spacing:0.07em;text-transform:uppercase;
+  color:var(--muted);white-space:nowrap;
+  border-bottom:1px solid var(--line);
+}
+tbody tr:last-child td{border-bottom:0}
+tbody tr.total td{background:var(--surface-2);font-weight:500;color:var(--ink)}
+td.n,th.n{text-align:right;white-space:nowrap}
+.pass{color:var(--pass)}
+.fail{color:var(--fail)}
+.warn{color:var(--warn)}
+.dim{color:var(--muted)}
+
+.note{
+  font-size:0.82rem;color:var(--muted);max-width:72ch;margin:0 0 1.05em;
+  font-family:"Source Serif 4","Noto Sans TC","PingFang TC",serif;
+}
+.note code{font-size:0.8em}
+
+/* ---------- callout ---------- */
+.callout{
+  border:1px solid var(--line);
+  border-left:3px solid var(--accent);
+  background:var(--surface);
+  padding:18px 22px;
+  margin:0 0 22px;
+}
+.callout.is-warn{border-left-color:var(--warn)}
+.callout p:last-child{margin-bottom:0}
+.callout .label{display:block;margin-bottom:8px}
+
+/* ---------- defects ---------- */
+.defect{
+  border:1px solid var(--line);
+  background:var(--surface);
+  padding:20px 22px;
+  margin:0 0 14px;
+}
+.defect > header{
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 16px;
+  padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--line);
+}
+.defect .idx{
+  font-family:"IBM Plex Mono",Consolas,monospace;font-size:0.7rem;
+  letter-spacing:0.1em;color:var(--accent);
+}
+.defect .cost{
+  margin-left:auto;font-family:"IBM Plex Mono",Consolas,monospace;
+  font-size:0.74rem;color:var(--muted);font-variant-numeric:tabular-nums;
+}
+dl.fields{margin:0;display:grid;grid-template-columns:5.5rem 1fr;gap:6px 18px}
+dl.fields dt{
+  font-family:"IBM Plex Mono",Consolas,monospace;
+  font-size:0.66rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);
+  padding-top:0.42em;
+}
+dl.fields dd{margin:0;font-size:0.92rem;color:var(--ink-2);line-height:1.62}
+@media (max-width:640px){
+  dl.fields{grid-template-columns:1fr;gap:2px 0}
+  dl.fields dd{margin-bottom:10px}
+}
+
+ul.tight{margin:0 0 1.05em;padding-left:1.25em}
+ul.tight li{margin-bottom:0.4em}
+
+.footnotes{border-top:1px solid var(--line);padding-top:22px;margin-top:8px}
+.footnotes ol{margin:0;padding-left:1.4em;font-size:0.84rem;color:var(--muted);max-width:72ch}
+.footnotes li{margin-bottom:0.6em}
+
+@media (prefers-reduced-motion: reduce){
+  *{animation:none !important;transition:none !important}
+}
+</style>
+
+<div class="page">
+
+<header class="masthead">
+  <span class="label">A³ Workshop · CHIA Hackathon Proposal 2 · 驗證報告</span>
+  <h1>Titan：在 Saturn 向量單元上實作 RISC-V IME 矩陣擴充</h1>
+  <div class="deck prose">
+    <p>Titan 以 CHIA agentic loop 在 Chipyard 樹內、Shuttle 核心的 Saturn 向量單元上實作 RISC-V IME（Zvvm）v0.9.0 矩陣擴充，目標是邊緣端 LLM 的 INT8 GEMM。三輪下來交付 15 條規格指令中的 8 條，並附一份獨立撰寫、先於 RTL 存在的 Spike 參考模型。整個專案的形狀不是「agent 寫硬體」，而是「先把裁判造出來，再讓被告受審」：46 小時、837 美元的支出中，絕大部分花在發現迴圈與裁判本身必須長成什麼樣子，真正用它來交付功能的那幾輪只佔很小一塊。最有價值的結果也不是那 8 條指令，而是一個方法學上的發現——模擬器的隨機暫存器初始化讓「邏輯上完全無作用的改動」也能翻轉測試結果，因此本專案早期好幾個關於同一個缺陷的實驗（包括第一輪那個被當成根因的一行修正）都是被混淆的。</p>
+  </div>
+  <div class="meta-row">
+    <span><strong>規格</strong> Zvvm v0.9.0</span>
+    <span><strong>參數</strong> VLEN=256 · DLEN=128 · Shuttle</span>
+    <span><strong>最終產物</strong> titan_runs/r15_round3.diff</span>
+    <span><strong>資料截止</strong> 2026-09-17</span>
+  </div>
+</header>
+
+<!-- ============ STAGE SPINE ============ -->
+<section id="spine">
+  <div class="sec-head">
+    <span class="label">一 · 迴圈骨幹與最終計數</span>
+    <h2>五個階段，依照它們真正執行的順序</h2>
+    <p>階段編號在這裡有意義，因為順序本身承載了專案的核心原則：每一個裁判都先於它所審判的對象存在。<code>rvv_ref.py</code> 由人類在任何 RTL 存在之前寫成；<code>riscv-vector-tests</code> 隨 Saturn 附帶、在任何人動手之前就已通過；Spike 模型先跑，所以模型作者不可能看過它稍後要審判的 RTL。以下是 8 指令設計的最終驗證計數。</p>
+  </div>
+
+  <div class="spine-wrap">
+    <div class="spine">
+      <div class="stage">
+        <span class="step">Stage M</span>
+        <span class="nm">模型</span>
+        <span class="cnt">80 / 80</span>
+        <span class="judge">agent 的 Spike 模型 對 <code>rvv_ref.py</code>；此時尚無 RTL</span>
+      </div>
+      <div class="stage">
+        <span class="step">Stage S1</span>
+        <span class="nm">定向測試</span>
+        <span class="cnt">80 / 80</span>
+        <span class="judge">RTL 對 <code>rvv_ref.py</code>，雙發射 <code>DIRECTED_CONFIG</code></span>
+      </div>
+      <div class="stage">
+        <span class="step">Stage S2</span>
+        <span class="nm">RVV 回歸</span>
+        <span class="cnt">837 / 0</span>
+        <span class="judge">RTL 對 <em>stock</em> Spike lockstep cosim；837 執行、0 失敗</span>
+      </div>
+      <div class="stage">
+        <span class="step">Gate</span>
+        <span class="nm">全幾何掃描</span>
+        <span class="cnt">548 / 548</span>
+        <span class="judge">每一組合法的 (SEW, λ, LMUL, VL)，含部分 VL</span>
+      </div>
+      <div class="stage">
+        <span class="step">Stage S3</span>
+        <span class="nm">隨機 lockstep</span>
+        <span class="cnt">64 / 64</span>
+        <span class="judge">隨機化 tile 幾何，RTL 對 agent 自己的 Spike 模型</span>
+      </div>
+    </div>
+  </div>
+  <p class="note">來源：<code>r15_full_verify/results.json</code>（directed 80/80、<code>s2_full</code> 837 執行 / 0 失敗）與執行 <code>r15_0917_1109</code>（<code>20260917_122552_gate.json</code> 548/548、<code>20260917_123203_summary.json</code> <code>stress_done: 64</code>、<code>converged: true</code>）。S2 在迴圈內跑的是 150 支的等距抽樣（r15 為 0/150）；上表的 837 是迴圈外補跑的全套 —— 841 支扣掉 4 支已記錄的排除項。</p>
+</section>
+
+<!-- ============ SCOPE ============ -->
+<section id="scope">
+  <div class="sec-head">
+    <span class="label">二 · 交付範圍</span>
+    <h2>15 條 IME v0.9.0 指令中的 8 條</h2>
+    <p>規格來源 <code>specs/ime/instructions.json</code>（15 筆），對照 <code>integrated-matrix-v0.9.0.adoc</code>。編碼不是手抄的：<code>ime_encodings.py</code> 由 JSON 資料驅動，並以 <code>check_round_{one,two,three}_bits</code> 做人工交叉檢查。</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>IME v0.9.0 指令清單與交付狀態</caption>
+      <thead>
+        <tr><th class="n">#</th><th>Mnemonic</th><th>族群</th><th>狀態</th><th>語意</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="n">1</td><td><code>vmmacc.vv</code></td><td>Zvvmm</td><td class="pass">第一輪</td><td>同寬整數矩陣乘加，C += A × Bᵀ，模 2^SEW</td></tr>
+        <tr><td class="n">2</td><td><code>vmtl.v</code></td><td>Zvvmtls</td><td class="pass">第一輪</td><td>保序二維 tile 載入</td></tr>
+        <tr><td class="n">3</td><td><code>vmts.v</code></td><td>Zvvmtls</td><td class="pass">第一輪</td><td>保序二維 tile 儲存，<code>vmtl.v</code> 的逆操作</td></tr>
+        <tr><td class="n">4</td><td><code>vqmmacc.vv</code></td><td>Zvvmm</td><td class="pass">第二輪</td><td>W=4，Int8×Int8 累加進 Int32（Zvvi8i32mm）</td></tr>
+        <tr><td class="n">5</td><td><code>vwmmacc.vv</code></td><td>Zvvmm</td><td class="pass">第三輪</td><td>W=2，A/B 於 SEW/2，於 SEW 累加</td></tr>
+        <tr><td class="n">6</td><td><code>v8wmmacc.vv</code></td><td>Zvvmm</td><td class="pass">第三輪</td><td>W=8，Int8 → Int64（SEW=64）</td></tr>
+        <tr><td class="n">7</td><td><code>vmttl.v</code></td><td>Zvvmttls</td><td class="pass">第三輪</td><td>轉置 tile 載入</td></tr>
+        <tr><td class="n">8</td><td><code>vmtts.v</code></td><td>Zvvmttls</td><td class="pass">第三輪</td><td>轉置 tile 儲存，<code>vmttl.v</code> 的逆操作</td></tr>
+        <tr><td class="n">9</td><td><code>vfmmacc.vv</code></td><td>Zvvfmm</td><td class="warn">延後</td><td>浮點 W=1</td></tr>
+        <tr><td class="n">10</td><td><code>vfwmmacc.vv</code></td><td>Zvvfmm</td><td class="warn">延後</td><td>浮點 W=2，可選 MX 縮放</td></tr>
+        <tr><td class="n">11</td><td><code>vfqmmacc.vv</code></td><td>Zvvfmm</td><td class="warn">延後</td><td>浮點 W=4，可選 MX 縮放</td></tr>
+        <tr><td class="n">12</td><td><code>vf8wmmacc.vv</code></td><td>Zvvfmm</td><td class="warn">延後</td><td>浮點 W=8，可選 MX 縮放</td></tr>
+        <tr><td class="n">13</td><td><code>vfwimmacc.vv</code></td><td>Zvvfmm</td><td class="warn">延後</td><td><code>vwmmacc.vv</code> 的 vm=0 別名：整數輸入、浮點累加</td></tr>
+        <tr><td class="n">14</td><td><code>vfqimmacc.vv</code></td><td>Zvvfmm</td><td class="warn">延後</td><td><code>vqmmacc.vv</code> 的 vm=0 別名</td></tr>
+        <tr><td class="n">15</td><td><code>vf8wimmacc.vv</code></td><td>Zvvfmm</td><td class="warn">延後</td><td><code>v8wmmacc.vv</code> 的 vm=0 別名</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">第 5、6 與 13–15 列共用 funct6（0x39 / 0x3b），僅以 vm 位元區分；第三輪只實作 vm=1 的整數累加形式，由 <code>ime_encodings.check_mx_split</code> 釘住。第 5–8 列的批次選擇理由見 <code>round3_design.md</code> §2。</p>
+
+  <div class="prose">
+    <p>被修改的檔案在三輪之間相當穩定。最終 diff <code>r15_round3.diff</code> 涵蓋 15 個 <code>generators/**</code> 的 RTL 檔（Saturn 12、rocket-chip 2、shuttle 1）與 19 個 Spike 模型檔。值得注意的是 rocket-chip 的足跡：<code>vtype</code> CSR 定義在 rocket-chip 而不在 Saturn，所以 λ/bs/altfmt 欄位的擴充必須動到 <code>rocket/CSR.scala</code>。全新的 RTL 模組只有一個，<code>exu/int/MatrixMultiplyPipe.scala</code>。</p>
+  </div>
+</section>
+
+<!-- ============ METHOD ============ -->
+<section id="method">
+  <div class="sec-head">
+    <span class="label">三 · 方法</span>
+    <h2>迴圈、兩個互相隔離的 agent，以及回饋紀律</h2>
+  </div>
+
+  <div class="prose">
+    <p>迴圈是嚴格循序的：Stage M 通過 → S1 與 S2 一起通過 → Gate → S3 跑到期限且無分歧，全部成立才標記 <code>converged</code>。S1 與 S2 不是兩個前後相接的階段而是同一個迴圈，理由寫在 <code>titan_loop.py</code> 的 docstring 裡：一次弄壞了普通 RVV 的 directed pass 不算 pass。每次嘗試的流程是編輯 → 以 <code>DIRECTED_CONFIG</code> 建置（不含 cosim harness，因為 S1 不得依賴 Spike）→ 跑 directed → 乾淨的話才建一次 <code>COSIM_CONFIG</code> 並跑 RVV 回歸抽樣，兩者必須在同一次嘗試裡都乾淨才回傳成功。</p>
+    <p>兩個 agent 完全分開。Stage M 的模型 agent 以 <code>resume_session=True</code> 保留整個階段的對話，但沒有任何自助建置或測試工具，只有 driver 每回合替它建置與評分一次；它被明文禁止讀取 <code>generators/saturn/</code> 底下任何東西，也禁止讀 <code>rvv_ref.py</code>、<code>ime_tests.py</code>、<code>ime_stress.py</code>、<code>sim_check.py</code>。S1/S2 的 RTL agent 則每回合換一個全新 session，可以編輯 Saturn 與 rocket-chip 的 VType/VConfig 部分，並持有自助的建置測試工具。這個隔離不是只靠 prompt 規則，而是靠順序：模型寫在前面，那時候根本沒有 RTL 可抄。</p>
+    <p>agent 每回合看得見的東西是刻意設計過的：依 outcome / EMUL_C / LAMBDA / SEW / LMUL 分組的 directed 結果（而不是按指令分組）、失敗 RVV 測試的名字（上限 40 個）、自己的持久筆記，以及在 mismatch 時最多 6 筆帶實際數值的證據與 tile dump。看不見的是參考模型的原始碼、測試產生器、以及編碼推導。回饋只包含自檢程式在執行期印出的東西，從不包含黃金模型的程式碼。</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>工具與防護欄何時加入</caption>
+      <thead><tr><th>項目</th><th>作用</th><th>加入於</th></tr></thead>
+      <tbody>
+        <tr><td><code>bash</code> / <code>read_spec</code> / <code>read_status</code> / <code>append_knowledge</code> / <code>finish</code></td><td>基本工具組</td><td class="dim">最早的快照</td></tr>
+        <tr><td><code>bad_geometry</code> 分類</td><td>把「DUT 回答不合法 WARL λ」從無害的 skip 中拆出來</td><td>r6</td></tr>
+        <tr><td>數值回饋（<code>TITAN DIFF</code> / <code>CDUMP</code> / <code>CREF</code>）</td><td>回饋帶實際 exp/got 十六進位值，而非只有座標</td><td>r6</td></tr>
+        <tr><td><code>run_directed</code>（阻塞式）</td><td>回合中途自行建置並測試當前樹</td><td>r6</td></tr>
+        <tr><td>session 預設不續用</td><td>取消每回合重播整份逐字稿的成本</td><td>r5</td></tr>
+        <tr><td><code>DISALLOWED_TOOLS = ["Task"]</code></td><td>禁止生子 agent，避免編輯與花費跑到帳外</td><td>r6</td></tr>
+        <tr><td><code>run_directed_start</code> / <code>_wait</code> / <code>_status</code></td><td>非阻塞版本，避免單一工具呼叫逼近 120 秒的背景化門檻</td><td>r9</td></tr>
+        <tr><td>迴圈自行產生並持有 <code>TitanS2CosimConfig</code></td><td>受審者不得維護審判自己的 harness</td><td>r9</td></tr>
+        <tr><td><code>run_rvv_start</code> / <code>run_rvv_wait</code></td><td>agent 自助跑 S2 回歸</td><td>r10<sup>[1]</sup></td></tr>
+        <tr><td><code>LLM_MAX_CONSECUTIVE_FAILURES = 2</code></td><td>偵測連續的基礎設施層 LLM 失敗並中止</td><td>r13</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <span class="label">裁判先於被告 —— 以及這條原則的極限</span>
+    <p>順序保證模型 agent 不可能讀到 RTL。它<strong>不</strong>保證模型 agent 不去讀測試——而在第一輪，測試本身就帶著缺陷。模型 agent 明知 Sail 附錄怎麼寫，仍在註解中寫下「測試提供的佈局只有在採用散文解釋時才得到正確結果，所以我們這裡跟隨散文」，然後照著壞掉的測試把模型擬合上去。兩個互相自洽的錯誤產物，從迴圈內部是偵測不到的。修正之後才加入常設規則：「可執行的 SAIL 附錄是規範性的……如果一個測試失敗，而你能想到唯一讓它通過的方法是寫下 SAIL 沒說的東西，那就停下來，不要寫。」</p>
+  </div>
+</section>
+
+<!-- ============ RESULTS ============ -->
+<section id="results">
+  <div class="sec-head">
+    <span class="label">四 · 結果</span>
+    <h2>17 次執行的帳本</h2>
+    <p>以下每一列都直接取自 <code>titan_runs/ledger.md</code>，它由 <code>tools/ledger.py</code> 解析每次執行的 <code>trace/ChiaProfileCollector.log</code> 重新產生。列依時間順序排列（帳本檔本身是字典序，會把 r1 與 r10 交錯）。</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>每次執行：wall clock、LLM 次數、成本、輸出 tokens、結果</caption>
+      <thead>
+        <tr><th class="n">#</th><th>執行</th><th class="n">wall</th><th class="n">LLM</th><th class="n">成本</th><th class="n">輸出 tokens</th><th>收斂</th><th>摘要</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="n">1</td><td><code>r1_0907_1231</code></td><td class="n">0:28:41</td><td class="n">1</td><td class="n">$11.66</td><td class="n">78,093</td><td class="fail">否</td><td class="dim">Stage M 首次嘗試</td></tr>
+        <tr><td class="n">2</td><td><code>r2_0907_1327</code></td><td class="n">4:14:18</td><td class="n">1</td><td class="n">$11.44</td><td class="n">82,810</td><td class="fail">否</td><td class="dim">單一 23 分鐘 LLM 呼叫卻花了 4 小時 14 分：Ray placement-group 死鎖</td></tr>
+        <tr><td class="n">3</td><td><code>r3_0907_1742</code></td><td class="n">3:14:47</td><td class="n">5</td><td class="n">$110.81</td><td class="n">772,218</td><td class="fail">否</td><td class="dim">Stage M 三輪收斂 27/27；S1 兩輪全 trap（cosim config bug）</td></tr>
+        <tr><td class="n">4</td><td><code>r4_0907_2120</code></td><td class="n">1:55:08</td><td class="n">5</td><td class="n">$50.56</td><td class="n">475,806</td><td class="fail">否</td><td class="dim">模型復用；S1 五輪卡在 12 mismatch / 15 skip；第六輪撞額度中斷</td></tr>
+        <tr><td class="n">5</td><td><code>r5_0908_1057</code></td><td class="n">3:03:34</td><td class="n">5</td><td class="n">$113.84</td><td class="n">690,497</td><td class="fail">否</td><td class="dim">接續 r4；五輪 12/15 不動；查出回饋無數值、<code>rvv_ref</code> 排列錯</td></tr>
+        <tr><td class="n">6</td><td><code>r6_0909_0440</code></td><td class="n">8:06:38</td><td class="n">5</td><td class="n">$126.81</td><td class="n">1,374,000</td><td class="fail">否</td><td class="dim">S1 重構（數值回饋、<code>run_directed</code>、新 session）；8/27 pass；含 81 分鐘額度等待</td></tr>
+        <tr><td class="n">7</td><td><code>r7_0909_1935</code></td><td class="n">0:04:19</td><td class="n">0</td><td class="n">$0.00</td><td class="n">0</td><td class="fail">否</td><td class="dim">啟動即失敗：根碟滿</td></tr>
+        <tr><td class="n">8</td><td><code>r7_0909_2306</code></td><td class="n">5:52:18</td><td class="n">5</td><td class="n">$107.45</td><td class="n">1,249,008</td><td class="fail">否</td><td class="dim">裁判改用 Sail、暫存搬 /share1；接續 r6；五輪 2→16→16→16→25→25 pass</td></tr>
+        <tr><td class="n">9</td><td><code>r8_0910_0521</code></td><td class="n">6:07:36</td><td class="n">6</td><td class="n">$120.67</td><td class="n">1,229,079</td><td class="fail">手動停止</td><td class="dim">第六輪 S1 首次 27/27；S2 隨即回報 841/841 結構性失敗</td></tr>
+        <tr><td class="n">10</td><td><code>r9_0912_0137</code></td><td class="n">1:11:06</td><td class="n">4</td><td class="n">$0.00</td><td class="n">0</td><td class="fail">手動停止</td><td class="dim">四次 LLM 呼叫全為 0 成本空轉（憑證過期）；帳本備註歸咎於 agent，與產物矛盾<sup>[2]</sup></td></tr>
+        <tr><td class="n">11</td><td><code>r10_0912_0302</code></td><td class="n">2:01:52</td><td class="n">1</td><td class="n">$37.28</td><td class="n">226,679</td><td class="fail">手動停止</td><td class="dim">憑證修復；S2 抽樣 23→22；查出 S2 裁判連結的是 IME 版 Spike，疑似 ABI 錯位</td></tr>
+        <tr><td class="n">12</td><td><code>r11_0912_0535</code></td><td class="n">2:21:03</td><td class="n">2</td><td class="n">$43.00</td><td class="n">332,560</td><td class="fail">手動停止</td><td class="dim">改用 stock Spike 裁判、排除 <code>vsetvl-0</code>；S2 24→23，<code>.vf</code> 仍失敗；停下跑 RTL 二分定位</td></tr>
+        <tr><td class="n">13</td><td><code>r12_0914_0341</code></td><td class="n">1:05:23</td><td class="n">1</td><td class="n">$0.65</td><td class="n">3,745</td><td class="pass">是</td><td class="dim"><strong>第一輪收斂</strong>：directed 27/27、S2 0 失敗、Gate 200/200、S3 64/64</td></tr>
+        <tr><td class="n">14</td><td><code>r13_0915_2100</code></td><td class="n">0:05:33</td><td class="n">0</td><td class="n">$0.00</td><td class="n">0</td><td class="fail">否</td><td class="dim">第二輪首送；Ray session log 檔遺失導致 <code>apply_diff</code> 崩潰，重啟叢集</td></tr>
+        <tr><td class="n">15</td><td><code>r13_0915_2118</code></td><td class="n">1:14:47</td><td class="n">2</td><td class="n">$16.96</td><td class="n">122,309</td><td class="pass">是</td><td class="dim"><strong>第二輪一次收斂</strong>：Stage M 1 輪 34/34、S1 1 輪 34/34、Gate 244/244、S3 64/64</td></tr>
+        <tr><td class="n">16</td><td><code>r14_0917_0425</code></td><td class="n">3:41:24</td><td class="n">4</td><td class="n">$79.45</td><td class="n">452,076</td><td class="fail">否</td><td class="dim">第三輪 8 條指令：Stage M 1 輪 80/80、S1 directed 80/80，但 S2 抽樣 23 支 <code>.vf</code> 失敗；停下跑解耦控制實驗</td></tr>
+        <tr><td class="n">17</td><td><code>r15_0917_1109</code></td><td class="n">1:22:39</td><td class="n">2</td><td class="n">$6.55</td><td class="n">43,978</td><td class="pass">是</td><td class="dim"><strong>第三輪收斂</strong>：模型種子 80/80、S1 attempt0 與 iter1 皆 80/80、S2 0/150、Gate 548/548、S3 64/64</td></tr>
+        <tr class="total"><td class="n"></td><td>累計（17 次執行）</td><td class="n">46:11:06</td><td class="n">49</td><td class="n">$837.13</td><td class="n">7,132,858<sup>[3]</sup></td><td>3 次收斂</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">「LLM 次數」計的是 agent session（每次迴圈迭代一次遠端 <code>prompt</code> 呼叫），不是 API 請求數；每個 session 是多回合的 agentic session，單次 session 的 cache-read tokens 可達數千萬（例如 <code>r10_0912_0302</code> 的 attempt 1 有 54,161,530）。另有一次執行 <code>r10_0912_0254</code> 因為 trace 是 0 位元組而完全沒有進入帳本，是已知的帳本缺口。</p>
+
+  <h3>發現 vs 使用：成本的形狀</h3>
+  <div class="tbl-wrap">
+    <table>
+      <caption>支出分割</caption>
+      <thead><tr><th>區段</th><th>執行</th><th class="n">成本</th><th class="n">佔比</th></tr></thead>
+      <tbody>
+        <tr><td>發現迴圈與裁判必須是什麼（第一輪的整個摸索期）</td><td>r1 – r11</td><td class="n">$733.52</td><td class="n">87.6%</td></tr>
+        <tr><td>使用它：三輪收斂執行</td><td>r12、r13_2118、r15</td><td class="n">$24.16</td><td class="n">2.9%</td></tr>
+        <tr><td>第三輪的第一次嘗試（未收斂，後續由迴圈外實驗接手）</td><td>r14</td><td class="n">$79.45</td><td class="n">9.5%</td></tr>
+        <tr class="total"><td>合計</td><td></td><td class="n">$837.13</td><td class="n">100%</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">另一種切法：依輪次，第一輪（r1–r12）$734.17、第二輪（r13 兩次）$16.96、第三輪（r14+r15）$86.00。無論怎麼切，結論相同——第一輪買的不是三條指令，而是這套裝置。</p>
+
+  <h3>每一輪的迭代數</h3>
+  <div class="prose">
+    <p>各輪之間最戲劇性的差異不是模型變聰明，而是規格語意在 agent 啟動前就被離線釘死了。第一輪的 agent 必須自己發現幾何、tile 佈局與測試契約；第二、三輪的種子 prompt 已經把分數、哪些失敗是自己的、以及「延伸既有程式碼、不要重新推導」講清楚，並指向原始日誌而不是摘要。</p>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <caption>每輪的 Stage M 與 S1 迭代數</caption>
+      <thead><tr><th>輪次</th><th>指令</th><th class="n">Stage M 迭代</th><th class="n">S1 迭代</th><th class="n">成本</th><th>備註</th></tr></thead>
+      <tbody>
+        <tr><td>第一輪</td><td><code>vmmacc.vv</code>、<code>vmtl.v</code>、<code>vmts.v</code></td><td class="n">3（r3）</td><td class="n">30 次 impl 嘗試，跨 r3–r8</td><td class="n">$734.17</td><td class="dim">S1 於 r8 第六輪首次 27/27；其後仍需迴圈外的 A/B 實驗才過 S2</td></tr>
+        <tr><td>第二輪</td><td><code>vqmmacc.vv</code></td><td class="n">1</td><td class="n">1</td><td class="n">$16.96</td><td class="dim">兩階段皆一次 34/34</td></tr>
+        <tr><td>第三輪</td><td><code>vwmmacc.vv</code>、<code>v8wmmacc.vv</code>、<code>vmttl.v</code>、<code>vmtts.v</code></td><td class="n">1</td><td class="n">1（r14）+ 1（r15）</td><td class="n">$86.00</td><td class="dim">r14 的 Stage M 與 S1 各一輪 80/80，但 S2 的 <code>.vf</code> 失敗需要迴圈外調查；r15 以修正後的 diff 重跑即收斂</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">第一輪的 S1 迭代數包含被錯誤裁判評分的 r4–r6（見 §五）；那些分數在事後看是沒有意義的，這也是 r7 從 2/27 重新起算的原因。</p>
+</section>
+
+<!-- ============ OP COSTS ============ -->
+<section id="costs">
+  <div class="sec-head">
+    <span class="label">五 · 各項操作的實測成本</span>
+    <h2>一次建置、一支測試、一輪迭代各值多少</h2>
+    <p>以下數字由 13 個執行目錄的 profiler log 以 <code>dispatch</code>/<code>complete</code> 配對解析而來。<code>r14</code> 與 <code>r15</code> 未納入這份重新解析，所以下表是第一、二輪語境下的量測。</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>操作成本（n = 樣本數）</caption>
+      <thead><tr><th>操作</th><th class="n">n</th><th class="n">最小</th><th class="n">中位數</th><th class="n">最大</th><th>平行度</th></tr></thead>
+      <tbody>
+        <tr><td>Spike 建置</td><td class="n">21</td><td class="n">0.487 s<span class="dim">（快取命中）</span></td><td class="n">~45.1 s</td><td class="n">54.21 s</td><td>1</td></tr>
+        <tr><td>Saturn elaborate + verilate（單一 <code>build_saturn</code>）</td><td class="n">118</td><td class="n">22.37 s<span class="dim">（增量）</span></td><td class="n">139.56 s</td><td class="n">176.53 s</td><td>1</td></tr>
+        <tr><td>一支 directed 測試</td><td class="n">2,080</td><td class="n">0.533 s</td><td class="n">3.593 s</td><td class="n">127.19 s</td><td>單獨 1；Gate 內 8</td></tr>
+        <tr><td>一支 cosim RVV 測試</td><td class="n">2,545</td><td class="n">0.799 s</td><td class="n">6.332 s 全語境 / 1.44 s 批量回歸內</td><td class="n">842.91 s</td><td>單獨 1；回歸內 8</td></tr>
+        <tr><td>200 支 Gate（第一輪）</td><td class="n">1</td><td class="n">—</td><td class="n">112.12 s wall（Σ 791.9 s，×7.06）</td><td class="n">—</td><td>8</td></tr>
+        <tr><td>244 支 Gate（第二輪）</td><td class="n">1</td><td class="n">—</td><td class="n">134.38 s wall（Σ 1,030.9 s，×7.67）</td><td class="n">—</td><td>8</td></tr>
+        <tr><td>64 案例 Stage 3 掃描</td><td class="n">2</td><td class="n">263.2 s</td><td class="n">—</td><td class="n">291.1 s</td><td>3 workers，有效 ≈1×</td></tr>
+        <tr><td>150 支 S2 抽樣（離線 side-run）</td><td class="n">1</td><td class="n">—</td><td class="n">1,238.6 s（+133.3 s cosim 建置）</td><td class="n">—</td><td class="dim">依該 driver 設定</td></tr>
+        <tr><td>839 支近全套 S2（離線循序）</td><td class="n">1</td><td class="n">—</td><td class="n">5,821.3 s</td><td class="n">—</td><td class="dim">同上</td></tr>
+        <tr><td>837 支全套 S2（最終驗證，8-way）</td><td class="n">1</td><td class="n">—</td><td class="n">4,319.7 s</td><td class="n">—</td><td>8</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout is-warn">
+    <span class="label">不要引用的一個數字</span>
+    <p>語料庫裡唯一一次「841 支全套回歸」是 r8 attempt 6，而那正是 Shuttle DebugROB 的結構性失敗本身：841 支測試全部在第一條 bootrom 指令就中止，159 秒。那是 841 支測試<em>瞬間失敗</em>的成本，不是一次回歸的成本，也代表那次執行沒有量到關於設計的任何事情。健康的全套掃描請引用 <code>a3_verify</code> 的 839 支循序 5,821.3 秒，或本專案最終驗證的 837 支 8-way 4,319.7 秒。</p>
+  </div>
+
+  <div class="prose">
+    <p>兩個結構性事實從這張表掉出來。其一，Gate 與 Stage 3 完全不花 LLM 的錢，它們是純計算。其二，一次 S1 迭代不可壓縮的計算下限大約是建置 140 秒加上 directed 約 12 秒，約 2.5 分鐘；加上 cosim 建置與 150 支 S2 抽樣後，一次完整的 S1+S2 嘗試約 17 分鐘的計算。相較之下，單次 LLM session 的中位數是 2,433 秒。<strong>agent 的思考時間，而不是模擬，才是迴圈的節奏主宰。</strong></p>
+    <p>39 次真實 LLM session 的花費中位數是 $18.63、平均 $19.26，最低 $0.65（r12 的那次「確認無事可做」session，3 分 27 秒），最高 $42.83。累計 3,708 個回合、約 28 小時的 agent 時間。</p>
+  </div>
+</section>
+
+<!-- ============ DEFECTS ============ -->
+<section id="defects">
+  <div class="sec-head">
+    <span class="label">六 · 缺陷</span>
+    <h2>九個缺陷，依撞上的順序</h2>
+    <p>每一則的格式相同：症狀 → 如何定位 → 成因 → 修法 → 代價。成本取自帳本與 trace。注意 §6.3 與 §6.4 在 r4、r5 同時存在，兩者的金額不可相加。</p>
+  </div>
+
+  <article class="defect">
+    <header>
+      <span class="idx">6.1 · 迴圈 harness</span>
+      <h3>S1 用 cosim config 建置 directed 映像</h3>
+      <span class="cost">r3 · ~0:56 · $32.96</span>
+    </header>
+    <dl class="fields">
+      <dt>症狀</dt><dd>Stage M 乾淨收斂（三輪 27/27）之後，S1 在 attempt 1 回傳 27/27 <code>trap</code>，attempt 2 在<em>完全不同的 RTL diff</em> 上回傳位元相同的 27/27 <code>trap</code>。</dd>
+      <dt>定位</dt><dd>均勻失敗的簽名（狀態檔沒有任何 LAMBDA/SEW/LMUL 分佈）指向 harness 而非設計。agent 自己誤判為 <code>vtype.lambda</code> 解碼的 WARL clamp bug，整個 attempt 2 花在一個注定不可能贏的實驗上。</dd>
+      <dt>成因</dt><dd>S1 的 directed 映像用 <code>COSIM_CONFIG</code> 建置。cosim config 連結的是容器映像裡的 <em>stock</em> <code>libriscv</code>，它從未聽過 Zvvm；directed 程式是自檢的、不需要黃金模型，但 cospike 會在第一個帶 lambda 欄位的 <code>vtype</code> 寫入時中止，發生在任何程式印出結論之前。</dd>
+      <dt>修法</dt><dd>r4 起 <code>SYNTH_CONFIG as DIRECTED_CONFIG</code>，S1 用它建置，S2 在 directed 通過後才獨立建 <code>COSIM_CONFIG</code>。同一份修改加入 <code>_dump_sim_logs</code>，因為 r3 完全沒留下「為什麼 27/27 trap」的觀察管道。</dd>
+    </dl>
+  </article>
+
+  <article class="defect">
+    <header>
+      <span class="idx">6.2 · 迴圈排程</span>
+      <h3>Ray placement-group 死鎖，3 小時 50 分</h3>
+      <span class="cost">r2 · 3:50:11 空轉 · $0</span>
+    </header>
+    <dl class="fields">
+      <dt>症狀</dt><dd>4:14:18 wall、1 次 LLM 呼叫、$11.44、未收斂。Stage M 的 LLM 回合正常結束，之後的一切都掛住。</dd>
+      <dt>定位</dt><dd>trace 有 127 個事件，<code>build_spike</code> 完成到 <code>run_end</code> 之間是 13,811 秒（230.2 分鐘）的空窗，零事件；然後 27 個 <code>spike_run</code> 配對在 6–9 毫秒內全部觸發並完成。關鍵在於 profiler 的 <code>dispatch</code> 與 <code>complete</code> <strong>都是 worker 端在執行時才發出</strong>，所以一個 Ray 從未排程的任務在真正跑起來之前什麼都不會記錄——正確的說法是「從未被<em>排程</em>」，不是「從未被 dispatch」。</dd>
+      <dt>成因</dt><dd><code>_run_on_spike</code> 少了 <code>pg_opts</code>，27 個 <code>spike_run</code> 任務向節點的預設資源池要 <code>chipyard</code>，而 <code>STRICT_PACK</code> 的 placement group 早已把它整個預約走。任務永遠停在 <code>PENDING_NODE_ASSIGNMENT</code>，而 Ray 對這種情況<strong>從不報錯</strong>。</dd>
+      <dt>修法</dt><dd>r3 起在 group 內 dispatch：<code>nodes.spike_run.options(**pg_opts)</code>。程式碼裡有兩處註解把這件事講了兩遍，「27 個待決任務四小時」的數字與 trace 完全吻合。</dd>
+      <dt>代價</dt><dd>錢沒有損失（LLM 工作在停擺之前就完成了），損失的是一天。帳本的 note 欄對 r2 是空白的——整個診斷來自程式碼註解，不是帳本。</dd>
+    </dl>
+  </article>
+
+  <article class="defect">
+    <header>
+      <span class="idx">6.3 · 迴圈評分</span>
+      <h3>SKIP 大赦，以及沒有數字的回饋</h3>
+      <span class="cost">r4 + r5 · 4:58:42 · $164.40</span>
+    </header>
+    <dl class="fields">
+      <dt>症狀</dt><dd>S1 分數在 r4 的全部五輪與 r5 的全部五輪凍結在 27 支中 <code>mismatch=12 / skip=15</code>——九個連續的 JSON 檢查點一模一樣。同時回饋只有座標沒有數值：「<code>mismatch at C[0,1]</code>」，如此而已。</dd>
+      <dt>定位</dt><dd>狀態檔顯示 <code>LAMBDA=1: skip=7</code>：DUT 一次都沒有滿足過 LAMBDA=1 的請求，七次全被大赦。</dd>
+      <dt>成因</dt><dd><code>classify_run</code> 把<em>每一個</em> <code>TITAN SKIP</code> 無條件歸為 <code>skip</code>，而 <code>skip</code> 被排除在「失敗」之外，回饋還白紙黑字告訴 agent 這些「不會算在你頭上」。規格其實只在一種情況允許向上取整，而且那是整次執行的性質，不是單一程式的性質。守門的 <code>MODEL_MAX_SKIP_FRACTION</code>（0.5）只管 Stage M，S1 的 15/27 ≈ 0.56 什麼都沒觸發。回饋側則是三層問題：程式根本沒印出數值、Outcome 因此只有座標、格式化函式再貼上 60 行原始 Verilator 尾巴。</dd>
+      <dt>修法</dt><dd>r6 起新增失敗類別 <code>bad_geometry</code>，只在整次執行的證據足以開脫時才降級為 <code>skip</code>——「刻意偏向多花迭代而不是藏起 bug 的那一邊」。回饋改為程式先印證據再印結論（<code>TITAN DIFF r= c= exp= got=</code> 加 tile dump），並以 6 筆測試 / 4000 字元為預算；日誌改寫進 chipyard 樹讓 agent 自己讀。</dd>
+      <dt>代價</dt><dd>r4 與 r5 合計 4:58:42、10 次 LLM 呼叫、$164.40，而分數在結構上根本不可能移動。順帶量到的一個數字：開著 <code>resume_session</code> 時，這種回饋在 r5 造成五次呼叫共 145,384,536 個 cache-read tokens，其中沒有任何一個錯誤的<em>數值</em>。</dd>
+    </dl>
+  </article>
+
+  <article class="defect">
+    <header>
+      <span class="idx">6.4 · 裁判</span>
+      <h3><code>rvv_ref</code> 與 Sail 附錄不一致，而 Spike 模型明知故犯地擬合了壞掉的測試</h3>
+      <span class="cost">r4 + r5 + r6 · ~13:05 · $291.21</span>
+    </header>
+    <dl class="fields">
+      <dt>症狀</dt><dd>r4、r5、r6 共用同一份 Stage M Spike diff，而 S1 就是不收斂。agent 每一輪都在「修正」自己的定址，毫無效果——它在追一個自己也錯了的裁判。</dd>
+      <dt>定位</dt><dd>agent 其實看見了：它在筆記裡寫下「參考模型說 C[i,j] 的暫存器位置是 <code>i*N_max + j</code>……規格的 SAIL 用的是 <code>mat_C_idx(i,j) = tile_reg_idx(...)</code>，在 EMUL_C &gt; 1 時會洗牌」，然後合理而災難性地推論：「測試是由 rvv_ref 的模型判定的，不是規格的，所以 RTL 必須用參考模型的平坦排列。」真正的定位來自迴圈外的判別實驗 <code>tools/verify_model_diff.py</code>：把新舊兩份 Stage M diff 對<em>修正後</em>的測試做零 LLM 的 A/B——新版 27/27 通過，r3 版 8/27。</dd>
+      <dt>成因</dt><dd>參考模型 <code>rvv_ref.py</code> 的 C 存取器是平坦的（A/B tile 已經正確置換，只有 C 沒有）。而 Spike 模型是<strong>明知而遷就</strong>：<code>vmmacc_vv.h</code> 的註解承認「SAIL 字面上是把 i 送過 <code>tile_reg_idx(...)</code>」，然後選擇跟隨測試。兩個互相自洽的錯誤產物，從迴圈內部偵測不到。</dd>
+      <dt>修法</dt><dd><code>rvv_ref.py</code> 逐字轉寫 <code>tile_reg_idx</code>，Spike 模型同步改寫，並加入常設 prompt 規則（SAIL 是規範性的，不得為了通過測試寫下 SAIL 沒說的東西）與參考模型自身的自我檢驗：以兩條獨立路徑推導每一條幾何規則並斷言兩者一致。檔頭留下常設警語：「如果這個檔案錯了，下游全部都錯，而且不會有任何東西告訴你。」</dd>
+      <dt>代價</dt><dd>r4、r5、r6 的 RTL 工作全部是對著錯誤裁判評分的：$291.21、約 13 小時。不是全然浪費——r6 在其中找到了真正的 <code>PipelinedFaultCheck</code> vl 覆寫 bug——但那三次執行報出的每一個分數都沒有意義，這也是 r7 在 r6 「達到」8/27 之後仍從 2/27 重新起算的原因。</dd>
+    </dl>
+  </article>
+
+  <article class="defect">
+    <header>
+      <span class="idx">6.5 · cosim harness（上游）</span>
+      <h3>Shuttle DebugROB <code>retireWidth</code>：841/841 在 2.5 分鐘內失敗</h3>
+      <span class="cost">r8 的 S2 · ~1:10 · ~$25</span>
+    </header>
+    <dl class="fields">
+      <dt>症狀</dt><dd>r8 attempt 6 達到第一輪首次 S1 27/27，S2 立刻回報 841 支全數失敗，全部是第一條 bootrom 指令的 PC 不符。</dd>
+      <dt>定位</dt><dd>時間就是線索。841 支 <code>cosim_run</code> 全部在 159 秒內完成，每支 exec 時間最小 1.20、中位 1.44、最大 1.95 秒。一個設計層的 bug 不會讓 841 支異質測試以幾乎相同的時間失敗。</dd>
+      <dt>成因</dt><dd>Shuttle 的 DebugROB 支援對每一條 retire lane 各呼叫一次 <code>debug_rob</code> DPI——<code>retireWidth</code> 個獨立的 <code>popTrace</code> 實體讀同一個 C++ deque，順序是 Verilator 未定義的。預設 2 寬的核心會例行地把配對彈反，cospike 先看到第二條指令就中止。<strong>它在乾淨的樹上、用 Saturn 自己的 config 也能重現，所以是 harness bug，與 agent 做了什麼無關。</strong></dd>
+      <dt>修法</dt><dd>r9 起三件事一起做：迴圈自己產生 harness <code>S2_COSIM_SCALA</code>，其中含 <code>WithShuttleRetireWidth(1)</code>；harness 延伸 agent 自己的 <code>SYNTH_CONFIG</code>，使 S2 審判的必然是 S1 剛通過的同一個設計；以及「迴圈寫它，不是 agent 寫它——一個由受審方維護的 gate 不是 gate」。</dd>
+      <dt>已承認的修法代價</dt><dd>S2 因此在 1 寬的宿主上評分，只有在兩條指令同週期 commit 時才出現的 bug 在這道 gate 之外。S1 仍跑雙發射。原則性的修法在上游：Shuttle 應該用一條有序多彈的 DPI 排空 DebugROB。</dd>
+      <dt>未證實</dt><dd>那句 <code>PC mismatch spike 10000 != DUT 10004</code> 的字面字串沒有保存在 r8 的檔案裡——手動停止前沒有留下 S2 的 simlog。該說法取自程式碼註解，並由 841 的計數與 159 秒在結構上佐證。</dd>
+    </dl>
+  </article>
+
+  <article class="defect">
+    <header>
+      <span class="idx">6.6 · 設計</span>
+      <h3><code>.vf</code> 回歸：矩陣功能單元卡住共用的 issue 路徑</h3>
+      <span class="cost">r9 – r11 · 5:34:01 · $80.28</span>
+    </header>
+    <dl class="fields">
+      <dt>症狀</dt><dd>S1 一路乾淨 27/27，S2 的 150 支抽樣卻有 21–24 支失敗，除了 <code>vsetvl</code> 家族之外<strong>全部</strong>是 <code>.vf</code>（向量–純量）測試。乾淨的樹在同一套判準下是 840/841 通過。</dd>
+      <dt>定位</dt><dd>先排除裁判：以 stock Spike 與 IME 版 Spike 分別評分，失敗的是<em>同樣</em> 9/10 支，而乾淨的 RTL 在兩者之下都 10/10——所以是真實的 RTL 破壞，不是裁判的假象。接著檔案層級的二分定位<strong>完全失敗</strong>：八個分支只有控制組建得起來，另外七個都建置失敗，<code>bisect.json</code> 的結論是「最小失敗集合 = 全部 RTL，最大通過集合 = 未觀察到」。真正的定位來自語意層的 A/B：先套用完整 diff（所以一定能編譯），再<em>反轉單獨一行</em>。</dd>
+      <dt>成因（當時的結論）</dt><dd><code>Parameters.scala</code> 無條件把 <code>integerMatrix</code> 加進 <code>integerFUs</code>，於是矩陣 FU 坐在永遠被實體化的 int ExecutionUnit 裡。它的 stall 傳到 <code>io.iss.ready</code> 再傳到 <code>dis_stall</code>；在 <code>VectorIssueStructure.Shared</code> 之下，int sequencer 會卡住 fp sequencer，擾動了晚一級才抵達 Saturn 的 <code>.vf</code> 純量運算元。諷刺的是，那個 <code>post_write_stall</code> 本身就是 agent 為了另一個症狀加上去的修正，被留下來只因為「看起來有幫助」。</dd>
+      <dt>修法（當時）</dt><dd>刪掉 <code>post_write_stall</code>，把最後一行改回 <code>io.stall := valid</code>。這份 diff 在離線驗證裡 directed 27/27、S2 全套 839 支只剩兩支已知排除項、<strong>零 <code>.vf</code> 失敗</strong>，r12 隨後以一次 $0.65 的 LLM 呼叫收斂了整個迴圈。</dd>
+      <dt>後續（重要）</dt><dd>這個「根因」在第三輪被推翻。變體 B 給 int 與 fp sequencer 各自獨立的 issue 路徑，若上述機制為真則 B 應該修好它——B 沒有修好。而且整個第一輪的 A/B 都是在隨機化混淆之下跑的（見 §七）。<strong>應該把當時的修正讀成「一次成功的邊際移動」，而不是「找到了錯的那一行」。</strong></dd>
+      <dt>代價</dt><dd>三輪付費的 agent 迭代（5 小時 34 分、$80.28）沒能定位它；約 2.5 小時的無人值守腳本實驗找到並修掉了它。</dd>
+    </dl>
+  </article>
+
+  <article class="defect">
+    <header>
+      <span class="idx">6.7 · 基礎設施</span>
+      <h3>根檔案系統塞滿</h3>
+      <span class="cost">r7_0909_1935 · 0:04:19 · $0</span>
+    </header>
+    <dl class="fields">
+      <dt>症狀</dt><dd>啟動四分鐘即死，0 次 LLM 呼叫。</dd>
+      <dt>定位</dt><dd>trace 顯示 <code>verilator_run_remote</code> dispatch=27、complete=4，其餘函式全部平衡；建置的 stdout 正常結束。所以建置成功，run 死在 directed 測試中途、23 個模擬還在飛。同期主機負載 <code>load1</code> 峰值 795.4、<code>mem_used_gb</code> 249.6，是整個語料庫最高。</dd>
+      <dt>成因</dt><dd>Ray 的 temp dir 與每個節點的 <code>TMPDIR</code> 都在 head 的根檔案系統上，而它滿了（877G）。r6 單獨一次就把 8 小時 6 分的建置與 cosim 灌進去。</dd>
+      <dt>修法</dt><dd>r7 重跑起把 <code>--temp-dir</code>、每一種節點的 <code>TMPDIR</code>、以及所有 worker 容器的 bind-mount 全部搬到 <code>/share1</code>，程式端改為繼承 <code>$TMPDIR</code>。同一次修改順手處理兩個次要風險：head 與 build 容器 uid 不同導致共用 session 目錄會讓核心 worker 崩潰，以及 Ray 的 plasma socket 是 AF_UNIX、全長不得超過 107 bytes。</dd>
+      <dt>未證實</dt><dd>沒有任何 <code>ENOSPC</code> 字串留存，確切的 errno 路徑無法確認；硬證據是那個不平衡的 dispatch 計數。</dd>
+    </dl>
+  </article>
+
+  <article class="defect">
+    <header>
+      <span class="idx">6.8 · 基礎設施</span>
+      <h3>容器憑證過期，造成四次靜默空轉的迭代</h3>
+      <span class="cost">r9 · 1:11:06 · $0.00</span>
+    </header>
+    <dl class="fields">
+      <dt>症狀</dt><dd>帳本說 r9 的 agent「無工具盲改三輪，21→21→23」。產物說 agent 根本沒跑。</dd>
+      <dt>定位</dt><dd>四份逐字稿各 15 位元組，內容只有 <code>success=False</code>；四份擷取的 diff 位元完全相同，md5 與 r8 最終的 diff 一模一樣；profiler 的 <code>extra</code> 顯示 CLI 在 50 毫秒內退出。r9 是 13 次執行中唯一逐字稿寫著 <code>success=False</code> 的一次。</dd>
+      <dt>成因</dt><dd>叢集把主機的 <code>$HOME/.claude</code> bind-mount 進 llm 容器，主機 token 過期後容器裡的 CLI 無法認證。而失敗是靜默的：CLI 立刻失敗並不會拋例外，它回傳一個 <code>success=False</code> 的結果物件與空的逐字稿，迴圈就高高興興地把一棵沒動過的樹建置並評分，剩下的每一輪都如此。整個語料庫的 13 份 trace 裡，<code>llm_failed</code> 這個事件型別<strong>從未出現過</strong>。</dd>
+      <dt>修法</dt><dd>當下只是重啟容器。程式端的守衛 <code>LLM_MAX_CONSECUTIVE_FAILURES = 2</code> 遲至 r13 才加入——比症狀晚了三次執行，所以 r10 重跑、r11、r12 全都在無防護狀態下跑完。</dd>
+      <dt>副作用</dt><dd>這個 bug 意外製造了一個乾淨的可重複性實驗：同一個位元相同的設計連跑三次 S2，失敗數是 21 / 21 / 23，失敗集合的聯集 23、穩定交集 19。連同一支測試的分歧簽名每次都不同，其中一次是「模擬器死掉（exit -11），無結論」。<strong>裁判本身帶著一個非決定性的失敗模式，最多可以灌水 6 支。</strong></dd>
+      <dt>代價</dt><dd>1 小時 11 分的叢集時間、四次完整的 build + S2 循環，$0.00。一個不花錢的失敗，是沒有東西會注意到的失敗。</dd>
+    </dl>
+  </article>
+
+  <article class="defect">
+    <header>
+      <span class="idx">6.9 · 基礎設施</span>
+      <h3>r13 首送：Ray session log 遺失導致 <code>apply_diff</code> 崩潰</h3>
+      <span class="cost">r13_0915_2100 · 0:05:33 · $0</span>
+    </header>
+    <dl class="fields">
+      <dt>症狀</dt><dd>五分半後結束，0 次 LLM 呼叫。</dd>
+      <dt>定位</dt><dd>17 個事件：<code>build_spike</code> 完成後是 289 秒完全沒有任何 Ray 事件的空窗，然後 <code>run_end</code>。沒有 <code>apply_diff</code> 的 dispatch 事件存在。與 r2 的空窗不同（那個以 27 個任務的爆發收尾），這一個裡面什麼都沒有，把崩潰定位在本地 driver 的 Python 裡。</dd>
+      <dt>未證實</dt><dd><strong>沒有任何 traceback 留存</strong>。「Ray session log 檔遺失」這個說法只由人工撰寫的帳本備註佐證。旁證是叢集已經連續開了約 40 小時，而 llm 容器設了 log 輪替上限。</dd>
+      <dt>修法</dt><dd>只有重啟叢集。兩次 r13 跑的是位元相同的程式碼，重跑即一次收斂第二輪。</dd>
+    </dl>
+  </article>
+
+  <h3>整體攤提</h3>
+  <div class="tbl-wrap">
+    <table>
+      <caption>依執行去重後的成本歸屬（以第一、二輪的 13 次執行為範圍）</caption>
+      <thead><tr><th>執行</th><th>主導缺陷</th><th class="n">成本</th><th class="n">佔 $751.13</th></tr></thead>
+      <tbody>
+        <tr><td>r1、r2、r3</td><td>Stage M 起步；placement-group 死鎖；cosim config</td><td class="n">$133.91</td><td class="n">17.8%</td></tr>
+        <tr><td>r4、r5、r6</td><td>SKIP 大赦與無證據回饋，接著是使三次執行全部作廢的裁判缺陷</td><td class="n">$291.21</td><td class="n">38.8%</td></tr>
+        <tr><td>r7（兩次）、r8</td><td>在修正後的裁判上真正的 RTL 收斂，終結於 DebugROB</td><td class="n">$228.12</td><td class="n">30.4%</td></tr>
+        <tr><td>r9、r10（兩次）、r11</td><td>靜默空轉，接著是 <code>.vf</code> 追捕</td><td class="n">$80.28</td><td class="n">10.7%</td></tr>
+        <tr><td>r12、r13（兩次）</td><td><strong>兩次收斂執行</strong></td><td class="n">$17.61</td><td class="n">2.3%</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="prose">
+    <p>三個都站得住腳的讀法。第一，<strong>單一最昂貴的缺陷在裁判裡</strong>：它沒有讓迴圈失敗，而是讓迴圈<em>成功地做錯的事情</em>並且一路回報乾淨的分數；而本來應該防止這件事的「裁判先於被告」機制沒能防住，因為模型 agent 讀得到測試，而測試帶著缺陷。第二，大約 87% 的支出發生在這套裝置變正確之前。第三，<strong>基礎設施缺陷幾乎不花錢，卻吃掉大量時間</strong>，而且四個裡有兩個是靜默的——迴圈的儀表在記錄成本這件事上做得很好，在記錄「沒有工作發生」這件事上做得很差。</p>
+  </div>
+</section>
+
+<!-- ============ RANDOMISATION ============ -->
+<section id="randomisation">
+  <div class="sec-head">
+    <span class="label">七 · 方法學上的主結果</span>
+    <h2>隨機暫存器初始化是一場每次建置重抽的樂透</h2>
+    <p>這一節自成一節，因為它改寫了前面好幾則缺陷敘事的效力。</p>
+  </div>
+
+  <div class="prose">
+    <p>模擬編譯時帶著 <code>+define+RANDOMIZE_MEM_INIT / _REG_INIT / _GARBAGE_ASSIGN / _INVALID_ASSIGN</code>。FIRRTL 因此為每個模組發出一個 <code>initial</code> 區塊，把偽隨機位元打包進每一個沒有 <code>RegInit</code> 的暫存器。<strong>打包方式取決於暫存器寬度</strong>，所以任何一個暫存器寬度的改變，都會把同一模組中排在它後面的每一個暫存器的初始值重抽一次。</p>
+    <p>這件事是在第三輪一個對照實驗裡直接被看見的。當時要驗證的假設很簡單：把一個完全無作用的 no-op 功能單元加進 <code>integerFUs</code>，會不會弄壞 <code>.vf</code> 測試？加進去之後 <code>ExecuteSequencer.fu_sel</code> 從 7 位元變 8 位元，發出的邏輯完全相同（<code>fu_sel &lt;= {1'h0, &lt;同一個運算式&gt;}</code>），但隨機化區塊整個位移：</p>
+  </div>
+
+  <pre><code>- fu_sel = _RANDOM[5'h14][22:16];    + fu_sel = _RANDOM[5'h14][23:16];
+- eff_vl = _RANDOM[5'h14][31:23];    + eff_vl = {_RANDOM[5'h14][31:24], _RANDOM[5'h15][0]};
+- eidx   = _RANDOM[5'h15][21:14];    + eidx   = _RANDOM[5'h15][22:15];</code></pre>
+
+  <div class="prose">
+    <p>然後 <code>machine_vfsgnjn_vf-1</code> 在一個組合邏輯完全沒有改變的設計上分歧了。把隨機化 define 拿掉之後，同一個分支是乾淨的。</p>
+  </div>
+
+  <div class="callout is-warn">
+    <span class="label">結果</span>
+    <p><strong>這個 bug 上的每一個更早的實驗都是在這場樂透底下跑的</strong>——包括第一輪那個被當成根因的一行「修正」、<code>issue_decouple</code> 的 A/B/C 篩選，以及整個檔案層級的 <code>rtl_bisect</code>。這也解釋了為什麼一個「修正」曾經有效、後來又失效，以及為什麼二分定位會得出一個「不可再約化的核心」這種答案。</p>
+  </div>
+
+  <div class="prose">
+    <p>把混淆移除之後重跑，結論有兩層。第一層是那個 no-op 功能單元的實驗<strong>通過</strong>了：加寬 <code>integerFUs</code> 並不會弄壞 <code>.vf</code>；而 IME 設計本身<em>不是</em>樂透的受害者，它在隨機化開與關之下都是 4/4 失敗，bug 是真實且決定性的。</p>
+    <p>第二層才是真正的發現。在確定性的條件下把 IME diff 逐段拆解，<strong>沒有任何一個子系統是必要的</strong>：移除矩陣 FU、或 tile 載入儲存路徑、或 vtype/lambda 擴充、或 <code>EarlyDecode</code>、或 <code>PipelinedFaultCheck</code>、或 <code>mem/</code> 的改動，各自單獨做，四支探針全都還是失敗；而 vtype 擴充單獨套用在乾淨樹上完全乾淨。更關鍵的是，兩個<em>架構行為完全相同</em>的分支給出相反的結果——<code>C1</code> 強制 <code>is_tile_op</code> 為假（這已經蘊含 <code>C3</code> 的效果）卻 4/4 失敗，而效果是其嚴格子集的 <code>C3</code> 卻 0/4 通過。</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>確定性條件下（已套用 <code>norand.diff</code>）的分支結果，探針為四支 <code>.vf</code> 測試</caption>
+      <thead><tr><th>分支</th><th>相對於第三輪 diff 的改動</th><th class="n">探針失敗</th></tr></thead>
+      <tbody>
+        <tr><td><code>E3</code> 控制組</td><td>無</td><td class="n fail">4 / 4</td></tr>
+        <tr><td><code>B10_vtype_only</code></td><td><strong>只保留</strong> vtype/lambda 擴充於乾淨樹上</td><td class="n pass">0 / 4</td></tr>
+        <tr><td><code>B6_no_matrix_fu</code></td><td>完全沒有矩陣 FU</td><td class="n fail">4 / 4</td></tr>
+        <tr><td><code>C1_no_tile</code></td><td><code>is_tile_op := false.B</code>，整條 tile 載入儲存路徑關閉</td><td class="n fail">4 / 4</td></tr>
+        <tr><td><code>C3_no_tile_memop</code></td><td><code>io.mem.bits.is_tile{,_transposing} := false.B</code>，C1 效果的嚴格子集</td><td class="n pass">0 / 4</td></tr>
+        <tr><td><code>C4_no_matrix_and_no_tile</code></td><td>B6 + C1</td><td class="n pass">0 / 4</td></tr>
+        <tr><td><code>B2_drop_earlydecode</code></td><td>移除 <code>frontend/EarlyDecode.scala</code></td><td class="n fail">4 / 4</td></tr>
+        <tr><td><code>B3_drop_pfc</code></td><td>移除 <code>frontend/PipelinedFaultCheck.scala</code></td><td class="n fail">3 / 4</td></tr>
+        <tr><td><code>B4_drop_mem</code></td><td>移除 <code>mem/{AddrGen,LoadOrderBuffer,Mem}.scala</code></td><td class="n fail">4 / 4</td></tr>
+        <tr><td><code>B7_drop_core_vtype</code></td><td>移除 <code>RocketCore.scala</code> + shuttle <code>Core.scala</code></td><td class="n fail">4 / 4</td></tr>
+        <tr><td><code>C2_decode_isolate</code></td><td><code>MatrixMacc</code>、<code>MatrixW</code> 移出共用的 <code>dis_ctrl</code> 欄位清單</td><td class="n pass">0 / 4</td></tr>
+        <tr><td><code>D1_decode_defaults</code></td><td><code>fields.map(_.dontCare)</code> → <code>fields.map(_.default)</code></td><td class="n fail">4 / 4</td></tr>
+        <tr><td class="dim"><code>B1</code>、<code>B5</code>、<code>B8</code></td><td class="dim">—</td><td class="n dim">無法 elaborate（不確定）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="prose">
+    <p>兩個架構行為相同、結果相反的分支只能意味著一件事：<strong>這個失敗是一個邊際的、對排程敏感的行為，而向量後端上任何邏輯上無作用的小擾動都足以把它翻到任一邊。</strong>乾淨的 Saturn 坐在這條邊界的安全側，第三輪的設計坐在錯誤側。這與 §七開頭那個隨機化混淆是同一個形狀，只是高了一層：那邊的樂透在<em>模擬</em>時抽，這邊在<em>elaboration</em> 時抽。</p>
+    <p>最終採用的改動是把 <code>MatrixMacc</code> 與 <code>MatrixW</code> 從 <code>backend/ExecuteSequencer.scala</code> 裡共用的 <code>dis_ctrl</code> 欄位清單移出，放進它們自己的 <code>VectorDecodedControl</code>。它被選中的理由是：它是唯一一個能讓八條 IME 指令全部保持功能的通過分支（<code>C3</code> 會破壞 tile 載入儲存，<code>C4</code> 直接移掉兩個 IME 功能），而且有一個說得通的解讀——它把共用的 sequencer 解碼表還原成乾淨 Saturn 上的原樣，於是最小化器對該表 don't-care 區域的解法也回到原樣。</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>採用改動的驗證（隨機化<strong>開啟</strong>，即 S2 裁判實際使用的 harness）</caption>
+      <thead><tr><th>gate</th><th class="n">第三輪未修正</th><th class="n">第三輪 + 改動</th></tr></thead>
+      <tbody>
+        <tr><td>80 幾何 IME directed 測試組</td><td class="n">80 / 80</td><td class="n pass">80 / 80</td></tr>
+        <tr><td>四支 <code>.vf</code> 探針</td><td class="n fail">4 失敗</td><td class="n pass">0 失敗</td></tr>
+        <tr><td>S2 抽樣（150 支）</td><td class="n fail">24 失敗，全為 <code>.vf</code></td><td class="n pass">0 失敗</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout is-warn">
+    <span class="label">誠實的結論</span>
+    <p>清乾淨 150 支中的 150 支，不是一次幸運重排合理做得到的事，所以這是「修好了」的證據，而不只是抽到好籤的證據。但它<strong>仍然是一次邊際移動，不是被證明的根因</strong>。真正根因版本的解釋（讓每個欄位遵守自己宣告的預設值而不是 don't-care）在實驗中<em>沒有</em>修好探針。潛在的缺陷還在：<code>.vf</code> 純量（<code>frs1</code>）的遞送路徑——整個設計裡唯一晚一級才抵達 Saturn 的純量——是邊際的，乾淨的 Saturn 與修正後的 Saturn 都是靠排程的運氣通過它，而不是靠構造保證。向量後端未來的任何改動都可能重新觸發它。</p>
+    <p>方法學上的推論很直接：<strong>四支探針的分支無法區分「一個修正」與「一次有利的重排」，只有夠廣的測試集可以</strong>；而這個 bug 上未來的每一次 A/B 都必須關閉隨機化，否則結果不可重現。</p>
+  </div>
+</section>
+
+<!-- ============ PPA ============ -->
+<section id="ppa">
+  <div class="sec-head">
+    <span class="label">八 · PPA</span>
+    <h2>沒有合成工具，沒有 PDK，因此沒有面積、時序或功耗數字</h2>
+    <p>這一節提供的是一個 RTL 結構代理，它<strong>不是</strong> PPA。每一個數字都附上取得規則，可以被重現或被質疑。</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>可行性檢查：本部署中不存在任何實體流程</caption>
+      <thead><tr><th>需求</th><th>檢查方式</th><th>結果</th></tr></thead>
+      <tbody>
+        <tr><td>合成執行檔</td><td>在 head 與 build 容器內 <code>which genus yosys openroad innovus abc dc_shell</code></td><td class="fail">全部不存在</td></tr>
+        <tr><td>Hammer</td><td>兩處皆 <code>python -c "import hammer"</code></td><td class="fail"><code>ModuleNotFoundError</code></td></tr>
+        <tr><td>Sky130 PDK</td><td><code>find / -iname "*sky130*"</code></td><td class="fail">只有 chipyard 的範例 YAML 樣板，沒有 <code>sky130A</code>、沒有 lib / LEF</td></tr>
+        <tr><td>VLSI worker</td><td><code>cluster.yaml</code> 的 <code>vlsi</code> 節點類型</td><td class="fail"><code>num_workers: 0</code>，<code>image:</code> 仍是 <code># FILL</code></td></tr>
+        <tr><td>PDK 路徑常數</td><td><code>constants.py</code> 的 <code>SKY130_COL_PATH</code></td><td class="fail">預設 <code>"#FILL"</code>，環境變數未設</td></tr>
+        <tr><td>工具 / 製程設定檔</td><td><code>examples/sky130_vlsi/tools-chia.yml</code>、<code>tech-sky130.yml</code></td><td class="fail">未填寫的樣板（<code>genus_bin: "/path/to/cadence/GENUS"</code>）</td></tr>
+        <tr><td>Docker 映像</td><td>主機上 <code>docker images</code></td><td class="fail">沒有任何 genus / sky130 / vlsi 映像</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">因此 <code>synth_node.py</code> 從未被接進迴圈，不是 driver 的疏漏：叢集沒有可以派工的 <code>vlsi</code> worker，也沒有東西可以在上面跑。迴圈自己也把這個缺口寫在程式裡（<code>PPA_SYNTH_WIRED = False</code>，註解說明是「刻意留成明顯的缺口而不是無聲的死碼」）。若流程存在，約束會是 10 ns 週期（100 MHz）、0.5 ns 不確定度、top 為 <code>ShuttleTile</code>。<strong>沒有任何 PPA 數字被捏造。</strong></p>
+
+  <div class="callout">
+    <span class="label">A/B 配對必須先被修正</span>
+    <p>任務原本指定的基準 config（<code>GENV256D128ShuttleConfig</code>）<strong>參數並不匹配</strong>：它用的是 <code>genParams</code>，改了 issue 結構與四個佇列深度。可觀察的後果是基準的 <code>LoadOrderBuffer</code> elaborate 出 16 個 entry（2201 個 flop 位元），IME 設計是 8 個（747 位元）——一個 1454 位元的<em>減少</em>，與 IME 毫無關係。因此另外加入了 <code>REFV256D128ShuttleConfig</code> 作為<strong>主要</strong>基準，它與 <code>TitanV256D128ShuttleConfig</code> 逐 fragment 相同，所以兩者之間的每一個差異都只能歸因於 IME 的 RTL 修改。未匹配的 GEN 基準會報出 −653 個暫存器位元，也就是 IME 設計看起來<em>比較便宜</em>——引用它就會得到相反的結論。</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>RTL 結構代理，整體設計：<code>baseline_ref</code> → <code>ime</code>。這不是合成結果</caption>
+      <thead><tr><th>指標</th><th class="n">baseline_ref</th><th class="n">ime</th><th class="n">差</th><th class="n">%</th></tr></thead>
+      <tbody>
+        <tr><td>產生的 .sv/.v 檔數</td><td class="n">668</td><td class="n">670</td><td class="n">+2</td><td class="n">+0.30%</td></tr>
+        <tr><td>產生的 Verilog 總行數</td><td class="n">185,097</td><td class="n">186,236</td><td class="n">+1,139</td><td class="n">+0.61%</td></tr>
+        <tr><td>模組數</td><td class="n">681</td><td class="n">683</td><td class="n">+2</td><td class="n">+0.29%</td></tr>
+        <tr><td><strong>暫存器位元</strong></td><td class="n">415,684</td><td class="n">416,535</td><td class="n">+851</td><td class="n">+0.20%</td></tr>
+        <tr><td>乘法位點（<code>*</code>）</td><td class="n">20</td><td class="n">22</td><td class="n">+2</td><td class="n">+10.00%</td></tr>
+        <tr><td>加法位點（<code>+</code>）</td><td class="n">1,828</td><td class="n">1,859</td><td class="n">+31</td><td class="n">+1.70%</td></tr>
+        <tr><td>SRAM 巨集 / 位元</td><td class="n">8 / 1,533,824</td><td class="n">8 / 1,533,824</td><td class="n">0 / 0</td><td class="n">0%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>階層彙總（含實體化重數）</caption>
+      <thead><tr><th>子樹</th><th>指標</th><th class="n">baseline_ref</th><th class="n">ime</th><th class="n">差</th><th class="n">%</th></tr></thead>
+      <tbody>
+        <tr><td><code>ShuttleTile</code>（預定的合成 top）</td><td>flop 位元</td><td class="n">71,719</td><td class="n">72,570</td><td class="n">+851</td><td class="n">+1.19%</td></tr>
+        <tr><td></td><td>乘法位點</td><td class="n">39</td><td class="n">42</td><td class="n">+3</td><td class="n">+7.69%</td></tr>
+        <tr><td></td><td>加法位點</td><td class="n">2,254</td><td class="n">2,290</td><td class="n">+36</td><td class="n">+1.60%</td></tr>
+        <tr><td><code>SaturnShuttleUnit</code>（向量單元）</td><td>flop 位元</td><td class="n">28,952</td><td class="n">29,803</td><td class="n">+851</td><td class="n">+2.94%</td></tr>
+        <tr><td><code>VectorBackend</code></td><td>flop 位元</td><td class="n">16,368</td><td class="n">17,083</td><td class="n">+715</td><td class="n">+4.37%</td></tr>
+        <tr><td><code>VectorMemUnit</code></td><td>flop 位元</td><td class="n">7,935</td><td class="n">8,071</td><td class="n">+136</td><td class="n">+1.71%</td></tr>
+        <tr><td><code>MatrixMultiplyPipe</code>（新模組）</td><td>flop 位元</td><td class="n dim">不存在</td><td class="n">558</td><td class="n">+558</td><td class="n dim">新增</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="prose">
+    <p>一句話讀法：IME 的修改替 <code>ShuttleTile</code> 增加 851 個暫存器位元（+1.19%），其中 558 位元（66%）就是新的 <code>MatrixMultiplyPipe</code> 本身；全部 851 位元都落在 <code>SaturnShuttleUnit</code> 之內，tile 的非向量邏輯完全沒有被動到；SRAM 巨集與位元數完全不變。三次 elaboration 各 163.7 / 164.6 / 160.0 秒。</p>
+  </div>
+
+  <div class="callout is-warn">
+    <span class="label">這些數字不能告訴你的事</span>
+    <ul class="tight">
+      <li>暫存器位元與 cell 面積不是線性關係；<code>*</code> 的計數是<em>乘法位點</em>，不是乘法器面積——Verilog 裡的一個 <code>*</code> 可以是任何寬度。</li>
+      <li><strong>這裡完全沒有時序或功耗數字</strong>：WNS、Fmax 與 power 是<em>缺席</em>，不是零。</li>
+      <li>未經合成的 RTL 仍含有合成器會刪掉的邏輯，也缺少合成器會找到的共用。把這些差值讀成「設計在哪裡長大了」的上界草圖。</li>
+      <li><code>mult_ops</code> 對這個設計特別弱：IME 的算術成本在於 <code>MatrixMultiplyPipe</code> 跨多週期發出的 MAC 的寬度與次數，而一個位點計數看不見這件事。一個重複使用單一乘法器的迭代式單元在這裡看起來是「免費」的，而它不是。</li>
+      <li><strong>這份代理量的是第二輪（4 條指令）的 RTL diff</strong>（<code>ppa/r13_round2_rtl_only.diff</code>，+844 / −45 行 Chisel），不是最終 8 條指令的設計。第三輪之後尚未重跑。</li>
+    </ul>
+  </div>
+  <p class="note">工具鏈出處：主機 gpuserv4；chipyard <code>1.14.0-19-g4ab72313</code>；saturn <code>dfe75de</code>、rocket-chip <code>70430823f</code>、shuttle <code>622f08b</code>；Chisel 6.7.0 / Scala 2.13 / sbt 1.8.2 / OpenJDK 20.0.2；CIRCT firtool-1.75.0（LLVM 19.0.0git）；Verilator 5.022。</p>
+</section>
+
+<!-- ============ OPEN ITEMS ============ -->
+<section id="open">
+  <div class="sec-head">
+    <span class="label">九 · 未竟事項與證據缺口</span>
+    <h2>沒有做的事，以及沒有被證實的事</h2>
+  </div>
+
+  <h3>功能缺口</h3>
+  <div class="prose">
+    <p>剩下的 7 條全部屬於 Zvvfmm 浮點矩陣族群（含三個 MX 整數輸入形式）。延後是<strong>明文的決定</strong>，理由記在 <code>round3_design.md</code> §2 第 5 點與 <code>constants.py</code> 的註解裡：它對「邊緣 LLM INT8」這個既定目標買不到任何東西，而它需要一整組 FP MAC 陣列、<code>altfmt</code> 格式解碼、<code>frm</code>/<code>fflags</code>、G/psm/rnd 的累加與捨入模型，再加上 MX scale 解碼；而且這些全部落在共用的 int/fp issue 路徑上——正是第一輪與第三輪的 bug 群聚的地方。三個 MX 整數輸入形式（<code>vfwimmacc.vv</code> / <code>vfqimmacc.vv</code> / <code>vf8wimmacc.vv</code>）是「穿著整數 opcode 的浮點累加指令」，因此繼承同一個延後決定。</p>
+  </div>
+
+  <h3>其餘開放項目</h3>
+  <div class="tbl-wrap">
+    <table>
+      <caption>開放項目與其狀態</caption>
+      <thead><tr><th>項目</th><th>狀態</th></tr></thead>
+      <tbody>
+        <tr><td>真實 PPA</td><td class="warn">需要授權的 Cadence Genus、<code>sky130_col</code> collateral、以及承載兩者的容器映像。<code>synth_node.py</code> 不需要修改，它需要的是一個 worker。</td></tr>
+        <tr><td>潛在的 <code>.vf</code> 排程敏感性</td><td class="fail">未解決。已採用的改動被驗證能清乾淨 150/150，但它是邊際移動而非證實的根因；全套 841 支未在該改動下單獨重跑（最終驗證是在合併後的 r15 設計上跑的，837 執行 / 0 失敗）。</td></tr>
+        <tr><td>S2 在迴圈內只跑 150 支等距抽樣</td><td class="warn">每一次迴圈執行皆如此；全套只在迴圈外跑過（<code>a3_verify</code> 839 支、<code>r15_full_verify</code> 837 支）。</td></tr>
+        <tr><td>S2 在 1 寬 retire 的宿主上評分</td><td class="warn">只有兩條指令同週期 commit 才出現的 bug 在這道 gate 之外。S1 仍跑雙發射。原則性修法在 Shuttle 上游。</td></tr>
+        <tr><td>S2 本身是非決定性的</td><td class="fail">同一個設計三次給出 21 / 21 / 23 個失敗，並反覆出現 <code>exit -11</code> 的模擬器死亡。迴圈裡沒有任何機制考慮裁判的不穩定性。</td></tr>
+        <tr><td>映像未以 digest 釘住</td><td class="warn">四個容器映像全部使用可變 tag，沒有任何 <code>sha256</code>。<code>pull_before_run: False</code> 只能緩解意外重拉，不能緩解同 tag 的重建或重貼標籤。</td></tr>
+        <tr><td>沒有針對「零 token、零成本、單回合迭代」的偵測器</td><td class="warn">守衛只看連續失敗次數；一次靜默空轉的迭代本身仍然不會發出任何訊號。</td></tr>
+        <tr><td>header / ABI 漂移只被緩解、未被偵測</td><td class="warn">做法是每次重建 stock Spike，而不是版本檢查；未來的 header 漂移會以無法解釋的 cosim 分歧重新浮現。</td></tr>
+        <tr><td><code>machine_vsetvli-0</code> 是否漏在排除清單外</td><td class="pass">已於 9/17 補入，排除清單現為 4 筆。</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>四筆 S2 排除項，以及為什麼每一筆都有原則</h3>
+  <div class="prose">
+    <p>被排除的是 <code>machine_vfcvt_f_x_v-0</code>、<code>machine_vsetvl-0</code>、<code>machine_vsetivli-0</code>、<code>machine_vsetvli-0</code>。第一筆是真正的既存基準失敗：乾淨的 Saturn 對 stock Spike 本來就有 1 ulp 的差異。後三筆是同一類，而且理由更強——IME v0.9.0 要求一條 IME-legal 的 <code>vsetvli</code> 必須把非零的 λ 寫進 <code>vtype[62:60]</code>，而 stock Spike 不認識這個欄位、永遠回 0，所以<strong>任何符合規格的 IME 實作都不可能讓這些測試在 stock Spike 之下通過</strong>。分歧的特徵是 <code>spike x14 = 0x5</code> 對 <code>DUT x14 = 0x3000000000000005</code>，也就是 λ=0b011，VLEN=256 / SEW=8 之下的最大合法值。</p>
+    <p>原則因此是：<strong>一個正確的實作在這個裁判下不可能通過的測試，要移交給能夠審判它的裁判，而不是刪掉。</strong><code>vtype</code> 的 IME 欄位語意改由 Stage 3 以 IME Spike 模型 lockstep 判定。這個排除也是刻意要防止 agent 用「破壞規格相容性」的方式去修掉症狀——先前一次把 λ 強制為 0 的 agent 改動被丟棄了。</p>
+  </div>
+
+  <h3>證據缺口（不予圓場）</h3>
+  <ul class="tight prose">
+    <li>r8 的 DebugROB 失敗那句 <code>PC mismatch spike 10000 != DUT 10004</code> 的字面字串<strong>沒有保存</strong>；該說法取自程式碼註解，由 841 的計數與 159 秒在結構上佐證。</li>
+    <li>r7 首次執行的根碟已滿沒有留下任何 <code>ENOSPC</code> 字串，確切的 errno 路徑<strong>未證實</strong>。</li>
+    <li>r13 首送的崩潰<strong>沒有任何 traceback 留存</strong>；「Ray session log 檔遺失」只由人工帳本備註佐證。</li>
+    <li>r10 憑證事件的因果鏈（過期的靜態 token 快照 → 改回即時更新的主機目錄）是<strong>推論的</strong>，沒有任何產物直接陳述它。</li>
+    <li><code>rvv_ref.py</code> 那次關鍵修正本身<strong>沒有被快照捕捉到</strong>，只能在兩個時間點之間夾擠。</li>
+    <li>Titan 的測試產生器檔案是否從 agent 的 bash 工具可達，<strong>無法由靜態閱讀排除</strong>。</li>
+    <li>迴圈裡兩個真實的執行時間離群值（一次 842.91 秒的 <code>cosim_run</code>、一次 127.19 秒的 <code>verilator_run_remote</code>）在 trace 中<strong>找不到成因</strong>。</li>
+    <li>Sail 優先於測試的那條 Stage M 規則究竟在哪一次執行加入，<strong>不確定</strong>（沒有中間快照），情況上指向 r7。</li>
+  </ul>
+</section>
+
+<footer class="footnotes">
+  <ol>
+    <li><code>tools.py.bak-r13</code> 是最早含有 <code>run_rvv*</code> 的快照，但 trace 在 <code>r10_0912_0302</code> 與 <code>r11_0912_0535</code> 就已經有 <code>agent_rvv</code> 事件，所以該能力在 r10 就已上線；此處採信 trace，<code>.bak</code> 標籤落後於實際導入時間。</li>
+    <li>凡 <code>report_data.md</code> 與 <code>ledger.md</code> 不一致之處一律採信 <code>ledger.md</code>，因為它較新並且涵蓋 r14 與 r15。<code>report_data.md</code> 的頭條數字（16 個執行目錄、41 小時 07 分、$751.13、15 條中交付 4 條）是第二輪結束時的狀態，已被本報告採用的 17 列帳本（46 小時 11 分、$837.13、15 條中交付 8 條）取代；它自己也在文件開頭聲明「關於 r14 與第三輪的一切均不在其涵蓋範圍內」。唯一的例外是 r9 那一列：帳本的備註說 agent 盲改了三輪，而三類獨立產物（15 位元組的逐字稿、位元相同的 diff、50 毫秒退出的 CLI）一致顯示 agent 從未執行；此處採信產物，並已在 §6.8 標明。另有一次執行 <code>r10_0912_0254</code> 有 <code>ledger_notes.json</code> 條目卻沒有 <code>ledger.md</code> 列，是已知的帳本缺口。</li>
+    <li>輸出 token 的合計為 6,636,804（前 13 次執行，經獨立重新解析）加上 r14 的 452,076 與 r15 的 43,978。wall clock、成本與 LLM 次數三欄直接取自 <code>ledger.md</code> 的頁尾與逐列加總，均可對上。</li>
+  </ol>
+</footer>
+
+</div>

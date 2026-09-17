@@ -1,0 +1,231 @@
+# =============================================================================
+# Titan cluster descriptor — TEMPLATE
+#
+# Copy to `cluster.yaml` (git-ignored) and substitute every placeholder below.
+# This file is a plain template: `chia up` does NOT expand environment
+# variables inside YAML keys on this branch, so the placeholders must be
+# edited by hand — do not write `${VAR}` in their place.
+#
+#   <HEAD_IP>      the Ray head node's IP, e.g. 10.0.0.12.  Appears in
+#                  `provider.head_ip` and in every node type's
+#                  `compatible_ips`.  All Titan nodes are colocated on one
+#                  host in this deployment; a multi-host cluster needs the
+#                  other hosts added to the matching `compatible_ips`.
+#   <SHARED_ROOT>  an absolute path, identical on the host and inside every
+#                  container, on a filesystem with tens of GB free.  It holds
+#                  `<SHARED_ROOT>/titan_scratch` (build trees, sim work,
+#                  node TMPDIR), `<SHARED_ROOT>/titan_ray` (head Ray temp dir)
+#                  and `<SHARED_ROOT>/titan_ray_ct` (container Ray temp dir —
+#                  a SEPARATE directory bind-mounted at the same path; see
+#                  the uid note in the header comment below).  Keep it short:
+#                  Ray's plasma socket is an AF_UNIX path capped at 107 bytes.
+#   <HOME>         the head user's home directory, if any path below needs it.
+#
+# Also review, but leave as shell variables (these ARE expanded, because they
+# sit inside docker run command lines, not YAML keys):
+#   ${USER}, ${HOME}, ${SSH_AUTH_SOCK}
+#
+# Other things you will almost certainly have to change:
+#   * Ports 6380 / 8266 / 20001 and the 9000–9199 tool-server range are chosen
+#     to coexist with a second Ray cluster on the same host.  On a dedicated
+#     host the stock 6379 / 8265 are fine.
+#   * `num_cpus` / `CHIA_NUM_CPUS` per node type sum to 96 threads here.
+#     Rescale to your host (see the CPU quota comment below).
+#   * The `build` node uses a locally-built image `chia-chisel-build-aether-
+#     cosim:local`; substitute your own Chisel+Verilator+Spike build image.
+#   * The `vlsi` node is disabled (`num_workers: 0`) and its image is unset —
+#     no synthesis tool or PDK exists in this deployment.  See
+#     `docs/ppa_method.md`.
+#   * The `llm` node bind-mounts `${HOME}/.claude` so the Claude Code CLI
+#     inside the container sees the host's credentials.  Point this at
+#     whatever credential directory your own setup uses.
+# =============================================================================
+
+# Titan — RISC-V IME (Zvvm) matrix-extension loop for the Saturn vector unit.
+# 獨立叢集（2026-09-07 起與 AETHER 分開），全部節點都在 GPU-Server4（gpuserv4，<HEAD_IP>）。
+#
+# 與 AETHER 叢集（aether/cluster/aether-local.yaml，head 6379 / dashboard 8265）共存的規則：
+#   * head 用 6380 / dashboard 8266 / client 20001，容器名 titan-*。
+#   * head_start_ray_commands 不放 `ray stop` —— 那是 host-global，會把 AETHER 的 head 一起殺掉。
+#     bare worker 的 `ray stop` chia 會因為同 IP 自動略過；docker worker 有自己的 PID namespace，安全。
+#   * head --temp-dir=<SHARED_ROOT>/titan_ray（worker 會從 GCS 繼承同一路徑，所以必須是容器內也存在可寫的路徑，
+#     ~/ 不行）。r7 起改到 /share1（root fs 877G 已滿），同一絕對路徑 bind-mount 進每個 worker 容器。
+#     容器的 ray temp 掛的是 titan_ray_ct（不是 titan_ray）：路徑必須同名，但目錄不能共用 ——
+#     head 是 uid 1002，build/cosim/riscv 容器是 uid 1000(ray)，共用時 head 先建的
+#     session_*/logs/events (0755) 會讓容器內的 core worker 開檔失敗而 crash。
+#     llm 容器跑 --user $(id -u)，uid 與 head 相同，所以跟 head 共用 titan_ray。
+#     這個路徑刻意短：Ray 的 plasma socket 是 AF_UNIX，全長不能超過 107 bytes，
+#     titan_scratch/ray_tmp/ 會超過（titan_scratch/ray_tmp 是指向它的 symlink，方便查找）。
+#     ray_current_cluster 因此寫在 titan_ray/，/tmp/ray/ray_current_cluster 仍指向 AETHER，
+#     AETHER 的 ray.init(address="auto") 不受影響。
+#     Titan 這邊一律明確指定 RAY_ADDRESS=<HEAD_IP>:6380（job submit 用 http://<HEAD_IP>:8266）。
+#   * tool server 從 9000 起掃埠，避開 AETHER 的 8000 段。
+#
+# CPU 配額：主機 96 執行緒（2×24 核 SMT）。10 個節點若不指定 --num-cpus 各報 96、合計 960，配額形同虛設。
+#   head 2 + head_local 2 + database 1 + llm 8 + chipyard 16 + verilator_run 4×16 + riscv_build 3 = 96
+#   verilator 16/節點 = 2 支 8-thread sim（nodes.py num_cpus=VERILATOR_THREADS=8）。
+#   AETHER 叢集另有自己的 96；兩邊同時滿載時主機是 time-share，真正上限仍是 96。
+cluster_name: titan
+
+available_node_types:
+    head_local:
+        resources: {"head_local": 8}
+        num_workers: 1
+        compatible_ips: ["<HEAD_IP>"]
+        worker_env_commands:
+            - "source /usr/local/anaconda3/etc/profile.d/conda.sh && conda activate chia_env"
+            - "export CHIA_NUM_CPUS=2 CHIA_TOOL_BASE_PORT=9000 CHIA_TOOL_MAX_PORT=9199"
+            - "export TMPDIR=<SHARED_ROOT>/titan_scratch/node_tmp"
+
+    database:
+        resources: {"database": 2}
+        num_workers: 1
+        compatible_ips: ["<HEAD_IP>"]
+        worker_env_commands:
+            - "source /usr/local/anaconda3/etc/profile.d/conda.sh && conda activate chia_env"
+            - "export CHIA_NUM_CPUS=1 CHIA_TOOL_BASE_PORT=9000 CHIA_TOOL_MAX_PORT=9199"
+            - "export TMPDIR=<SHARED_ROOT>/titan_scratch/node_tmp"
+
+    # 兩個 agent（RTL、Spike 模型）從不同時在同一個 session；tool server actor 也落在這裡，各吃 1 CPU。
+    llm:
+        resources: {"llm": 4}
+        num_workers: 1
+        compatible_ips: ["<HEAD_IP>"]
+        worker_env_commands:
+            - "export CHIA_NUM_CPUS=8 CHIA_TOOL_BASE_PORT=9000 CHIA_TOOL_MAX_PORT=9199"
+            - "export TMPDIR=<SHARED_ROOT>/titan_scratch/node_tmp"
+            # claude CLI 預設 120s 就把還沒回來的 MCP call 丟到背景並把控制權還給
+            # model；-p 模式下 model 沒事做就結束 turn，job 還在跑、tree 還是壞的
+            # （r8 iter3 就是這樣被打成 27 mismatch）。0 = 完全不背景化，
+            # 1800000 = 30 分鐘（CLI 內部上限 2^31-1 ms）。
+            # 只在 cluster 重啟後生效；不重啟的那條路在 llm.py LLM_TASK_OPTS。
+            - "export CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=1800000"
+        docker:
+            image: "ghcr.io/ucb-bar/chia-claude-code:latest"
+            container_name: "titan-claude-code-${USER}"
+            pull_before_run: False
+            run_options:
+                - --ulimit nofile=65536:65536
+                - "-v <SHARED_ROOT>/titan_scratch:<SHARED_ROOT>/titan_scratch"
+                - "-v <SHARED_ROOT>/titan_ray:<SHARED_ROOT>/titan_ray"
+                - --shm-size=10.24gb
+                - "--user $(id -u):$(id -g)"
+                - "-v ${HOME}/.claude:/home/ray/.claude"
+                - --log-opt max-size=50m
+                - --log-opt max-file=2
+            run_setup_commands:
+                - echo "user:x:$(id -u):$(id -g)::/home/ray:/bin/bash" >> /etc/passwd
+                - mkdir -p /home/ray/llm_env
+
+    # Chisel elaborate + Verilator build + Spike build（SpikeBuildNode 也在這裡，見 nodes.py）。
+    # image 用 preflight 12/12 實際通過的那份（AETHER 衍生的本地 image），不用 ghcr 原版。
+    build:
+        resources: {"chipyard": 1}
+        num_workers: 1
+        compatible_ips: ["<HEAD_IP>"]
+        worker_env_commands:
+            - "cd /home/ray/chipyard && source env.sh"
+            - "export CHIA_NUM_CPUS=16 CHIA_TOOL_BASE_PORT=9000 CHIA_TOOL_MAX_PORT=9199"
+            - "export TMPDIR=<SHARED_ROOT>/titan_scratch/node_tmp"
+        docker:
+            image: "chia-chisel-build-aether-cosim:local"
+            container_name: "titan-chisel-build-${USER}"
+            pull_before_run: False
+            run_options:
+                - --ulimit nofile=65536:65536
+                - "-v <SHARED_ROOT>/titan_scratch:<SHARED_ROOT>/titan_scratch"
+                - "-v <SHARED_ROOT>/titan_ray_ct:<SHARED_ROOT>/titan_ray"
+                - --shm-size=10.24gb
+                - -v ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent
+                - "-v <SHARED_ROOT>/titan_scratch/chipyard:/home/ray/chipyard"
+                - --log-opt max-size=50m
+                - --log-opt max-file=2
+
+    # Verilator DUT sims + lockstep cospike。
+    cosim:
+        resources: {"verilator_run": 4}
+        num_workers: 4
+        compatible_ips: ["<HEAD_IP>"]
+        worker_env_commands:
+            - "export CHIA_NUM_CPUS=16 CHIA_TOOL_BASE_PORT=9000 CHIA_TOOL_MAX_PORT=9199"
+            - "export TMPDIR=<SHARED_ROOT>/titan_scratch/node_tmp"
+        docker:
+            image: "ghcr.io/ucb-bar/chia-verilator-run:latest"
+            container_name: "titan-verilator-run-${USER}"
+            pull_before_run: False
+            run_options:
+                - --ulimit nofile=65536:65536
+                - "-v <SHARED_ROOT>/titan_scratch:<SHARED_ROOT>/titan_scratch"
+                - "-v <SHARED_ROOT>/titan_ray_ct:<SHARED_ROOT>/titan_ray"
+                - --shm-size=10.24gb
+                - --log-opt max-size=50m
+                - --log-opt max-file=2
+
+    # 不放 gen 節點：riscv-dv 產不出向量指令，Stage 3 的隨機程式由 head 上的 ime_stress.py 產生。
+
+    riscv_build:
+        resources: {"riscv_build": 4}
+        num_workers: 1
+        compatible_ips: ["<HEAD_IP>"]
+        worker_env_commands:
+            - "export CHIA_NUM_CPUS=3 CHIA_TOOL_BASE_PORT=9000 CHIA_TOOL_MAX_PORT=9199"
+            - "export TMPDIR=<SHARED_ROOT>/titan_scratch/node_tmp"
+        docker:
+            image: "ghcr.io/ucb-bar/chia-riscv-cross:latest"
+            container_name: "titan-riscv-cross-${USER}"
+            pull_before_run: False
+            run_options:
+                - --ulimit nofile=65536:65536
+                - "-v <SHARED_ROOT>/titan_scratch:<SHARED_ROOT>/titan_scratch"
+                - "-v <SHARED_ROOT>/titan_ray_ct:<SHARED_ROOT>/titan_ray"
+                - --log-opt max-size=50m
+                - --log-opt max-file=2
+
+    # Synthesis (PPA)：Genus + sky130 image 還沒有，num_workers:0 = 關閉（synth_node.py 尚未接進 loop）。
+    vlsi:
+        resources: {"VLSI": 4, "Syn": 1, "cacti": 4}
+        num_workers: 0
+        docker:
+            image:  # FILL — genus + hammer + cacti + sky130 PDK image
+            container_name: "titan-genus-${USER}"
+            pull_before_run: False
+            run_options:
+                - --ulimit nofile=65536:65536
+                - "-v <SHARED_ROOT>/titan_scratch:<SHARED_ROOT>/titan_scratch"
+                - "-v <SHARED_ROOT>/titan_ray_ct:<SHARED_ROOT>/titan_ray"
+                - --log-opt max-size=50m
+                - --log-opt max-file=2
+        compatible_ips: ["<HEAD_IP>"]
+
+provider:
+    type: local
+    head_ip: <HEAD_IP>
+
+auth:
+    ssh_user: ${USER}
+
+file_mounts: {}
+
+rsync_exclude:
+    - "**/.git"
+    - "**/.git/**"
+
+rsync_filter:
+    - ".gitignore"
+
+initialization_commands: []
+
+setup_commands: []
+
+head_env_commands:
+    - "source /usr/local/anaconda3/etc/profile.d/conda.sh && conda activate chia_env"
+    - "export CHIA_TOOL_BASE_PORT=9000 CHIA_TOOL_MAX_PORT=9199"
+    - "export TMPDIR=<SHARED_ROOT>/titan_scratch/node_tmp"
+
+# 注意：沒有 `ray stop`（見檔頭）。
+head_start_ray_commands:
+    - ulimit -c unlimited && ray start --head --port=6380 --dashboard-port=8266 --ray-client-server-port=20001 --temp-dir=<SHARED_ROOT>/titan_ray --num-cpus=2 --include-dashboard=True --dashboard-agent-listen-port=0
+
+worker_start_ray_commands:
+    - ray stop
+    - ray start --address=$RAY_HEAD_IP:6380 --num-cpus=${CHIA_NUM_CPUS:-8} --dashboard-agent-listen-port=0

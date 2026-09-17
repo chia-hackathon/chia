@@ -1,0 +1,74 @@
+{
+ "diff_source": "/share1/saves/max410011/hackathon/titan_runs/r15_rtl_fixed.diff",
+ "diff_lines": 3077,
+ "phase": "done",
+ "sample": 0,
+ "baseline": {
+  "path": "/share1/saves/max410011/hackathon/chia/examples/titan/rvv_baseline_failures.json",
+  "subtracted": [
+   "machine_vfcvt_f_x_v-0",
+   "machine_vsetivli-0",
+   "machine_vsetvl-0",
+   "machine_vsetvli-0"
+  ],
+  "n": 4
+ },
+ "stock_spike_digest": "6d78935237dd6593",
+ "applied_files": [
+  "generators/saturn/chipyard/SaturnConfigs.scala",
+  "generators/saturn/src/main/scala/backend/ExecuteSequencer.scala",
+  "generators/saturn/src/main/scala/common/Bundles.scala",
+  "generators/saturn/src/main/scala/common/Parameters.scala",
+  "generators/saturn/src/main/scala/exu/int/MatrixMultiplyPipe.scala",
+  "generators/saturn/src/main/scala/frontend/Dispatch.scala",
+  "generators/saturn/src/main/scala/frontend/EarlyDecode.scala",
+  "generators/saturn/src/main/scala/frontend/PipelinedFaultCheck.scala",
+  "generators/saturn/src/main/scala/insns/MatrixInstructions.scala",
+  "generators/saturn/src/main/scala/mem/AddrGen.scala",
+  "generators/saturn/src/main/scala/mem/LoadOrderBuffer.scala",
+  "generators/saturn/src/main/scala/mem/Mem.scala",
+  "generators/rocket-chip/src/main/scala/rocket/CSR.scala",
+  "generators/rocket-chip/src/main/scala/rocket/RocketCore.scala",
+  "generators/shuttle/src/main/scala/exu/Core.scala",
+  "toolchains/riscv-tools/riscv-isa-sim/Makefile.in",
+  "toolchains/riscv-tools/riscv-isa-sim/disasm/isa_parser.cc",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/encoding.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/v8wmmacc_vv.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vf8wimmacc_vv.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vfqimmacc_vv.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vfwimmacc_vv.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmmacc_vv.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmtl_v.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmts_v.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmttl_v.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vmtts_v.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vqmmacc_vv.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vsetvl.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/insns/vwmmacc_vv.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/isa_parser.h",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/riscv.mk.in",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.cc",
+  "toolchains/riscv-tools/riscv-isa-sim/riscv/vector_unit.h"
+ ],
+ "directed": {
+  "build_ok": true,
+  "build_seconds": 178.9,
+  "n_tests": 80,
+  "counts": {
+   "pass": 80
+  },
+  "failing": []
+ },
+ "cosim_build_seconds": 135.5,
+ "s2_full": {
+  "build_ok": true,
+  "build_seconds": 135.5,
+  "seconds": 4319.7,
+  "n_ran": 837,
+  "n_failing": 0,
+  "failing": [],
+  "reasons": {}
+ },
+ "final_reset_ok": true,
+ "total_seconds": 4677.9
+}

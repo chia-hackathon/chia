@@ -1,0 +1,1206 @@
+{
+  "spec": "Zvvm Family of Integrated Matrix Extensions",
+  "version": "0.9.0",
+  "commit": "5a2d0f65",
+  "source": "integrated-matrix-v0.9.0.adoc",
+  "instructions": {
+    "v8wmmacc.vv": {
+      "synopsis": "Integer 8× Widening Matrix Multiply-Accumulate",
+      "mnemonic": "v8wmmacc.vv vd, vs1, vs2",
+      "extensions": [
+        "Zvvmm"
+      ],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "OPIVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "vm=1"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 59,
+          "attr": "v8wmmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPIVV": 0,
+        "vm=1": 1,
+        "v8wmmacc.vv": 59
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2"
+      ]
+    },
+    "vf8wmmacc.vv": {
+      "synopsis": "Floating-Point 8× Widening Matrix Multiply-Accumulate",
+      "mnemonic": "vf8wmmacc.vv vd, vs1, vs2 +",
+      "extensions": [],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "OPFVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "field",
+          "name": "vm",
+          "value": null,
+          "attr": "1=unscaled, 0=MX"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 23,
+          "attr": "vf8wmmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPFVV": 1,
+        "vf8wmmacc.vv": 23
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2",
+        "vm"
+      ]
+    },
+    "vfmmacc.vv": {
+      "synopsis": "Floating-Point Matrix Multiply-Accumulate",
+      "mnemonic": "vfmmacc.vv vd, vs1, vs2",
+      "extensions": [],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "OPFVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": null
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 20,
+          "attr": "vfmmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPFVV": 1,
+        "bits[25:25]": 1,
+        "vfmmacc.vv": 20
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2"
+      ]
+    },
+    "vfqmmacc.vv": {
+      "synopsis": "Floating-Point Quad-Widening Matrix Multiply-Accumulate",
+      "mnemonic": "vfqmmacc.vv vd, vs1, vs2 +",
+      "extensions": [],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "OPFVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "field",
+          "name": "vm",
+          "value": null,
+          "attr": "1=unscaled, 0=MX"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 22,
+          "attr": "vfqmmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPFVV": 1,
+        "vfqmmacc.vv": 22
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2",
+        "vm"
+      ]
+    },
+    "vfwmmacc.vv": {
+      "synopsis": "Floating-Point Widening Matrix Multiply-Accumulate",
+      "mnemonic": "vfwmmacc.vv vd, vs1, vs2 +",
+      "extensions": [],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "OPFVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "field",
+          "name": "vm",
+          "value": null,
+          "attr": "1=unscaled, 0=MX"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 21,
+          "attr": "vfwmmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPFVV": 1,
+        "vfwmmacc.vv": 21
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2",
+        "vm"
+      ]
+    },
+    "vfwimmacc.vv": {
+      "synopsis": "Integer-Input Widening Floating-Point-Accumulate Matrix Multiply-Accumulate with Microscaling",
+      "mnemonic": "vfwimmacc.vv vd, vs1, vs2, v0.scale",
+      "extensions": [],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "OPIVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "vm=0"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 57,
+          "attr": "vfwimmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPIVV": 0,
+        "vm=0": 0,
+        "vfwimmacc.vv": 57
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2"
+      ]
+    },
+    "vf8wimmacc.vv": {
+      "synopsis": "Integer-Input 8× Widening Floating-Point-Accumulate Matrix Multiply-Accumulate with Microscaling",
+      "mnemonic": "vf8wimmacc.vv vd, vs1, vs2, v0.scale",
+      "extensions": [],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "OPIVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "vm=0"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 59,
+          "attr": "vf8wimmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPIVV": 0,
+        "vm=0": 0,
+        "vf8wimmacc.vv": 59
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2"
+      ]
+    },
+    "vfqimmacc.vv": {
+      "synopsis": "Integer-Input Quad-Widening Floating-Point-Accumulate Matrix Multiply-Accumulate with Microscaling",
+      "mnemonic": "vfqimmacc.vv vd, vs1, vs2, v0.scale",
+      "extensions": [],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "OPIVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "vm=0"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 58,
+          "attr": "vfqimmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPIVV": 0,
+        "vm=0": 0,
+        "vfqimmacc.vv": 58
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2"
+      ]
+    },
+    "vmmacc.vv": {
+      "synopsis": "Integer Matrix Multiply-Accumulate",
+      "mnemonic": "vmmacc.vv vd, vs1, vs2",
+      "extensions": [
+        "Zvvmm"
+      ],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "OPIVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "vm=1"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 56,
+          "attr": "vmmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPIVV": 0,
+        "vm=1": 1,
+        "vmmacc.vv": 56
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2"
+      ]
+    },
+    "vmtl.v": {
+      "synopsis": "Order-Preserving Matrix Tile Load",
+      "mnemonic": "vmtl.v vd, (rs1), rs2 [, L`LAMBDA`] [, vm]",
+      "extensions": [
+        "Zvvmtls"
+      ],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 7,
+          "attr": "Vector tile (2D) load"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": "destination of load"
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 7,
+          "attr": null
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "rs1",
+          "value": null,
+          "attr": "base address"
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "rs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "field",
+          "name": "vm",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 26,
+          "width": 2,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "order preserving"
+        },
+        {
+          "lsb": 28,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": null
+        },
+        {
+          "lsb": 29,
+          "width": 3,
+          "kind": "field",
+          "name": "lambda",
+          "value": null,
+          "attr": null
+        }
+      ],
+      "constants": {
+        "Vector tile (2D) load": 7,
+        "bits[12:14]": 7,
+        "order preserving": 0,
+        "bits[28:28]": 1
+      },
+      "operands": [
+        "vd",
+        "rs1",
+        "rs2",
+        "vm",
+        "lambda"
+      ]
+    },
+    "vmts.v": {
+      "synopsis": "Order-Preserving Matrix Tile Store",
+      "mnemonic": "vmts.v vs3, (rs1), rs2 [, LLAMBDA] [, vm]",
+      "extensions": [
+        "Zvvmtls"
+      ],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 39,
+          "attr": "Vector tile (2D) store"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vs3",
+          "value": null,
+          "attr": "source of store"
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 7,
+          "attr": null
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "rs1",
+          "value": null,
+          "attr": "base address"
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "rs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "field",
+          "name": "vm",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 26,
+          "width": 2,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "order preserving"
+        },
+        {
+          "lsb": 28,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": null
+        },
+        {
+          "lsb": 29,
+          "width": 3,
+          "kind": "field",
+          "name": "lambda",
+          "value": null,
+          "attr": null
+        }
+      ],
+      "constants": {
+        "Vector tile (2D) store": 39,
+        "bits[12:14]": 7,
+        "order preserving": 0,
+        "bits[28:28]": 1
+      },
+      "operands": [
+        "vs3",
+        "rs1",
+        "rs2",
+        "vm",
+        "lambda"
+      ]
+    },
+    "vmttl.v": {
+      "synopsis": "Transposing Matrix Tile Load",
+      "mnemonic": "vmttl.v vd, (rs1), rs2 [, LLAMBDA] [, vm]",
+      "extensions": [
+        "Zvvmttls"
+      ],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 7,
+          "attr": "Vector tile (2D) load"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": "destination of load"
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 7,
+          "attr": null
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "rs1",
+          "value": null,
+          "attr": "base address"
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "rs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "field",
+          "name": "vm",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 26,
+          "width": 2,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "transposing"
+        },
+        {
+          "lsb": 28,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": null
+        },
+        {
+          "lsb": 29,
+          "width": 3,
+          "kind": "field",
+          "name": "lambda",
+          "value": null,
+          "attr": null
+        }
+      ],
+      "constants": {
+        "Vector tile (2D) load": 7,
+        "bits[12:14]": 7,
+        "transposing": 1,
+        "bits[28:28]": 1
+      },
+      "operands": [
+        "vd",
+        "rs1",
+        "rs2",
+        "vm",
+        "lambda"
+      ]
+    },
+    "vmtts.v": {
+      "synopsis": "Transposing Matrix Tile Store",
+      "mnemonic": "vmtts.v vs3, (rs1), rs2 [, LLAMBDA] [, vm]",
+      "extensions": [
+        "Zvvmttls"
+      ],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 39,
+          "attr": "Vector tile (2D) store"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vs3",
+          "value": null,
+          "attr": "source of store"
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 7,
+          "attr": null
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "rs1",
+          "value": null,
+          "attr": "base address"
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "rs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "field",
+          "name": "vm",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 26,
+          "width": 2,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "transposing"
+        },
+        {
+          "lsb": 28,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": null
+        },
+        {
+          "lsb": 29,
+          "width": 3,
+          "kind": "field",
+          "name": "lambda",
+          "value": null,
+          "attr": null
+        }
+      ],
+      "constants": {
+        "Vector tile (2D) store": 39,
+        "bits[12:14]": 7,
+        "transposing": 1,
+        "bits[28:28]": 1
+      },
+      "operands": [
+        "vs3",
+        "rs1",
+        "rs2",
+        "vm",
+        "lambda"
+      ]
+    },
+    "vqmmacc.vv": {
+      "synopsis": "Integer Quad-Widening Matrix Multiply-Accumulate",
+      "mnemonic": "vqmmacc.vv vd, vs1, vs2",
+      "extensions": [
+        "Zvvmm"
+      ],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "OPIVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "vm=1"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 58,
+          "attr": "vqmmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPIVV": 0,
+        "vm=1": 1,
+        "vqmmacc.vv": 58
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2"
+      ]
+    },
+    "vwmmacc.vv": {
+      "synopsis": "Integer Widening Matrix Multiply-Accumulate",
+      "mnemonic": "vwmmacc.vv vd, vs1, vs2",
+      "extensions": [
+        "Zvvmm"
+      ],
+      "fields": [
+        {
+          "lsb": 0,
+          "width": 7,
+          "kind": "const",
+          "name": null,
+          "value": 87,
+          "attr": "OP-V"
+        },
+        {
+          "lsb": 7,
+          "width": 5,
+          "kind": "field",
+          "name": "vd",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 12,
+          "width": 3,
+          "kind": "const",
+          "name": null,
+          "value": 0,
+          "attr": "OPIVV"
+        },
+        {
+          "lsb": 15,
+          "width": 5,
+          "kind": "field",
+          "name": "vs1",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 20,
+          "width": 5,
+          "kind": "field",
+          "name": "vs2",
+          "value": null,
+          "attr": null
+        },
+        {
+          "lsb": 25,
+          "width": 1,
+          "kind": "const",
+          "name": null,
+          "value": 1,
+          "attr": "vm=1"
+        },
+        {
+          "lsb": 26,
+          "width": 6,
+          "kind": "const",
+          "name": null,
+          "value": 57,
+          "attr": "vwmmacc.vv"
+        }
+      ],
+      "constants": {
+        "OP-V": 87,
+        "OPIVV": 0,
+        "vm=1": 1,
+        "vwmmacc.vv": 57
+      },
+      "operands": [
+        "vd",
+        "vs1",
+        "vs2"
+      ]
+    }
+  }
+}
