@@ -8,13 +8,25 @@
 # 自訂 kernel 會消失，llama-q8-gemm 就會 build 失敗。跑這支補回去。
 #
 # 用法：bash cluster/install-gemmini-kernels.sh [container_name]
+#   env: AETHER_GEMMINI_SRC (source tree), AETHER_BUILD_CONTAINER (container name)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 AETHER_DIR="$(dirname -- "$SCRIPT_DIR")"
-SRC="$AETHER_DIR/repos/gemmini/software/gemmini-rocc-tests"
-CONTAINER="${1:-aether-chisel-build-${USER}-0}"
+# Where the project's own Gemmini kernel sources live. In the original working
+# tree that was a full gemmini checkout under repos/; in this published snapshot
+# the same files are kept flat under kernels/ (bareMetalC/ + include/). Prefer
+# the checkout when present, fall back to kernels/, and let AETHER_GEMMINI_SRC
+# override both.
+if [ -n "${AETHER_GEMMINI_SRC:-}" ]; then
+    SRC="$AETHER_GEMMINI_SRC"
+elif [ -d "$AETHER_DIR/repos/gemmini/software/gemmini-rocc-tests" ]; then
+    SRC="$AETHER_DIR/repos/gemmini/software/gemmini-rocc-tests"
+else
+    SRC="$AETHER_DIR/kernels"
+fi
+CONTAINER="${1:-${AETHER_BUILD_CONTAINER:-aether-chisel-build-${USER}-0}}"
 DST="/home/ray/chipyard/generators/gemmini/software/gemmini-rocc-tests"
 
 # 每支 kernel 兩個檔：sealed harness（main + golden model + self-check）與
@@ -57,6 +69,10 @@ FILES=(
 # docker cp 在這台機器上會踩到 chisel-build container 的 /ssh-agent bind-mount
 # （docker cp 會 pause/重掛容器，而那個 mount source 是 socket 不是目錄），
 # 所以用 exec + stdin 重導向，不要用 docker cp。
+for rel in "${FILES[@]}"; do
+    [ -f "$SRC/$rel" ] || { echo "[install] missing source file: $SRC/$rel" >&2; exit 1; }
+done
+
 for rel in "${FILES[@]}"; do
     echo "[install] $rel -> $CONTAINER:$DST/$rel"
     docker exec -i "$CONTAINER" bash -c "cat > $DST/$rel" < "$SRC/$rel"

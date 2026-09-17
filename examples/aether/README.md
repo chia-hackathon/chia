@@ -12,9 +12,15 @@ This directory is a curated, read-only snapshot of the research artifacts
 from that loop (code, cluster/config, kernel sources, and results data),
 packaged for reference alongside a paper submission. It is **not** a
 push-button reproduction of the original multi-day run — see
-[Known limitations](#known-limitations) and
+[`requirements.md`](requirements.md) (packages, images, RTL commits, and the
+explicit list of what an outside user must supply themselves),
+[Known limitations](#known-limitations), and
 [How to reproduce](#how-to-reproduce) below for exactly what is and isn't
 included.
+
+> **Precondition:** the loop assumes **a CHIA cluster is already up and
+> running**. `cluster/up.sh` starts it as a separate, prior step; `loop.py`
+> itself only connects to it.
 
 ## What this loop does
 
@@ -80,15 +86,29 @@ describes the intended flow against those checkouts; treat paths and
 container names as what the original run used, not as verified against a
 fresh clone.
 
+0. **Install and configure.** `pip install -e .` from the repository root
+   (this example imports the `chia` package), then export the environment
+   variables `cluster/cluster.yaml` is written against — full table in
+   [`requirements.md`](requirements.md):
+   ```bash
+   export AETHER_HEAD_IP=$(hostname -I | awk '{print $1}')
+   export AETHER_RAY_TMPDIR=/large/disk/aether_ray   # keep it short: AF_UNIX 107B cap
+   export AETHER_WORKDIR=$PWD/out
+   export RAY_ADDRESS="$AETHER_HEAD_IP:6379"         # only if >1 Ray cluster on the host
+   ```
 1. **Cluster bring-up.** `cluster/up.sh [yaml]` activates the `chia_env`
    conda environment, ensures an `ssh-agent` with a forwardable key (needed
    for the chisel-build container's `git@github.com:ucb-bar/chipyard.git`
-   access), and runs `chia up -y <yaml>`, logging to `out/chia-up-<ts>.log`.
-   It defaults to `cluster/aether-local.yaml`; in this package the same file
-   is named `cluster/cluster.yaml`, so invoke it explicitly:
+   access), creates the host-side bind-mount dirs, and runs
+   `chia up -y <yaml>`, logging to `out/chia-up-<ts>.log`. It defaults to
+   `cluster/cluster.yaml`, so no argument is needed:
    ```bash
-   bash cluster/up.sh cluster/cluster.yaml
+   bash cluster/up.sh
    ```
+   It exits non-zero with a list of names if any required `AETHER_*` variable
+   is unset — chia substitutes `${VAR}` in the YAML and passes an *unset* one
+   through literally, which would otherwise produce containers with
+   `"${...}"` paths.
 2. **Install the project's own Gemmini kernels into the chisel-build
    container.** `loop/nodes.py`'s Gemmini collateral is read from inside the
    `chisel-build` container's chipyard tree, which is *not* bind-mounted to
@@ -97,10 +117,12 @@ fresh clone.
    bash cluster/install-gemmini-kernels.sh [container_name]
    ```
    after every `chia up`, or Gemmini kernel builds fail with a missing
-   header. In this package the kernel files it installs live under
-   `kernels/include/` and `kernels/bareMetalC/` (see below) rather than a
-   full `repos/gemmini` checkout — adjust the script's `SRC` path to point
-   at wherever your own `gemmini-rocc-tests` checkout lives.
+   header. In this package the 16 kernel files it installs live under
+   `kernels/bareMetalC/` and `kernels/include/` rather than in a full
+   `repos/gemmini` checkout, and the script picks that up automatically (it
+   prefers `repos/gemmini/software/gemmini-rocc-tests` when present, falls
+   back to `kernels/`, and honours `AETHER_GEMMINI_SRC`). It verifies every
+   file exists before copying anything.
 3. **Run the loop.** `loop/loop.py`'s actual flags (from its `argparse`
    definition):
    ```bash
@@ -117,7 +139,8 @@ fresh clone.
    | `--seed RUN_ID\|best` (alias `--seed-run RUN_ID`) | start editing from a previously-optimized kernel instead of the pristine one; iteration 0 stays the pristine baseline so speedups remain comparable |
 4. **Track results.** `loop/ledger.py` joins `out/loop/rounds.json` (which
    `run_id`s belong to which named round — hand-maintained) against
-   `loop/aether.db`'s `runs`/`iters` tables and `loop/kernels.py`'s
+   the SQLite DB at `$AETHER_DB` (the published copy is
+   `results/loop/aether.db`)'s `runs`/`iters` tables and `loop/kernels.py`'s
    `roofline_cycles`, and writes `out/loop/ledger.md` / `ledger.json` — the
    authoritative per-round cost/iteration/result ledger (`results/loop/`
    here). `loop/journal.py` does the same at per-*iteration* granularity

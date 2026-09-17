@@ -3,7 +3,7 @@
 # log 導到 out/chia-up-<timestamp>.log。
 #
 # 用法：
-#   bash cluster/up.sh
+#   bash cluster/up.sh [yaml]   # default yaml: cluster/cluster.yaml
 #
 # 背景：build node 的 docker run_options 用 -v ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent
 # 把 ssh-agent socket 掛進 chisel-build container 給 git@github.com:ucb-bar/chipyard.git
@@ -17,7 +17,29 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 AETHER_DIR="$(dirname -- "$SCRIPT_DIR")"
-YAML="${1:-$AETHER_DIR/cluster/aether-local.yaml}"
+YAML="${1:-$AETHER_DIR/cluster/cluster.yaml}"
+
+# --- required env vars -----------------------------------------------------
+# cluster.yaml is written against chia's ${VAR} substitution, and chia passes
+# an UNSET ${VAR} through literally instead of failing. Check them here so a
+# missing value is a loud error rather than a container with a "${...}" path.
+missing=()
+for v in AETHER_HEAD_IP AETHER_RAY_TMPDIR AETHER_WORKDIR; do
+    [ -n "${!v:-}" ] || missing+=("$v")
+done
+if [ ${#missing[@]} -ne 0 ]; then
+    echo "[up.sh] missing required env var(s): ${missing[*]}" >&2
+    echo "[up.sh] see examples/aether/requirements.md; e.g." >&2
+    echo "        export AETHER_HEAD_IP=\$(hostname -I | awk '{print \$1}')" >&2
+    echo "        export AETHER_RAY_TMPDIR=/big/disk/aether_ray" >&2
+    echo "        export AETHER_WORKDIR=$AETHER_DIR/out" >&2
+    exit 2
+fi
+
+# Host-side dirs the cluster.yaml bind-mounts must exist before docker run.
+mkdir -p "$AETHER_WORKDIR"/work/{kernel,sim,build} \
+         "$AETHER_RAY_TMPDIR" \
+         "$AETHER_RAY_TMPDIR"_ct_{llm,build,cosim,riscv}
 
 # --- conda env ---
 CONDA_SH="/usr/local/anaconda3/etc/profile.d/conda.sh"

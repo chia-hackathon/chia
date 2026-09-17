@@ -15,9 +15,15 @@ import os
 from pathlib import Path
 
 # --- Workspace -------------------------------------------------------------
-AETHER_ROOT = Path(os.environ.get("AETHER_ROOT", Path.home() / "aether"))
-BENCHMARKS_DIR = AETHER_ROOT / "repos" / "saturn" / "benchmarks"
-OUT_DIR = AETHER_ROOT / "out" / "loop"
+# Everything the loop reads/writes on the host hangs off AETHER_ROOT. It
+# defaults to this example's own directory (the parent of loop/), so a fresh
+# clone works without setting anything; point AETHER_ROOT elsewhere to keep
+# run artifacts off the checkout.
+AETHER_ROOT = Path(os.environ.get("AETHER_ROOT", Path(__file__).resolve().parent.parent))
+# Saturn benchmark tree the loop compiles against (a saturn-vectors checkout).
+BENCHMARKS_DIR = Path(os.environ.get(
+    "AETHER_BENCHMARKS_DIR", AETHER_ROOT / "repos" / "saturn" / "benchmarks"))
+OUT_DIR = Path(os.environ.get("AETHER_OUT_DIR", AETHER_ROOT / "out" / "loop"))
 
 # --- Target (defaults; override per run with `loop.py --config NAME`) ------
 # Shuttle + Saturn, VLEN=256 / DLEN=128. Non-cosim: the benchmark self-checks,
@@ -28,7 +34,8 @@ OUT_DIR = AETHER_ROOT / "out" / "loop"
 # every iteration ~2x faster.
 SIM_CONFIG = "GENV256D128GemminiShuttleConfig"
 CONFIG_PACKAGE = "chipyard"
-CHIPYARD_PATH = "/home/ray/chipyard"
+# Path to chipyard INSIDE the chisel-build container (not on the host).
+CHIPYARD_PATH = os.environ.get("CHIPYARD_PATH", "/home/ray/chipyard")
 
 # --- The kernel under optimization -----------------------------------------
 # Default entry from kernels.KERNELS; override with `loop.py --kernel NAME`.
@@ -54,8 +61,12 @@ def cflags(bench_dir: str) -> list[str]:
 
 
 # --- Agent workspace (on the riscv_build container) ------------------------
-AGENT_WORK_DIR = "/tmp/aether-kernel"
-BUILD_WORK_DIR = "/tmp/aether-build"
+# Container-internal paths; cluster/cluster.yaml bind-mounts host dirs onto
+# them (${AETHER_WORKDIR}/work/{kernel,build,sim}). Override in lockstep with
+# that yaml if you change them.
+AGENT_WORK_DIR = os.environ.get("AETHER_AGENT_WORK_DIR", "/tmp/aether-kernel")
+BUILD_WORK_DIR = os.environ.get("AETHER_BUILD_WORK_DIR", "/tmp/aether-build")
+SIM_WORK_DIR = os.environ.get("AETHER_SIM_WORK_DIR", "/tmp/aether-sim")
 
 # --- Resources -------------------------------------------------------------
 LLM_RESOURCE = 1

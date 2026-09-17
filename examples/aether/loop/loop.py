@@ -26,7 +26,7 @@ returns an :class:`InnerResult`. It never builds hardware and never re-measures
 a baseline it can load from cache, so a future OUTER loop (a search over
 hardware parameters — Saturn VLEN/DLEN, Gemmini dims) can do::
 
-    ray.init(address="auto", runtime_env=RUNTIME_ENV)
+    ray.init(address=os.environ.get("RAY_ADDRESS", "auto"), runtime_env=RUNTIME_ENV)
     start_collector(log_dir=...)
     for cfg in design_points:
         select(kernel_name, cfg)          # context.py globals
@@ -40,9 +40,9 @@ from the registry in `kernels.py` (`--kernel NAME`); the simulator config comes
 from `--config NAME`. Every measurement — baseline included — plus its LLM
 cost is written to the SQLite store in `db.py` as it happens.
 
-Run (after `chia up ~/aether/cluster/aether-local.yaml -y`):
+Run (after `bash cluster/up.sh`, which runs `chia up -y cluster/cluster.yaml`):
 
-    chia job submit --working-dir ~/aether/loop -- python loop.py
+    chia job submit --working-dir examples/aether/loop -- python loop.py
     python loop.py --kernel vec-softmax --baseline-only
     python loop.py --kernel vec-sgemv --iters 5 --budget-usd 25
     python loop.py --kernel llama-softmax --seed 20260907-043200-f0d7
@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import secrets
 import sys
 import time
@@ -633,7 +634,7 @@ def main() -> int:
                      k.name, k.unavailable_reason)
         return 2
 
-    ray.init(address="auto", runtime_env=RUNTIME_ENV)
+    ray.init(address=os.environ.get("RAY_ADDRESS", "auto"), runtime_env=RUNTIME_ENV)
 
     run_id = (datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
               + "-" + secrets.token_hex(2))

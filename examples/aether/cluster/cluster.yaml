@@ -7,10 +7,26 @@
 #
 # 啟動：
 #   conda activate chia_env
-#   chia up ~/aether/cluster/aether-local.yaml -y
+#   bash cluster/up.sh          # wraps: chia up -y cluster/cluster.yaml
 #
-# 注意：既有的 chia-chipyard-max410011_l-0 / chia-verilator-max410011_l-0
-# 是前一個 cluster 留下的，容器名不同，chia up 會另外開新的。
+# ---------------------------------------------------------------------------
+# REQUIRED ENVIRONMENT VARIABLES (expanded by chia's ${VAR} substitution,
+# see chia/cluster/config.py). `cluster/up.sh` refuses to run if any is unset,
+# because an unset ${VAR} is passed through LITERALLY by chia rather than
+# erroring out. See ../requirements.md for the full list.
+#
+#   AETHER_HEAD_IP   IP of the (single) host that runs every Ray node,
+#                    reachable over ssh from where you run `chia up`.
+#   AETHER_RAY_TMPDIR  Ray temp/spill dir on a LARGE filesystem. Keep it short:
+#                    AF_UNIX socket paths cap at 107 bytes. Each containerized
+#                    node type gets its own host dir "<dir>_ct_<type>" bind-
+#                    mounted onto this same path inside the container (the
+#                    container users have different uids; sharing one host dir
+#                    gives Permission denied).
+#   AETHER_WORKDIR   Host dir for the loop's scratch trees; "<dir>/work/{kernel,
+#                    sim,build}" are bind-mounted into the containers.
+#   USER, HOME       your own; SSH_AUTH_SOCK optional (see build node below).
+# ---------------------------------------------------------------------------
 
 cluster_name: aether
 
@@ -24,7 +40,7 @@ available_node_types:
     head_local:
         resources: {"head_local": 8}
         num_workers: 1
-        compatible_ips: ["140.113.241.75"]
+        compatible_ips: ["${AETHER_HEAD_IP}"]
         worker_env_commands:
             - "source /usr/local/anaconda3/etc/profile.d/conda.sh && conda activate chia_env"
             - "export CHIA_NUM_CPUS=4"
@@ -33,7 +49,7 @@ available_node_types:
     database:
         resources: {"database": 2}
         num_workers: 1
-        compatible_ips: ["140.113.241.75"]
+        compatible_ips: ["${AETHER_HEAD_IP}"]
         worker_env_commands:
             - "source /usr/local/anaconda3/etc/profile.d/conda.sh && conda activate chia_env"
             - "export CHIA_NUM_CPUS=2"
@@ -42,7 +58,7 @@ available_node_types:
     llm:
         resources: {"llm": 4}
         num_workers: 1
-        compatible_ips: ["140.113.241.75"]
+        compatible_ips: ["${AETHER_HEAD_IP}"]
         worker_env_commands: ["export CHIA_NUM_CPUS=2"]
         docker:
             image: "ghcr.io/ucb-bar/chia-claude-code:latest"
@@ -50,11 +66,11 @@ available_node_types:
             pull_before_run: False   # 四個 image 都已在本地；True 會讓 30.6GB 的 chisel-build 逐層驗證而超時
             run_options:
                 - --ulimit nofile=65536:65536
-                - "-v /share1/saves/max410011/aether_ray_ct_llm:/share1/saves/max410011/aether_ray"  # 2026-09-10 容器內 ray 沿用 head 的 temp-dir 路徑；各 node type 分開的 host 目錄（容器使用者 uid 不同，共用會 Permission denied）
+                - "-v ${AETHER_RAY_TMPDIR}_ct_llm:${AETHER_RAY_TMPDIR}"  # 2026-09-10 容器內 ray 沿用 head 的 temp-dir 路徑；各 node type 分開的 host 目錄（容器使用者 uid 不同，共用會 Permission denied）
                 - --shm-size=10.24gb
                 - "--user $(id -u):$(id -g)"              # 用自己的身分跑，掛進去的憑證才讀得到
                 - "-v ${HOME}/.claude:/home/ray/.claude"  # Claude Code 憑證目錄
-                - "-v /share1/saves/max410011/hackathon/aether/out/work/kernel:/tmp/aether-kernel"  # 2026-09-09 agent workspace 落 /share1
+                - "-v ${AETHER_WORKDIR}/work/kernel:/tmp/aether-kernel"  # 2026-09-09 agent workspace 落 /share1
             run_setup_commands:
                 - echo "user:x:$(id -u):$(id -g)::/home/ray:/bin/bash" >> /etc/passwd
                 - mkdir -p /home/ray/llm_env              # claude CLI 會 chdir 進去的空目錄
@@ -63,7 +79,7 @@ available_node_types:
     build:
         resources: {"chipyard": 1}
         num_workers: 1
-        compatible_ips: ["140.113.241.75"]
+        compatible_ips: ["${AETHER_HEAD_IP}"]
         worker_env_commands: ["cd /home/ray/chipyard && source env.sh", "export CHIA_NUM_CPUS=16"]
         docker:
             image: "chia-chisel-build-aether-cosim:local"
@@ -71,7 +87,7 @@ available_node_types:
             pull_before_run: False   # 四個 image 都已在本地；True 會讓 30.6GB 的 chisel-build 逐層驗證而超時
             run_options:
                 - --ulimit nofile=65536:65536
-                - "-v /share1/saves/max410011/aether_ray_ct_build:/share1/saves/max410011/aether_ray"  # 2026-09-10 容器內 ray 沿用 head 的 temp-dir 路徑；各 node type 分開的 host 目錄（容器使用者 uid 不同，共用會 Permission denied）
+                - "-v ${AETHER_RAY_TMPDIR}_ct_build:${AETHER_RAY_TMPDIR}"  # 2026-09-10 容器內 ray 沿用 head 的 temp-dir 路徑；各 node type 分開的 host 目錄（容器使用者 uid 不同，共用會 Permission denied）
                 - --shm-size=10.24gb
                 - -v ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent  # bash 預設值語法；chia 只展開 ${VAR} 且僅在整段是合法環境變數名時才動，
                                                               # 這段含 ":-" 不合法變數名，所以會原樣送到遠端 bash 由它展開，
@@ -81,7 +97,7 @@ available_node_types:
     cosim:
         resources: {"verilator_run": 4}
         num_workers: 4
-        compatible_ips: ["140.113.241.75"]
+        compatible_ips: ["${AETHER_HEAD_IP}"]
         worker_env_commands: ["export CHIA_NUM_CPUS=16"]   # 每台 2 支 8-thread Verilator sim（titan nodes.py num_cpus=VERILATOR_THREADS=8）
         docker:
             image: "ghcr.io/ucb-bar/chia-verilator-run:latest"
@@ -89,15 +105,15 @@ available_node_types:
             pull_before_run: False   # 四個 image 都已在本地；True 會讓 30.6GB 的 chisel-build 逐層驗證而超時
             run_options:
                 - --ulimit nofile=65536:65536
-                - "-v /share1/saves/max410011/aether_ray_ct_cosim:/share1/saves/max410011/aether_ray"  # 2026-09-10 容器內 ray 沿用 head 的 temp-dir 路徑；各 node type 分開的 host 目錄（容器使用者 uid 不同，共用會 Permission denied）
+                - "-v ${AETHER_RAY_TMPDIR}_ct_cosim:${AETHER_RAY_TMPDIR}"  # 2026-09-10 容器內 ray 沿用 head 的 temp-dir 路徑；各 node type 分開的 host 目錄（容器使用者 uid 不同，共用會 Permission denied）
                 - --shm-size=10.24gb
-                - "-v /share1/saves/max410011/hackathon/aether/out/work/sim:/tmp/aether-sim"  # 2026-09-09 模擬工作目錄落 /share1（task 子目錄亂數命名、binary 有 flock 去重，多容器共用安全）
+                - "-v ${AETHER_WORKDIR}/work/sim:/tmp/aether-sim"  # 2026-09-09 模擬工作目錄落 /share1（task 子目錄亂數命名、binary 有 flock 去重，多容器共用安全）
 
     # 把 agent 改過的 kernel 交叉編譯成 ELF
     riscv_build:
         resources: {"riscv_build": 4}
         num_workers: 1
-        compatible_ips: ["140.113.241.75"]
+        compatible_ips: ["${AETHER_HEAD_IP}"]
         worker_env_commands: ["export CHIA_NUM_CPUS=4"]
         docker:
             image: "ghcr.io/ucb-bar/chia-riscv-cross:latest"
@@ -105,12 +121,12 @@ available_node_types:
             pull_before_run: False   # 四個 image 都已在本地；True 會讓 30.6GB 的 chisel-build 逐層驗證而超時
             run_options:
                 - --ulimit nofile=65536:65536
-                - "-v /share1/saves/max410011/aether_ray_ct_riscv:/share1/saves/max410011/aether_ray"  # 2026-09-10 容器內 ray 沿用 head 的 temp-dir 路徑；各 node type 分開的 host 目錄（容器使用者 uid 不同，共用會 Permission denied）
-                - "-v /share1/saves/max410011/hackathon/aether/out/work/build:/tmp/aether-build"  # 2026-09-09 交叉編譯工作目錄落 /share1
+                - "-v ${AETHER_RAY_TMPDIR}_ct_riscv:${AETHER_RAY_TMPDIR}"  # 2026-09-10 容器內 ray 沿用 head 的 temp-dir 路徑；各 node type 分開的 host 目錄（容器使用者 uid 不同，共用會 Permission denied）
+                - "-v ${AETHER_WORKDIR}/work/build:/tmp/aether-build"  # 2026-09-09 交叉編譯工作目錄落 /share1
 
 provider:
     type: local
-    head_ip: 140.113.241.75
+    head_ip: ${AETHER_HEAD_IP}
 
 auth:
     ssh_user: ${USER}
@@ -135,7 +151,7 @@ head_env_commands:
 head_start_ray_commands:
     # 2026-09-09: 不再 ray stop —— 宿主機的 Ray 與 titan(6380) 共用，ray stop 會殺掉所有 ray process。
     # 要重啟 aether head 請只 kill 該 session 的 pid。temp-dir 改到 /share1（路徑要短：AF_UNIX socket 路徑上限 107 bytes，out/ray_tmp 太長會 fail）。
-    - ulimit -c unlimited && (ray status --address 140.113.241.75:6379 >/dev/null 2>&1 && echo "aether head already up, skip") || ray start --head --port=6379 --temp-dir=/share1/saves/max410011/aether_ray --num-cpus=4 --include-dashboard=True --dashboard-agent-listen-port=0
+    - ulimit -c unlimited && (ray status --address ${AETHER_HEAD_IP}:6379 >/dev/null 2>&1 && echo "aether head already up, skip") || ray start --head --port=6379 --temp-dir=${AETHER_RAY_TMPDIR} --num-cpus=4 --include-dashboard=True --dashboard-agent-listen-port=0
 
 worker_start_ray_commands:
     - ray stop
