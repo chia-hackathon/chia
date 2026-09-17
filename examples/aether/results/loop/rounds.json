@@ -1,0 +1,433 @@
+{
+  "_comment": "Ledger input: one entry per inner-loop round. ledger.py reads this, joins against loop/aether.db (runs+iters) and loop/kernels.py (roofline_cycles), and writes ledger.md / ledger.json. Round3+ is appended by another agent; do not reorder existing rounds or change run_id values.",
+  "rounds": [
+    {
+      "name": "smoke",
+      "start": "2026-09-06T19:37:28+00:00",
+      "note": "smoke test of the inner loop before round1",
+      "runs": [
+        {
+          "run_id": "20260906-193727-ebbf",
+          "kernel": "llama-softmax",
+          "planned_iters": 2
+        }
+      ]
+    },
+    {
+      "name": "round1",
+      "start": "2026-09-07T04:31:20+00:00",
+      "note": "config GENV256D128GemminiShuttleConfig, model claude-fable-5-1 (see out/loop/round1-runs.txt)",
+      "runs": [
+        {
+          "run_id": "20260907-043120-a7d0",
+          "kernel": "llama-q8-gemv-gemmini-n1",
+          "planned_iters": 8
+        },
+        {
+          "run_id": "20260907-043130-fa24",
+          "kernel": "llama-attn-scores-int8",
+          "planned_iters": 6
+        },
+        {
+          "run_id": "20260907-043140-2246",
+          "kernel": "llama-attn-pv-int8",
+          "planned_iters": 6
+        },
+        {
+          "run_id": "20260907-043150-7557",
+          "kernel": "llama-silu-mul",
+          "planned_iters": 6
+        },
+        {
+          "run_id": "20260907-043200-f0d7",
+          "kernel": "llama-softmax",
+          "planned_iters": 4
+        }
+      ]
+    },
+    {
+      "name": "round2",
+      "start": "2026-09-07T14:21:55+00:00",
+      "note": "first round2 launch, aborted mid-run (session limit); see out/loop/round2-runs.txt",
+      "runs": [
+        {
+          "run_id": "20260907-142155-86bf",
+          "kernel": "llama-q8-gemv-gemmini-n1",
+          "planned_iters": 8,
+          "note": "aborted: session limit"
+        },
+        {
+          "run_id": "20260907-142205-6c45",
+          "kernel": "llama-attn-scores-int8",
+          "planned_iters": 4,
+          "note": "aborted: session limit"
+        },
+        {
+          "run_id": "20260907-142215-b093",
+          "kernel": "llama-attn-pv-int8",
+          "planned_iters": 4,
+          "note": "aborted: session limit"
+        },
+        {
+          "run_id": "20260907-142225-55f2",
+          "kernel": "llama-silu-mul",
+          "planned_iters": 4,
+          "note": "aborted: session limit"
+        },
+        {
+          "run_id": "20260907-142235-7231",
+          "kernel": "llama-softmax",
+          "planned_iters": 3,
+          "note": "aborted: session limit"
+        },
+        {
+          "run_id": "20260907-144414-da36",
+          "kernel": "llama-q8-gemv-gemmini-lmhead",
+          "planned_iters": 6,
+          "note": "aborted: session limit"
+        }
+      ]
+    },
+    {
+      "name": "round2b",
+      "start": "2026-09-08T02:58:20+00:00",
+      "note": "round2 restart 2026-09-08T11:00:03+08:00 (session limit reset, seeded from --seed best); see out/loop/round2-runs.txt",
+      "runs": [
+        {
+          "run_id": "20260908-025820-f7c4",
+          "kernel": "llama-q8-gemv-gemmini-n1",
+          "planned_iters": 8
+        },
+        {
+          "run_id": "20260908-025835-a0cc",
+          "kernel": "llama-q8-gemv-gemmini-lmhead",
+          "planned_iters": 6
+        },
+        {
+          "run_id": "20260908-025850-2356",
+          "kernel": "llama-attn-scores-int8",
+          "planned_iters": 4
+        },
+        {
+          "run_id": "20260908-025905-5427",
+          "kernel": "llama-attn-pv-int8",
+          "planned_iters": 4
+        },
+        {
+          "run_id": "20260908-025919-3d8d",
+          "kernel": "llama-silu-mul",
+          "planned_iters": 4
+        },
+        {
+          "run_id": "20260908-025933-f639",
+          "kernel": "llama-softmax",
+          "planned_iters": 3
+        }
+      ]
+    },
+    {
+      "name": "round3",
+      "start": "2026-09-08T20:24:12+00:00",
+      "note": "launched 2026-09-09T04:24:12+08:00 Taipei, all --seed best --budget-usd 1000; ended ~2026-09-09T17:59+08:00 (out/loop/round3-launch.sh, out/loop/round3-runs.txt, out/loop/round3-watchdog.log). llama-q8-gemv-gemmini-n1 and llama-q8-gemv-gemmini-lmhead were each interrupted by a Claude session-limit 429 (n1 after 4 iters, lmhead after 3) and restarted with the remaining planned_iters, seed=best; the watchdog's auto-restart misparsed the API's 'resets 5pm America/Los_Angeles' message as local time, so a human manually restarted both at 2026-09-09T13:23+08:00 instead of waiting for the watchdog.",
+      "runs": [
+        {
+          "run_id": "20260908-202413-e8e8",
+          "kernel": "llama-q8-gemv-gemmini-n1",
+          "planned_iters": 12,
+          "note": "aborted after 4 iters: session limit (429); restarted as 20260909-052323-9d90"
+        },
+        {
+          "run_id": "20260909-052323-9d90",
+          "kernel": "llama-q8-gemv-gemmini-n1",
+          "planned_iters": 8,
+          "note": "manual restart 2026-09-09T13:23:22+08:00 of 20260908-202413-e8e8, seed=best"
+        },
+        {
+          "run_id": "20260908-202428-217e",
+          "kernel": "llama-q8-gemv-gemmini-lmhead",
+          "planned_iters": 8,
+          "note": "aborted after 3 iters: session limit (429); restarted as 20260909-052338-b80e"
+        },
+        {
+          "run_id": "20260909-052338-b80e",
+          "kernel": "llama-q8-gemv-gemmini-lmhead",
+          "planned_iters": 5,
+          "note": "manual restart 2026-09-09T13:23:37+08:00 of 20260908-202428-217e, seed=best"
+        },
+        {
+          "run_id": "20260908-202443-5906",
+          "kernel": "llama-q8-gemm",
+          "planned_iters": 6
+        },
+        {
+          "run_id": "20260908-202458-85ab",
+          "kernel": "llama-attn-scores-int8",
+          "planned_iters": 4
+        },
+        {
+          "run_id": "20260908-202513-620b",
+          "kernel": "llama-attn-pv-int8",
+          "planned_iters": 3
+        },
+        {
+          "run_id": "20260908-202528-f504",
+          "kernel": "llama-silu-mul",
+          "planned_iters": 4
+        },
+        {
+          "run_id": "20260908-202543-fc79",
+          "kernel": "llama-softmax",
+          "planned_iters": 3
+        }
+      ]
+    },
+    {
+      "name": "round4",
+      "start": "2026-09-09T20:05:40+00:00",
+      "note": "launched 2026-09-10T04:05:40+08:00 Taipei, all --seed best --budget-usd 1000; ended ~2026-09-10T12:55:24+08:00 (all three runs FINISHED ... completed=N of N, no restart -- unlike round3, no session-limit interruptions this round; out/loop/round4-launch.sh, out/loop/round4-runs.txt, out/loop/round4-watchdog.log). Two infra notes predating this round: (1) the roofline memory-bandwidth bug (mbus is 8 B/cycle, not 16) was fixed 2026-09-09, just before round4 launched -- see out/loop/README.md's 'Roofline correction (2026-09-09)' section; round4 is the first round measured/analyzed entirely under the corrected roofline. (2) Ray's temp/spill dir was migrated from local disk to /share1 on 2026-09-09 (see out/loop/migrate-ray-to-share1.sh). llama-q8-gemv-gemmini-n1 was run as a deliberate 2-iteration probe (not a full search) since round3 had already converged it to ~1.01x roofline -- see out/loop/README.md's 'Round 4 planning' section.",
+      "runs": [
+        {
+          "run_id": "20260909-200541-dae1",
+          "kernel": "llama-q8-gemv-gemmini-lmhead",
+          "planned_iters": 12
+        },
+        {
+          "run_id": "20260909-200556-5de3",
+          "kernel": "llama-q8-gemm",
+          "planned_iters": 6
+        },
+        {
+          "run_id": "20260909-200611-94c0",
+          "kernel": "llama-q8-gemv-gemmini-n1",
+          "planned_iters": 2,
+          "note": "deliberate 2-iter probe, not a full search (round3 had already converged this kernel to ~1.01x roofline); see README 'Round 4 planning'"
+        }
+      ]
+    },
+    {
+      "name": "round5",
+      "start": "2026-09-11T06:56:00+00:00",
+      "note": "launched 2026-09-11T14:56:00+08:00 Taipei, ended ~2026-09-11T19:19:00+08:00 Taipei (~4h23m). Single run: llama-q8-gemv-gemmini-n16 (the pristine N=16 batched-decode GEMV tile, never previously optimized -- see measured_cycles_round4.json's int8_gemv_gemmini entry, N=16 additional_measurement, 168,367 cycles baseline), 10 iterations, run_id 20260911-065653-8115; baseline 168,367 -> best 142,458 cycles (1.087x the 131,072 roofline). Starting this round, the harness saves simlog_NN.txt per iteration, and the passing feedback includes a stdout tail.",
+      "runs": [
+        {
+          "run_id": "20260911-065653-8115",
+          "kernel": "llama-q8-gemv-gemmini-n16",
+          "planned_iters": 10
+        }
+      ]
+    },
+    {
+      "name": "round6",
+      "start": "2026-09-11T11:58:00+00:00",
+      "note": "launched 2026-09-11T19:58:00+08:00 Taipei, ended ~2026-09-11T22:21:00+08:00 Taipei (~2h23m). Single run: llama-q8-gemv-gemmini-n16 (continuation of round5's kernel, seeded from round5's best), 4 iterations, run_id 20260911-115840-5f95; seed 142458 cycles (from round5 iter 2) -> iterations 688048 (per-loop probe) and 1992395 (per-loop probe) regressed, best remained 142458 -- no new best this round (1.087x the 131,072 roofline, unchanged from round5).",
+      "runs": [
+        {
+          "run_id": "20260911-115840-5f95",
+          "kernel": "llama-q8-gemv-gemmini-n16",
+          "planned_iters": 4
+        }
+      ]
+    },
+    {
+      "name": "round7",
+      "start": "2026-09-13T03:17:00+00:00",
+      "note": "launched 2026-09-13T11:17:00+08:00 Taipei; ended early at 2026-09-14T00:50:00+08:00 (2026-09-13T16:50:00Z) when the operator stopped the watchdog after it hit the weekly Claude usage cap at 2026-09-13T08:01:00+08:00 (2026-09-13T00:01:00Z) and then restarted 52 times, every restart returning HTTP 429 (weekly limit resets 2026-09-15T06:00:00Z). Two real runs completed before the cap: llama-layer-fused-n1 (new kernel, baseline 206,304, roofline 140,680), run_id 20260912-191730-3a47, 4 iterations -- 217295 (iter1, regression), 189851 (iter2, new best, -8.0% vs baseline), 189924 (iter3, ~flat), 223640 (iter4, regression); and llama-q8-gemv-gemmini-n1 in-flight-scan probe, run_id 20260912-191830-e713, 2 iterations -- 3017659 (iter1, in-flight scan, large regression) and 660409 (iter2, warm/cold contrast probe). After the cap, the watchdog auto-restarted the layer-fused run 26 times (out/loop/20260913-*/ and one 20260914-000202-*/ dir); each restart only re-ran the baseline probe (kind=baseline, cycles=206304, cost_usd=0.0) before hitting 429 on the first agent turn, so none of the 26 restarts produced any real iteration or cost -- no residual progress was lost. Total round7 cost across all 28 run rows: $7.536489 (iters table SUM(cost_usd)).",
+      "runs": [
+        {
+          "run_id": "20260912-191730-3a47",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 8,
+          "note": "completed 4 of 8 iterations before session-limit stop; best 189851 (iter2)"
+        },
+        {
+          "run_id": "20260912-191830-e713",
+          "kernel": "llama-q8-gemv-gemmini-n1",
+          "planned_iters": 2,
+          "note": "in-flight-scan / warm-cold probe run, seeded from 132424 (run 20260908-202413-e8e8 iter2); both iterations regressed vs seed"
+        },
+        {
+          "run_id": "20260913-000137-2132",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, no agent turn ran, cost $0"
+        },
+        {
+          "run_id": "20260913-004138-786f",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-012139-c080",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-020140-53fc",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-024141-3644",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-032142-e3a6",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-040143-edab",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-044144-a893",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-052146-2e52",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-060147-fea2",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-064148-3da8",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-072149-c40c",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-080150-e953",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-084151-bb60",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-092152-8335",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-100153-1f7c",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-104154-43d8",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-112156-d66a",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-120157-3fa8",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-124158-4820",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-132159-ff8b",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-140200-51f5",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-144201-9d99",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-152202-4b7b",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-160203-35d3",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        },
+        {
+          "run_id": "20260913-164204-0fd2",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "watchdog auto-restart after 429; baseline-only, cost $0"
+        }
+      ]
+    },
+    {
+      "name": "round8",
+      "start": "2026-09-15T06:08:20+00:00",
+      "note": "launched 2026-09-15T14:08:00+08:00 Taipei, ended ~2026-09-15T19:52:00+08:00 Taipei (~5h44m). This is the operator-restarted continuation of round7's llama-layer-fused-n1 run, which was cut short by the weekly Claude usage cap after only 4 of its planned 8 iterations; round7+round8 together make up the full 8-iteration search for this kernel. Single run: llama-layer-fused-n1, run_id 20260915-060820-a93a, 4 iterations, seeded from round7's best (189851 cycles, run 20260912-191730-3a47 iter 2) with --seed best; baseline 206304, roofline 140680 -> iterations 179585 (iter1, new overall best), 198688 (iter2, regression), 199347 (iter3, regression), 181860 (iter4, close to best but not improving). Best cycles 179585 is a cumulative +13.0% improvement over baseline across round7+round8's 8 iterations combined.",
+      "runs": [
+        {
+          "run_id": "20260915-060820-a93a",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "continuation of round7's run_id 20260912-191730-3a47, seeded from its best (189851 cycles); new best 179585 (iter1, -13.0% vs baseline 206304)"
+        }
+      ]
+    },
+    {
+      "name": "round9",
+      "start": "2026-09-16T20:00:00+00:00",
+      "note": "launched 2026-09-17T04:00:00+08:00 Taipei, ended ~2026-09-17T09:4x:00+08:00 Taipei (same day). This is the continuation of round7+round8's llama-layer-fused-n1 search, seeded --seed best from round8's best (179,585 cycles, run 20260915-060820-a93a iter 1). Single run: llama-layer-fused-n1, run_id 20260916-195958-36b4, 4 iterations, baseline 206304, roofline 140680 -> iterations 185374 (iter1, regression), 180107 (iter2, close but not a new best), 183430 (iter3, probe-only iteration, regression), 179033 (iter4, new overall best). Best cycles 179033 is a +13.2% improvement over baseline ((206304-179033)/206304 = 0.13219), down slightly from round8's 179585 (1.277x roofline) to 1.273x roofline. Round7+round8+round9 together make up 12 iterations total on this kernel. iter1-3 probes split Saturn compute completion (sat_done) from kernel end (gemv_end): iter1 106708/185332, iter2 99956/179890, iter3 104365/183228 -- Saturn's own compute finishes at roughly half the total cycle count, i.e. it is now mostly hidden behind Gemmini weight-stream / host dispatch, not exposed on the critical path. iter3 also measured host dispatch cost directly: unit_host_cycles=48799 over unit_calls=256 (~190.6 cycles/call) and mvin_stall_sampled=2558 over mvin_samples=512 (~5.0 stall cycles/sampled mvin).",
+      "runs": [
+        {
+          "run_id": "20260916-195958-36b4",
+          "kernel": "llama-layer-fused-n1",
+          "planned_iters": 4,
+          "note": "continuation of round8's run_id 20260915-060820-a93a, seeded from its best (179585 cycles) with --seed best; new best 179033 (iter4, -13.2% vs baseline 206304)"
+        }
+      ]
+    }
+  ]
+}

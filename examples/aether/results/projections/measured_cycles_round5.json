@@ -1,0 +1,807 @@
+{
+ "_README": [
+  "Measured kernel cycles, consumed by loop/llama_project.py.",
+  "Entries with `cycles: null` are PLACEHOLDERS until someone fills them in",
+  "from a real Verilator run (the SoC does ~1.8k cycles/s, so only single",
+  "kernels are measurable; the whole model is projected, never simulated).",
+  "",
+  "Fields:",
+  "  kernel         one of the kernel types in loop/llama_model.py",
+  "  shape          the shape that was actually measured (documentation)",
+  "  work_metric    'macs' or 'elems' - which quantity cycles scale with",
+  "  work_measured  value of that metric at the measured shape",
+  "  cycles         total cycles for one call at that shape (null = not measured)",
+  "  overhead_cycles  fixed per-call cost (setup, config, fences) subtracted",
+  "                 before linear extrapolation and re-added per call",
+  "  device         'gemmini' or 'saturn' - which unit ran it",
+  "  source         where the number came from",
+  "",
+  "Scaling rule applied by llama_project.py:",
+  "  cycles(target) = calls*overhead + (cycles - overhead) * work_target/work_measured",
+  "Entries with cycles == null fall back to roofline x --fallback-factor and",
+  "are flagged 'est' in the output tables.",
+  "",
+  "HOW TO SWITCH decode GEMV BETWEEN SATURN AND GEMMINI",
+  "  project() looks up `<kernel>_<unit>` first when `--device kernel=unit` is",
+  "  given on the CLI (e.g. `--device int8_gemv=gemmini` -> `int8_gemv_gemmini`),",
+  "  and falls back to the bare `<kernel>` entry otherwise. An entry's own",
+  "  `device` field is only used when the CLI did NOT pin that kernel.",
+  "  The two candidate numbers for the SAME decode GEMV shape (M=512, K=2048,",
+  "  1,048,576 MACs, 1 MiB of weights) are:",
+  "      saturn  621724 cycles  (1.69 B/cycle of weights)  <- naive RVV baseline",
+  "      gemmini 150339 cycles  (6.97 B/cycle of weights)  <- 4.1x faster",
+  "  So: no --device -> saturn (bare entries); `--device int8_gemv=gemmini",
+  "  --device lm_head_gemv=gemmini` -> the *_gemmini entries.",
+  "",
+  "WHY MAC-LINEAR SCALING IS OK FOR A DECODE GEMV",
+  "  At N=1 a GEMV does exactly one MAC per weight byte, so scaling by MACs is",
+  "  scaling by weight traffic - which is what actually costs cycles here. Do",
+  "  NOT extrapolate the N=64 `int8_gemm` measurement down to decode: at N=64",
+  "  the weight mvin is amortized over 64 rows of work, at N=1 over one. That",
+  "  extrapolation predicted ~9.01M cycles/token, below the 78M memory roofline",
+  "  for 1.24 GB of weights, i.e. impossible. The measured N=1 rate of",
+  "  6.97 B/cycle gives ~178M cycles/token instead.",
+  "",
+  "THE SEVEN NON-GEMM OPERATORS (measured 2026-09-05, Saturn)",
+  "  rmsnorm, rope, attn_scores, softmax, attn_pv, silu_mul and add are now",
+  "  real Verilator numbers from the `llama-<op>` benchmarks in",
+  "  repos/saturn/benchmarks/, registered in loop/kernels.py and run with",
+  "  `loop.py --kernel llama-<op> --baseline-only --config",
+  "  GENV256D128GemminiShuttleConfig`. All seven are PRISTINE naive RVV 1.0",
+  "  baselines (LMUL=1, no unrolling, no reuse) - they were written to be",
+  "  MEASURED, not optimized, because together they are ~1% of decode cycles.",
+  "  Every one of them has 2.5x-60x of headroom to its own roofline; see the",
+  "  `notes` on each Kernel entry in loop/kernels.py for where it is.",
+  "",
+  "  dtype: fp32 activations throughout, matching ModelSpec.acc_bytes = 4.",
+  "  attn_scores and attn_pv are now costed from the **int8 KV cache**",
+  "  variants (`llama-attn-scores-q8kv`, `llama-attn-pv-q8kv`), which match",
+  "  ModelSpec's kv_bytes = 1: K/V stored int8 with one fp32 dequant scale",
+  "  per KV row, q and P still fp32. The fp32-cache measurements of the",
+  "  identical shape are kept under each entry's additional_measurements.",
+  "",
+  "  SURPRISE, AND IT IS THE INTERESTING RESULT HERE: the int8 cache is",
+  "  SLOWER, not faster - 68,571 vs 60,147 for attn_scores (1.14x) and",
+  "  62,541 vs 44,765 for attn_pv (1.40x). Quartering the cache took the",
+  "  memory floor from 8,192 to 2,304 cycles, but because q/P stay fp32",
+  "  every cached byte must be widened int8 -> int32 -> fp32 before it can",
+  "  be multiplied: two extra 32-bit-destination ops per element, which",
+  "  raises the ARITHMETIC floor from 8,192 to 24,576. The kernel goes from",
+  "  perfectly balanced to compute-bound by 10x. On this SoC, at this shape,",
+  "  quantising only the cache is a losing trade.",
+  "  That prediction was then TESTED. `llama-attn-scores-int8` and",
+  "  `llama-attn-pv-int8` quantise the activation side as well (int8 q with a",
+  "  per-vector scale; int8 probabilities with V's per-row scales folded in,",
+  "  since a cross-row reduction cannot carry a per-row scale), accumulate in",
+  "  int32 with vwmul + vwadd.wv, and do exactly one fp32 multiply per output.",
+  "  Three measurements of the identical 512x64 shape, all equally naive:",
+  "",
+  "      variant   cache        activation   attn_scores   attn_pv",
+  "      -------   ----------   ----------   -----------   -------",
+  "      fp32      fp32 128KiB  fp32              60,147    44,765",
+  "      q8kv      int8  32KiB  fp32              68,571    62,541",
+  "      int8      int8  32KiB  int8              51,280    22,856",
+  "",
+  "  So quantising the cache ALONE loses (1.14x / 1.40x slower than fp32) and",
+  "  quantising BOTH sides wins (1.17x / 1.96x faster than fp32, and 1.34x /",
+  "  2.74x faster than cache-only). The arithmetic floors say why:",
+  "",
+  "      variant   memory floor   arithmetic floor   binding",
+  "      -------   ------------   ----------------   -------",
+  "      fp32             8,192              8,192   balanced",
+  "      q8kv             2,304             24,576   compute, 10x",
+  "      int8             2,300              8,192   compute, ~3.6x",
+  "",
+  "  int8 activations delete the per-element vsext+vfcvt, putting the",
+  "  arithmetic floor back where fp32's was while keeping a quarter of the",
+  "  traffic - the only one of the three with slack on BOTH resources.",
+  "  Accuracy is not the obstacle: measured relative L2 error against a true",
+  "  fp32 reference is 1.7e-3 (scores) and 2.9e-3 (pv), 10-17x inside the",
+  "  3e-2 gate. Each of those kernels also carries an EXACT int32 self-check,",
+  "  so quantisation tolerance never hides a kernel bug.",
+  "",
+  "  The primary cost basis above is still the q8kv (int8 cache, fp32",
+  "  activation) entry, deliberately: moving the model to full int8 attention",
+  "  changes the attention CONTRACT (softmax must emit int8 probabilities and",
+  "  q_proj must emit an int8 query), which is a model decision and not a",
+  "  kernel optimization. The full-int8 numbers are recorded under each",
+  "  entry's additional_measurements so the switch can be costed the moment",
+  "  it is taken: it would move decode from 261.68M to 232.51M cycles/token",
+  "  (3.82 -> 4.30 tokens/s) and prefill from 16.42M to 14.57M (60.9 -> 68.6).",
+  "",
+  "  Both are measured for ONE query head (32,768 MACs); MAC-linear scaling",
+  "  multiplies them by the 32 heads x 16 layers the profile asks for.",
+  "  `rope` is ONE measurement covering both rope calls of a layer (rope_q",
+  "  2048 elems + rope_k 512 elems = 2560); elems-linear scaling splits it.",
+  "",
+  "  STILL ESTIMATED (cycles == null -> roofline x --fallback-factor):",
+  "    embedding     a 2048-byte row gather out of the 128256x2048 table",
+  "    lm_head_gemm  the prefill output projection (same shape as lm_head_gemv)",
+  "  In prefill the seven measurements above are extrapolated from their decode",
+  "  shapes by elems/macs, which is right for the elementwise ops (N tokens is",
+  "  N times the elements) but optimistic for attn_scores/attn_pv, where the",
+  "  causal N(N+1)/2 shape is a different kernel, not a longer one.",
+  "ROUND2 (2026-09-08, run_ids in out/loop/round2-runs.txt, section 'round2b restart'; db out/loop/aether.db): six kernels re-optimized. int8_gemv_gemmini/lm_head_gemv_gemmini (n1 shape) 132653->132424 (~flat), attn_scores 8574->8233, attn_pv 4853->4853 (unchanged), silu_mul 66811->35774 (1.87x), softmax 1752->1568 (1.12x). lm_head_gemv_gemmini's own top-level cycles are NOT the raw n1 number: round2 also directly measured a dedicated, bigger LM-head tile (M=2048,K=2048; 740101->659142 cycles, run_id 20260908-025835-a0cc) and that ratio (0.89061) was applied to round1's 132653 to get this entry's round2 value -- see the lm_head_gemv_gemmini entry's own `source` field for the full reasoning.",
+  "ROUND4 (2026-09-10, run_ids in out/loop/round4-runs.txt; db out/loop/aether.db): three kernels touched, first round fully measured/analyzed under the 2026-09-09 roofline fix (8 B/cycle mbus, not 16 -- see out/loop/README.md's 'Roofline correction (2026-09-09)' section). int8_gemv_gemmini (n1 shape) was only a deliberate 2-iteration probe this round (not a full search, since round3 had already converged it to ~1.01x roofline): re-confirmed unchanged at 132424 cycles, run_id 20260909-200611-94c0. int8_gemm improved 138892->137246 cycles (1.012x faster), run_id 20260909-200556-5de3, now 1.047x the 131072 compute-bound roofline. lm_head_gemv_gemmini's dedicated M=2048 tile kernel improved 635908->634507 cycles (run_id 20260909-200541-dae1); carried through the same n1-basis ratio conversion used since round2, this entry's top-level (n1-basis) value moves from round3's 113978 to 113727 cycles -- see this entry's `source` field for the arithmetic.",
+  "ROUND5 (2026-09-11, run_id 20260911-065653-8115; db out/loop/aether.db): llama-q8-gemv-gemmini-n16 (the pristine N=16 batched-decode GEMV tile, never previously optimized -- see the int8_gemv_gemmini entry's N=16 additional_measurement) got its first dedicated optimization pass, 10/10 iterations, no restart: 168,367 -> 142,458 cycles (1.182x faster), now 1.087x the 131,072 roofline (down from 1.28x pristine). This is lower than the pre-round5 168,367 value, so the int8_gemv_gemmini entry's N=16 additional_measurement below is updated to 142,458 cycles; the pristine 168,367 value is kept as a superseded additional_measurement for history."
+ ],
+ "clock_hz": 1000000000.0,
+ "entries": [
+  {
+   "kernel": "int8_gemv",
+   "shape": {
+    "M": 512,
+    "K": 2048
+   },
+   "work_metric": "macs",
+   "work_measured": 1048576,
+   "cycles": 621724,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "loop baseline llama-q8-gemv 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, naive RVV baseline, roofline 262144 | ALTERNATIVE: the identical shape measured on Gemmini takes 150339 cycles (4.14x faster); see int8_gemv_gemmini and _README to switch.",
+   "additional_measurements": [
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 1048576,
+     "cycles": 150339,
+     "device": "gemmini",
+     "source": "SAME shape on Gemmini instead of Saturn - see int8_gemv_gemmini below and the _README swap instructions. 4.14x faster than the 621724 saturn number in this entry."
+    }
+   ]
+  },
+  {
+   "kernel": "int8_gemv_gemmini",
+   "shape": {
+    "M": 512,
+    "K": 2048,
+    "N": 1
+   },
+   "work_metric": "macs",
+   "work_measured": 1048576,
+   "cycles": 132424,
+   "overhead_cycles": 0,
+   "device": "gemmini",
+   "source": "ROUND4 re-confirmation of llama-q8-gemv-gemmini-n1, run_id 20260909-200611-94c0, 2026-09-10 GENV256D128GemminiShuttleConfig Verilator, self-check PASSED; deliberate 2-iteration PROBE (not a full search -- round3 had already converged this kernel to ~1.01x roofline; see out/loop/README.md's 'Round 4 planning' section), seed=best. NO CHANGE: 132424 -> 132424 cycles (1.00x, re-confirmed, not newly optimized).",
+   "additional_measurements": [
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 1048576,
+     "cycles": 132424,
+     "device": "gemmini",
+     "source": "ROUND3 entry, superseded by ROUND4 in this entry's top level (numerically identical -- round4 re-confirmed the round3 value via a 2-iteration probe rather than a full search)."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 1048576,
+     "cycles": 132424,
+     "device": "gemmini",
+     "source": "ROUND2 entry, superseded by ROUND3 in this entry's top level."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 1048576,
+     "cycles": 132653,
+     "device": "gemmini",
+     "source": "ROUND1 entry, superseded by ROUND2 in this entry's top level."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 1048576,
+     "cycles": 150339,
+     "device": "gemmini",
+     "source": "PRE-ROUND1 baseline, loop baseline llama-q8-gemv-gemmini-n1 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, tiled_matmul_auto WS full_C, dim_I=1 padded to DIM=16 internally; roofline 65536 (weight DMA: 1 MiB / 16 B per cycle), so 2.29x the floor. Superseded by the round1-optimized 132653 cycle number in this entry's top level (run_id 20260907-043120-a7d0, 2026-09-07)."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 16
+     },
+     "work_measured": 16777216,
+     "cycles": 142458,
+     "device": "gemmini",
+     "source": "ROUND5 optimization of llama-q8-gemv-gemmini-n16, run_id 20260911-065653-8115, 2026-09-11 GENV256D128GemminiShuttleConfig Verilator, 10 iterations, self-check PASSED; pristine baseline 168,367 -> optimized 142,458 cycles (1.182x faster), 1.087x the 131,072 roofline. Same 1 MiB of weights as the N=1 point. Documentation only - MeasuredDB.load keys one Measurement per kernel name, so this N=16 shape is still not read as a distinct top-level entry by llama_project.py (see the manual per-token comparison in projection_round5.md instead)."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 16
+     },
+     "work_measured": 16777216,
+     "cycles": 168367,
+     "device": "gemmini",
+     "source": "PRE-ROUND5 pristine baseline, superseded by ROUND5's 142,458 cycles above. loop baseline llama-q8-gemv-gemmini-n16 2026-09-05. Same 1 MiB of weights as the N=1 point: 16x the MACs for 12% more cycles (6.23 B/cycle vs 6.97), which is what 'weight-bandwidth bound' looks like. Batching decode to N=16 is nearly free; past 16 use the int8_gemm measurement. Documentation only - MeasuredDB.load keys one Measurement per kernel name."
+    }
+   ],
+   "notes": [
+    "PRE-ROUND1 measured rates against the same 1 MiB of weights:",
+    "  N=1  150339 cycles -> 6.97 B/cycle (44% of the 16 B/cycle DMA peak),",
+    "                        6.97 MAC/cycle (2.7% of the 256 MAC/cycle array)",
+    "  N=16 168367 cycles -> 6.23 B/cycle (39%), 99.6 MAC/cycle (39%)",
+    "The array is ~97% idle at N=1 and that is correct: 15 of every 16 rows",
+    "fed through the 16x16 array are zero padding, and the weights arrive far",
+    "slower than the array can eat them. Decode on this SoC is a memory",
+    "problem, not a compute problem.",
+    "ROUND1 (20260907-043120-a7d0, 2026-09-07): N=1 improved to 132653 cycles",
+    "-> 7.91 B/cycle (49% of DMA peak). Still DMA-bound; roofline 65536 unchanged.",
+    "ROUND2 (20260908-025820-f7c4, 2026-09-08): N=1 improved marginally to 132424 cycles -> 7.92 B/cycle (49.5% of DMA peak). Still DMA-bound; roofline 65536 unchanged. Essentially converged from round1's 132653.",
+    "ROUND3 (20260908-202413-e8e8 + restart 20260909-052323-9d90, 2026-09-08/09): no further improvement found; still 132424 cycles, essentially converged since round2.",
+    "ROUND4 (20260909-200611-94c0, 2026-09-10): deliberate 2-iteration probe only (not a full search); re-confirmed 132424 cycles, unchanged, 1.010x the 131072 (corrected 8 B/cycle) roofline.",
+    "ROUND5 (20260911-065653-8115, 2026-09-11): the N=16 shape (additional_measurements) got its first dedicated optimization pass: 168,367 -> 142,458 cycles (1.182x faster), 1.087x the 131,072 roofline. The N=1 shape (this entry's top-level basis) was not touched this round."
+   ],
+   "round": 4,
+   "run_id": "20260909-200611-94c0"
+  },
+  {
+   "kernel": "int8_gemm",
+   "shape": {
+    "M": 64,
+    "K": 2048,
+    "N": 256
+   },
+   "work_metric": "macs",
+   "work_measured": 33554432,
+   "cycles": 137246,
+   "overhead_cycles": 0,
+   "device": "gemmini",
+   "source": "ROUND4 inner-loop optimization of llama-q8-gemm, run_id 20260909-200556-5de3, 2026-09-10 GENV256D128GemminiShuttleConfig Verilator, seed=best-of-round3 (138892), self-check PASSED; 138892 -> 137246 cycles (1.012x faster). Roofline 131072 unchanged (compute-bound, M=64,K=2048,N=256), i.e. 137246/131072 = 1.047x the floor.",
+   "additional_measurements": [
+    {
+     "shape": {
+      "M": 64,
+      "K": 2048,
+      "N": 256
+     },
+     "work_measured": 33554432,
+     "cycles": 138892,
+     "device": "gemmini",
+     "source": "ROUND3 entry, superseded by ROUND4 in this entry's top level."
+    },
+    {
+     "shape": {
+      "M": 64,
+      "K": 2048,
+      "N": 256
+     },
+     "work_measured": 33554432,
+     "cycles": 146737,
+     "device": "gemmini",
+     "source": "PRE-ROUND3 baseline, loop baseline llama-q8-gemm 2026-09-05, tiled_matmul_auto WS full_C, roofline 131072. Superseded by the round3-optimized 138892 cycle number, itself superseded by round4's 137246 in this entry's top level (run_id 20260908-202443-5906, 2026-09-08)."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 256
+     },
+     "work_measured": 268435456,
+     "cycles": 315825,
+     "source": "loop baseline llama-q8-gemm 2026-09-05, tiled_matmul_auto WS full_C, M=512 sweep point (documentation only - MeasuredDB.load keys one Measurement per kernel, so this second point is not read by llama_project.py; kept here for a future curve fit / sanity check against the M=64 point)"
+    }
+   ],
+   "round": 4,
+   "run_id": "20260909-200556-5de3",
+   "notes": [
+    "ROUND3 (20260908-202443-5906, 2026-09-08): improved from the pristine 146737-cycle baseline to 138892 cycles, 1.060x the 131072 roofline (first optimization pass for this kernel; not touched in round1/round2).",
+    "ROUND4 (20260909-200556-5de3, 2026-09-10): improved to 137246 cycles, 1.047x the 131072 roofline (unchanged, compute-bound; unaffected by the 2026-09-09 mbus fix)."
+   ]
+  },
+  {
+   "kernel": "lm_head_gemv",
+   "shape": {
+    "M": 512,
+    "K": 2048
+   },
+   "work_metric": "macs",
+   "work_measured": 1048576,
+   "cycles": 621724,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "loop baseline llama-q8-gemv 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, naive RVV baseline, roofline 262144 (lm_head is a GEMV, so it shares the int8_gemv measurement and is linearly extrapolated in MACs up to the 128256x2048 lm_head shape) | Same saturn-vs-gemmini choice as int8_gemv: swap in the int8_gemv_gemmini numbers to project lm_head on Gemmini."
+  },
+  {
+   "kernel": "lm_head_gemv_gemmini",
+   "shape": {
+    "M": 512,
+    "K": 2048,
+    "N": 1
+   },
+   "work_metric": "macs",
+   "work_measured": 1048576,
+   "cycles": 113727,
+   "overhead_cycles": 0,
+   "device": "gemmini",
+   "source": "ROUND4: llama-q8-gemv-gemmini-lmhead was re-optimized again at its OWN, bigger tile shape (M=2048, K=2048, 4,194,304 MACs, 4 MiB weights), run_id 20260909-200541-dae1, 2026-09-10 GENV256D128GemminiShuttleConfig Verilator, seed=best-of-round3, self-check PASSED: baseline (round3's best) 635908 -> optimized 634507 cycles (0.997797x, i.e. 1.002x faster). SAME CONVERSION METHOD AS ROUND2/ROUND3: because this entry's work_measured=1,048,576 / shape (M=512,K=2048,N=1) is tied to the n1 kernel and llama_project.py's linear-MAC scaling depends on that basis being self-consistent, we do NOT swap in 634507 directly (different tile size -> different fixed/DMA-warmup overhead ratio, not a proportional value). Instead we carry the SAME round1 lm_head_gemv_gemmini n1-basis value used in round2/round3 (132653 cycles at M=512/1,048,576 MACs) forward, scaled against the ORIGINAL pre-round1 tile baseline (740101, same baseline round3 used) by the lm_head tile's cumulative improvement ratio: ratio = 634507/740101 = 0.857325; round4 = 132653*0.857325 = 113726.72, rounded to 113727 cycles (at work_measured = 1,048,576). The raw M=2048 tile numbers (740101 baseline, 635908 round3, 634507 round4) are kept in additional_measurements for reference; they are NOT read by llama_project.py (MeasuredDB keys one Measurement per kernel name, work_measured must match this entry's shape).",
+   "additional_measurements": [
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 1048576,
+     "cycles": 113978,
+     "device": "gemmini",
+     "source": "ROUND3 entry, superseded by ROUND4 in this entry's top level."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 1048576,
+     "cycles": 118142,
+     "device": "gemmini",
+     "source": "ROUND2 entry, superseded by ROUND3 in this entry's top level."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 1048576,
+     "cycles": 132653,
+     "device": "gemmini",
+     "source": "ROUND1 entry, superseded by ROUND2 in this entry's top level."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 1048576,
+     "cycles": 150339,
+     "device": "gemmini",
+     "source": "PRE-ROUND1 baseline, loop baseline llama-q8-gemv-gemmini-n1 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, tiled_matmul_auto WS full_C, dim_I=1 padded to DIM=16 internally; roofline 65536; superseded by the round1-optimized 132653 cycle number in this entry's top level."
+    },
+    {
+     "shape": {
+      "M": 512,
+      "K": 2048,
+      "N": 16
+     },
+     "work_measured": 16777216,
+     "cycles": 168367,
+     "device": "gemmini",
+     "source": "loop baseline llama-q8-gemv-gemmini-n16 2026-09-05. Same 1 MiB of weights as the N=1 point: 16x the MACs for 12% more cycles (6.23 B/cycle vs 6.97), which is what 'weight-bandwidth bound' looks like. Batching decode to N=16 is nearly free; past 16 use the int8_gemm measurement. Documentation only - MeasuredDB.load keys one Measurement per kernel name."
+    },
+    {
+     "shape": {
+      "M": 2048,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 4194304,
+     "cycles": 740101,
+     "device": "gemmini",
+     "source": "PRE-ROUND2 baseline of the DEDICATED lm_head tile kernel llama-q8-gemv-gemmini-lmhead (M=2048,K=2048), reference_cycles in loop/kernels.py, roofline 262144 (4 MiB / 16 B per cycle). Documentation only - not read by llama_project.py, whose MeasuredDB.load keys one Measurement per kernel name and this entry's top-level work_measured/shape stay pinned to the n1 (M=512) basis; see this entry's `source` for the conversion."
+    },
+    {
+     "shape": {
+      "M": 2048,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 4194304,
+     "cycles": 659142,
+     "device": "gemmini",
+     "source": "ROUND2 optimized measurement of the DEDICATED lm_head tile kernel llama-q8-gemv-gemmini-lmhead, run_id 20260908-025835-a0cc, 2026-09-08 GENV256D128GemminiShuttleConfig Verilator, self-check PASSED; 740101 -> 659142 cycles (1.123x faster). Documentation only - not read by llama_project.py for the reason given in this entry's top-level `source`."
+    },
+    {
+     "shape": {
+      "M": 2048,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 4194304,
+     "cycles": 740101,
+     "device": "gemmini",
+     "source": "PRE-ROUND3 baseline of the DEDICATED lm_head tile kernel llama-q8-gemv-gemmini-lmhead, unchanged from round2's pristine baseline. Documentation only - not read by llama_project.py."
+    },
+    {
+     "shape": {
+      "M": 2048,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 4194304,
+     "cycles": 635908,
+     "device": "gemmini",
+     "source": "ROUND3 optimized measurement of the DEDICATED lm_head tile kernel llama-q8-gemv-gemmini-lmhead: run_id 20260908-202428-217e (3 iters, aborted by a session-limit 429) restarted as 20260909-052338-b80e (5 iters, seed=best), 2026-09-08/09 GENV256D128GemminiShuttleConfig Verilator, self-check PASSED; 740101 -> 635908 cycles (1.164x faster than baseline, 1.037x faster than round2's 659142). Documentation only - not read by llama_project.py for the reason given in this entry's top-level `source`."
+    },
+    {
+     "shape": {
+      "M": 2048,
+      "K": 2048,
+      "N": 1
+     },
+     "work_measured": 4194304,
+     "cycles": 634507,
+     "device": "gemmini",
+     "source": "ROUND4 optimized measurement of the DEDICATED lm_head tile kernel llama-q8-gemv-gemmini-lmhead, run_id 20260909-200541-dae1, 2026-09-10 GENV256D128GemminiShuttleConfig Verilator, seed=best-of-round3, self-check PASSED; 635908 -> 634507 cycles (1.002x faster than round3's best, 1.165x faster than the original pre-round1 baseline). Documentation only - not read by llama_project.py for the reason given in this entry's top-level `source`."
+    }
+   ],
+   "notes": [
+    "PRE-ROUND1 measured rates against the same 1 MiB of weights:",
+    "  N=1  150339 cycles -> 6.97 B/cycle (44% of the 16 B/cycle DMA peak),",
+    "                        6.97 MAC/cycle (2.7% of the 256 MAC/cycle array)",
+    "  N=16 168367 cycles -> 6.23 B/cycle (39%), 99.6 MAC/cycle (39%)",
+    "The array is ~97% idle at N=1 and that is correct: 15 of every 16 rows",
+    "fed through the 16x16 array are zero padding, and the weights arrive far",
+    "slower than the array can eat them. Decode on this SoC is a memory",
+    "problem, not a compute problem.",
+    "ROUND1 (20260907-043120-a7d0, 2026-09-07): N=1 improved to 132653 cycles.",
+    "ROUND2 conversion: scaled_cycles = round1_cycles(132653) * (lmhead_tile_round2(659142) / lmhead_tile_baseline(740101)) = 132653 * 0.890611 = 118142. See `source` for why this ratio scaling was used instead of substituting the raw M=2048 tile numbers.",
+    "ROUND3 conversion: scaled_cycles = round1_n1_basis(132653) * (lmhead_tile_round3(635908) / lmhead_tile_baseline(740101)) = 132653 * 0.859218 = 113978. Same method as round2 (see that entry's history in additional_measurements), just re-applied with round3's better own-tile ratio (635908 vs round2's 659142).",
+    "ROUND4 (20260909-200541-dae1, 2026-09-10): DEDICATED lm_head tile improved further, 635908 -> 634507 cycles (1.002x faster). Conversion: scaled_cycles = round1_n1_basis(132653) * (lmhead_tile_round4(634507) / lmhead_tile_baseline(740101)) = 132653 * 0.857325 = 113726.72 -> 113727. Same method as round2/round3, re-applied with round4's marginally better own-tile ratio (634507 vs round3's 635908)."
+   ],
+   "round": 4,
+   "run_id": "20260909-200541-dae1"
+  },
+  {
+   "kernel": "lm_head_gemm",
+   "shape": {
+    "M": 128256,
+    "K": 2048,
+    "N": 1
+   },
+   "work_metric": "macs",
+   "work_measured": 262668288,
+   "cycles": null,
+   "overhead_cycles": 0,
+   "device": "gemmini",
+   "source": "TODO: same as lm_head_gemv (prefill emits logits for 1 position)"
+  },
+  {
+   "kernel": "attn_scores",
+   "shape": {
+    "heads": 1,
+    "S": 512,
+    "head_dim": 64,
+    "kv_dtype": "int8",
+    "kv_scale": "per row",
+    "act_dtype": "int8",
+    "acc_dtype": "int32"
+   },
+   "work_metric": "macs",
+   "work_measured": 32768,
+   "cycles": 8233,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "ROUND3 re-run of llama-attn-scores-int8, run_id 20260908-202458-85ab, 2026-09-08 GENV256D128GemminiShuttleConfig Verilator, seed=best-of-round2 (8233), self-check PASSED; NO IMPROVEMENT over round2: 8233 -> 8233 cycles (1.00x, unchanged; iters 1-4 reached 8443/8474/18638/12935, all worse than the seed). Value is confirmed/re-recorded for round3 consistency, not newly optimized.",
+   "additional_measurements": [
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "int8",
+      "kv_scale": "per row",
+      "act_dtype": "int8",
+      "acc_dtype": "int32"
+     },
+     "work_measured": 32768,
+     "cycles": 8233,
+     "device": "saturn",
+     "source": "ROUND2 entry, superseded by ROUND3 in this entry's top level."
+    },
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "int8",
+      "kv_scale": "per row",
+      "act_dtype": "int8",
+      "acc_dtype": "int32"
+     },
+     "work_measured": 32768,
+     "cycles": 8574,
+     "device": "saturn",
+     "source": "ROUND1 entry, superseded by ROUND2 in this entry's top level."
+    },
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "int8",
+      "kv_scale": "per row",
+      "act_dtype": "int8",
+      "acc_dtype": "int32"
+     },
+     "work_measured": 32768,
+     "cycles": 51280,
+     "device": "saturn",
+     "source": "PRE-ROUND1 baseline, loop baseline llama-attn-scores-int8 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, --baseline-only, pristine naive RVV 1.0 kernel (20,524 instructions, IPC 0.40); FULLY QUANTISED, superseded by the round1-optimized 8574 cycle number in this entry's top level (run_id 20260907-043130-fa24, 2026-09-07)."
+    },
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "fp32"
+     },
+     "work_measured": 32768,
+     "cycles": 60147,
+     "device": "saturn",
+     "source": "loop baseline llama-attn-scores 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, --baseline-only, pristine naive RVV 1.0 kernel with an **fp32** K cache (35,884 instructions, IPC 0.60); roofline 8,192 (compute and memory exactly balanced), i.e. 7.3x the floor. Self-check: all 512 scores vs a scalar dot product, 1e-4 relative, PASSED. Kept for comparison only; not optimized in round1."
+    },
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "int8",
+      "kv_scale": "per row (fp32)"
+     },
+     "work_measured": 32768,
+     "cycles": 68571,
+     "device": "saturn",
+     "source": "loop baseline llama-attn-scores-q8kv 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, --baseline-only, pristine naive RVV 1.0 kernel (44,591 instructions, IPC 0.65); int8 K cache with a PER-ROW fp32 dequant scale (kv_bytes=1, matching ModelSpec), q stays fp32. This was the PRE-ROUND1 primary cost-basis entry, before round1 optimized the -int8 (fully quantised) kernel instead; kept here for comparison only, not optimized in round1."
+    }
+   ],
+   "round": 3,
+   "run_id": "20260908-202458-85ab",
+   "notes": [
+    "ROUND2 (20260908-025850-2356, 2026-09-08): improved to 8233 cycles, just above the 8,192 compute/memory-balanced roofline (1.005x the floor).",
+    "ROUND3 (20260908-202458-85ab, 2026-09-08): no further improvement found; still 8233 cycles, 1.005x the 8,192 compute/memory-balanced roofline, unchanged from round2."
+   ]
+  },
+  {
+   "kernel": "attn_pv",
+   "shape": {
+    "heads": 1,
+    "S": 512,
+    "head_dim": 64,
+    "kv_dtype": "int8",
+    "kv_scale": "per row",
+    "act_dtype": "int8",
+    "acc_dtype": "int32"
+   },
+   "work_metric": "macs",
+   "work_measured": 32768,
+   "cycles": 4814,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "ROUND3 inner-loop optimization of llama-attn-pv-int8, run_id 20260908-202513-620b, 2026-09-08 GENV256D128GemminiShuttleConfig Verilator, seed=best-of-round2 (4853), self-check PASSED (exact int32 gate + quantisation L2 gate); 4853 -> 4814 cycles (1.008x faster). Fully quantised int8 V cache (per-row fp32 dequant scale) and int8 probabilities, int32 accumulation. ONE query head (32,768 MACs); the projection multiplies by calls=32 heads x 16 layers.",
+   "additional_measurements": [
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "int8",
+      "kv_scale": "per row",
+      "act_dtype": "int8",
+      "acc_dtype": "int32"
+     },
+     "work_measured": 32768,
+     "cycles": 4853,
+     "device": "saturn",
+     "source": "ROUND2 entry, superseded by ROUND3 in this entry's top level."
+    },
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "int8",
+      "kv_scale": "per row",
+      "act_dtype": "int8",
+      "acc_dtype": "int32"
+     },
+     "work_measured": 32768,
+     "cycles": 4853,
+     "device": "saturn",
+     "source": "ROUND1 entry, superseded by ROUND2 in this entry's top level."
+    },
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "int8",
+      "kv_scale": "per row",
+      "act_dtype": "int8",
+      "acc_dtype": "int32"
+     },
+     "work_measured": 32768,
+     "cycles": 22856,
+     "device": "saturn",
+     "source": "PRE-ROUND1 baseline, loop baseline llama-attn-pv-int8 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, --baseline-only, pristine naive RVV 1.0 kernel (16,877 instructions, IPC 0.74); FULLY QUANTISED, superseded by the round1-optimized 4853 cycle number in this entry's top level (run_id 20260907-043140-2246, 2026-09-07)."
+    },
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "fp32"
+     },
+     "work_measured": 32768,
+     "cycles": 44765,
+     "device": "saturn",
+     "source": "loop baseline llama-attn-pv 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, --baseline-only, pristine naive RVV 1.0 kernel with an **fp32** V cache (37,413 instructions, IPC 0.84); roofline 8,192 (compute and memory exactly balanced), i.e. 5.5x the floor. Self-check: all 64 outputs vs a scalar reduction over the 512 rows, 1e-4 relative, PASSED. Kept for comparison only; not optimized in round1."
+    },
+    {
+     "shape": {
+      "heads": 1,
+      "S": 512,
+      "head_dim": 64,
+      "kv_dtype": "int8",
+      "kv_scale": "per row (fp32)"
+     },
+     "work_measured": 32768,
+     "cycles": 62541,
+     "device": "saturn",
+     "source": "loop baseline llama-attn-pv-q8kv 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, --baseline-only, pristine naive RVV 1.0 kernel (46,632 instructions, IPC 0.75); int8 V cache with a PER-ROW fp32 dequant scale (kv_bytes=1, matching ModelSpec); P stays fp32. This was the PRE-ROUND1 primary cost-basis entry, before round1 optimized the -int8 (fully quantised) kernel instead; kept here for comparison only, not optimized in round1."
+    }
+   ],
+   "round": 3,
+   "run_id": "20260908-202513-620b",
+   "notes": [
+    "ROUND2 (20260908-025905-5427, 2026-09-08): no further improvement found; still 4853 cycles, already 1.7x above the compute floor from round1's search (see round1 notes). Carried forward unchanged.",
+    "ROUND3 (20260908-202513-620b, 2026-09-08): improved to 4814 cycles, first improvement since round1 (round2 had been flat at 4853); still ~1.7x above the compute floor."
+   ]
+  },
+  {
+   "kernel": "rmsnorm",
+   "shape": {
+    "elems": 2048,
+    "note": "hidden_size, one RMSNorm"
+   },
+   "work_metric": "elems",
+   "work_measured": 2048,
+   "cycles": 5454,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "loop baseline llama-rmsnorm 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, --baseline-only, pristine naive RVV 1.0 fp32 kernel (3,896 instructions, IPC 0.71); roofline 1,536, i.e. 3.6x the floor. Self-check: all 2048 outputs vs a scalar double-precision reference, 1e-4 relative, PASSED. fp32 activations, as ModelSpec.acc_bytes=4 assumes."
+  },
+  {
+   "kernel": "rope",
+   "shape": {
+    "elems": 2560,
+    "q": [
+     32,
+     64
+    ],
+    "k": [
+     8,
+     64
+    ],
+    "pos": 511,
+    "theta": 500000
+   },
+   "work_metric": "elems",
+   "work_measured": 2560,
+   "cycles": 4695,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "loop baseline llama-rope 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, --baseline-only, pristine naive RVV 1.0 fp32 kernel (3,565 instructions, IPC 0.76); roofline 1,280, i.e. 3.7x the floor. Self-check: all 2560 rotated elements vs a scalar reference, 1e-4 relative, PASSED. ONE measurement covering BOTH rope calls of a layer (rope_q 2048 elems + rope_k 512 elems = 2560); elems-linear scaling splits it back correctly. cos/sin table is an input (precomputed once per position), not part of the kernel."
+  },
+  {
+   "kernel": "softmax",
+   "shape": {
+    "elems": 512
+   },
+   "work_metric": "elems",
+   "work_measured": 512,
+   "cycles": 1555,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "ROUND3 optimization of llama-softmax, run_id 20260908-202543-fc79, 2026-09-08 GENV256D128GemminiShuttleConfig Verilator, seed=best-of-round2 (1568), self-check PASSED (vs scalar libm expf reference, 1e-4 relative, output sum = 1.0); 1568 -> 1555 cycles (1.008x faster), further below the 2,560 fp32-exp roofline.",
+   "additional_measurements": [
+    {
+     "shape": {
+      "elems": 512
+     },
+     "work_measured": 512,
+     "cycles": 1568,
+     "device": "saturn",
+     "source": "ROUND2 entry, superseded by ROUND3 in this entry's top level."
+    },
+    {
+     "shape": {
+      "elems": 512
+     },
+     "work_measured": 512,
+     "cycles": 1752,
+     "device": "saturn",
+     "source": "ROUND1 entry, superseded by ROUND2 in this entry's top level."
+    }
+   ],
+   "round": 3,
+   "run_id": "20260908-202543-fc79",
+   "notes": [
+    "ROUND2 (20260908-025933-f639, 2026-09-08): improved to 1568 cycles, 0.61x the 2,560 roofline (already below it, as in round1).",
+    "ROUND3 (20260908-202543-fc79, 2026-09-08): improved to 1555 cycles, 0.61x the 2,560 roofline (already below it, as in round1/round2)."
+   ]
+  },
+  {
+   "kernel": "silu_mul",
+   "shape": {
+    "elems": 8192
+   },
+   "work_metric": "elems",
+   "work_measured": 8192,
+   "cycles": 31024,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "ROUND3 inner-loop optimization of llama-silu-mul, run_id 20260908-202528-f504, 2026-09-08 GENV256D128GemminiShuttleConfig Verilator, seed=best-of-round2 (35774), self-check PASSED (512 sampled outputs stride 13 vs scalar libm reference, 1e-4 relative, plus full 8192-elem checksum); 35774 -> 31024 cycles (1.153x faster).",
+   "additional_measurements": [
+    {
+     "shape": {
+      "elems": 8192
+     },
+     "work_measured": 8192,
+     "cycles": 35774,
+     "device": "saturn",
+     "source": "ROUND2 entry, superseded by ROUND3 in this entry's top level."
+    },
+    {
+     "shape": {
+      "elems": 8192
+     },
+     "work_measured": 8192,
+     "cycles": 66811,
+     "device": "saturn",
+     "source": "ROUND1 entry, superseded by ROUND2 in this entry's top level."
+    }
+   ],
+   "round": 3,
+   "run_id": "20260908-202528-f504",
+   "notes": [
+    "ROUND2 (20260908-025919-3d8d, 2026-09-08): improved to 35774 cycles, 5.82x the 6,144 roofline (down from round1's 10.9x).",
+    "ROUND3 (20260908-202528-f504, 2026-09-08): improved to 31024 cycles, 5.06x the 6,144 roofline (down from round2's 5.82x)."
+   ]
+  },
+  {
+   "kernel": "add",
+   "shape": {
+    "elems": 2048
+   },
+   "work_metric": "elems",
+   "work_measured": 2048,
+   "cycles": 3937,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "loop baseline llama-add 2026-09-05 GENV256D128GemminiShuttleConfig Verilator, --baseline-only, pristine naive RVV 1.0 fp32 kernel (2,840 instructions, IPC 0.72); roofline 1,536, i.e. 2.6x the floor. Self-check: all 2048 outputs BIT-EXACT against x0[i]+y[i] (a single fp32 add has one correct answer), PASSED. Pure memory traffic: 24 KiB moved, no reassociation possible."
+  },
+  {
+   "kernel": "embedding",
+   "shape": {
+    "elems": 2048
+   },
+   "work_metric": "elems",
+   "work_measured": 2048,
+   "cycles": null,
+   "overhead_cycles": 0,
+   "device": "saturn",
+   "source": "TODO: row gather from the 128256x2048 table"
+  }
+ ]
+}

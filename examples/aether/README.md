@@ -1,0 +1,336 @@
+# aether — Agentic Kernel Optimization for a Saturn + Gemmini SoC
+
+An inner-loop CHIA experiment in which an LLM agent (Claude) iteratively
+rewrites hand-written RISC-V kernels for a **Saturn** (RVV 1.0 vector core,
+VLEN=256/DLEN=128) + **Gemmini** (16x16 int8 systolic-array RoCC accelerator)
+SoC, using a cycle-accurate Verilator RTL simulation of the real hardware as
+the fitness signal for every edit. The target workload is **Llama-3.2-1B
+int8 decode/prefill** on this SoC: nine kernels covering the model's GEMV/GEMM,
+attention, normalization, and activation phases.
+
+This directory is a curated, read-only snapshot of the research artifacts
+from that loop (code, cluster/config, kernel sources, and results data),
+packaged for reference alongside a paper submission. It is **not** a
+push-button reproduction of the original multi-day run — see
+[Known limitations](#known-limitations) and
+[How to reproduce](#how-to-reproduce) below for exactly what is and isn't
+included.
+
+## What this loop does
+
+One invocation of the loop (`loop/loop.py`) optimizes exactly one kernel
+against one already-built simulator image. Per iteration:
+
+1. The agent edits the one source file it owns (a kernel's compute body —
+   never the sealed test harness, golden-model reference, or self-check).
+2. The driver cross-compiles the kernel and runs the resulting ELF on a
+   Verilator simulation of `GENV256D128GemminiShuttleConfig` (Saturn +
+   Gemmini on one Shuttle tile).
+3. **Correctness is enforced entirely inside the benchmark binary**, not by
+   the loop: each harness generates inputs from a fixed PRNG seed, computes
+   a scalar/golden reference, and calls `exit(1)`/prints `MISMATCH` on any
+   deviation past a stated tolerance. The loop only reads the numbers the
+   binary prints (a cycle count via `rdcycle`, extracted with a per-kernel
+   regex) and whether the process exited zero.
+4. A passing, best-so-far kernel becomes the new baseline for feedback; every
+   attempt (build failure, self-check failure, or a passing measurement) is
+   snapshotted to `out/loop/<run_id>/` and recorded in a SQLite DB
+   (`iters`/`runs` tables).
+5. The loop runs for a fixed iteration budget (`--iters`, default 10) or
+   until a dollar budget is exhausted (`--budget-usd`); there is no automatic
+   convergence detection (see [Corrections history](#corrections-history)
+   and [Known limitations](#known-limitations)).
+
+See `results/paper/methodology.md` for a full, file:line-cited account of
+this process (iteration budget, seeding, cost accounting, timing
+methodology, and threats to validity) as verified against this checkout.
+
+## Hardware configuration
+
+Simulator config: `GENV256D128GemminiShuttleConfig` — Saturn RVV at
+VLEN=256/DLEN=128 stacked with Gemmini's `DefaultGemminiConfig` on one
+Shuttle tile (`docker/add_coexist_config.py`), elaborated through Chisel/
+FIRRTL/Verilator (Chipyard/rocket-chip based).
+
+| Parameter | Value | Source |
+|---|---|---|
+| Gemmini systolic array | 16x16 int8 (256 MAC/cycle peak) | `loop/kernels.py`; `results/evidence/hardware-config-excerpts.md` §5 |
+| Scratchpad / accumulator | 256 KiB / 4 banks; 64 KiB / 2 banks | `loop/kernels.py` |
+| System bus (sbus) width | 128 bit = 16 B/cycle | `docker/add_coexist_config.py` (`WithSystemBusWidth(128)`) |
+| Shuttle tile beat bytes | 16 B | `docker/add_coexist_config.py` (`WithShuttleTileBeatBytes(16)`) |
+| **DRAM-facing bus (mbus) width** | **8 B/cycle** (not 16 — see corrections below) | `loop/kernels.py`; corroborated by measurement, see `results/evidence/hardware-config-excerpts.md` §5 |
+| **L2 MSHR count** | **12** | RTL-elaborated, `results/evidence/hardware-config-excerpts.md` §2 |
+| L2 cache | 512 KiB, 1024 sets, 64 B lines, InclusiveCache | `results/evidence/hardware-config-excerpts.md` §2 |
+| Clock domains (sbus/pbus/fbus/**mbus**/cbus) | **500 MHz** elaborated (cost model assumes 1 GHz) | `results/evidence/hardware-config-excerpts.md` §1 |
+| DRAM timing model | none — `mm_magic_t` (bandwidth-limited, zero-latency), not DRAMSim2 | `results/paper/methodology.md` §6(b) |
+| Address map / L2 client map | see excerpts | `results/evidence/hardware-config-excerpts.md` §3-4 |
+
+Every row above is grounded in `results/evidence/hardware-config-excerpts.md`,
+which reproduces the exact elaboration-log lines (with source file:line
+citations into the original `aether/out/coexist/*.log` files, not copied here
+in full) rather than restating the numbers from memory.
+
+## How to reproduce
+
+**This package does not include the `chipyard`/`rocket-chip`/`saturn`/
+`shuttle`/`gemmini` source checkouts or the container images the loop
+actually runs against** — those live outside `aether/` (chipyard on a
+separate container image, `CHIPYARD_PATH=/home/ray/chipyard`). What follows
+describes the intended flow against those checkouts; treat paths and
+container names as what the original run used, not as verified against a
+fresh clone.
+
+1. **Cluster bring-up.** `cluster/up.sh [yaml]` activates the `chia_env`
+   conda environment, ensures an `ssh-agent` with a forwardable key (needed
+   for the chisel-build container's `git@github.com:ucb-bar/chipyard.git`
+   access), and runs `chia up -y <yaml>`, logging to `out/chia-up-<ts>.log`.
+   It defaults to `cluster/aether-local.yaml`; in this package the same file
+   is named `cluster/cluster.yaml`, so invoke it explicitly:
+   ```bash
+   bash cluster/up.sh cluster/cluster.yaml
+   ```
+2. **Install the project's own Gemmini kernels into the chisel-build
+   container.** `loop/nodes.py`'s Gemmini collateral is read from inside the
+   `chisel-build` container's chipyard tree, which is *not* bind-mounted to
+   this repo — every `chia up` (or container replacement) wipes it. Run:
+   ```bash
+   bash cluster/install-gemmini-kernels.sh [container_name]
+   ```
+   after every `chia up`, or Gemmini kernel builds fail with a missing
+   header. In this package the kernel files it installs live under
+   `kernels/include/` and `kernels/bareMetalC/` (see below) rather than a
+   full `repos/gemmini` checkout — adjust the script's `SRC` path to point
+   at wherever your own `gemmini-rocc-tests` checkout lives.
+3. **Run the loop.** `loop/loop.py`'s actual flags (from its `argparse`
+   definition):
+   ```bash
+   python loop/loop.py --kernel llama-q8-gemv-gemmini-n1 --iters 10
+   ```
+   | Flag | Meaning |
+   |---|---|
+   | `--kernel NAME` | benchmark to optimize (default `vec-sgemv`, a non-Llama sanity kernel; see `loop/kernels.py` for the full `llama-*` registry) |
+   | `--config NAME` | chipyard simulator config (default `GENV256D128GemminiShuttleConfig`) |
+   | `--iters N` | optimization rounds after the baseline (default 10) |
+   | `--baseline-only` | measure the pristine kernel and stop (smoke test) |
+   | `--no-cache` | ignore the on-disk simulator/baseline cache; always rebuild |
+   | `--budget-usd USD` | stop once accumulated LLM cost reaches this |
+   | `--seed RUN_ID\|best` (alias `--seed-run RUN_ID`) | start editing from a previously-optimized kernel instead of the pristine one; iteration 0 stays the pristine baseline so speedups remain comparable |
+4. **Track results.** `loop/ledger.py` joins `out/loop/rounds.json` (which
+   `run_id`s belong to which named round — hand-maintained) against
+   `loop/aether.db`'s `runs`/`iters` tables and `loop/kernels.py`'s
+   `roofline_cycles`, and writes `out/loop/ledger.md` / `ledger.json` — the
+   authoritative per-round cost/iteration/result ledger (`results/loop/`
+   here). `loop/journal.py` does the same at per-*iteration* granularity
+   (one row per `(run_id, iter)`, with each iteration's agent hypothesis
+   pulled from its `agent_NN.txt`/`kernel_NN.h`), writing
+   `out/loop/iterations.md` / `iterations.json`. Both tools are read-only
+   against the DB and rerunnable at any time to regenerate their reports.
+
+## Results summary
+
+Nine kernels, each measured as a single-invocation cycle count (build →
+simulate → self-check → score), against a roofline (`max(compute floor,
+memory floor)`, memory floor computed at the corrected 8 B/cycle mbus rate).
+Source: `results/paper/kernels_final.csv`.
+
+| kernel | baseline (cyc) | final (cyc) | roofline (cyc) | speedup | final/roofline | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `llama-q8-gemv-gemmini-n1` | 150,339 | 132,424 | 131,072 | 1.14x | 1.01x | SOLVED |
+| `llama-q8-gemv-gemmini-n16` | 168,367 | 142,458 | 131,072 | 1.18x | 1.09x | TERMINAL |
+| `llama-q8-gemv-gemmini-lmhead` | 740,101 | 634,507 | 524,288 | 1.17x | 1.21x | SOLVED |
+| `llama-q8-gemm` (prefill) | 146,737 | 137,246 | 131,072 | 1.07x | 1.05x | SOLVED |
+| `llama-attn-scores-int8` | 51,280 | 8,233 | 6,144 | 6.23x | 1.34x | TERMINAL |
+| `llama-attn-pv-int8` | 22,856 | 4,814 | 4,096 | 4.75x | 1.18x | TERMINAL |
+| `llama-silu-mul` | 361,260 | 31,024 | 30,720 | 11.65x | 1.01x | TERMINAL |
+| `llama-softmax` | 21,906 | 1,555 | 1,472 | 14.09x | 1.06x | TERMINAL |
+| `llama-layer-fused-n1` (fused GEMV + 1 attn head) | 206,304 | 179,033 | 140,680 | 1.15x | 1.27x | ACTIVE |
+
+**Geometric-mean speedup across these 9 kernels: 2.76x** (best 14.09x,
+worst 1.07x); 7 of 9 sit within 1.01x-1.34x of their own roofline.
+`SOLVED`/`TERMINAL` means the loop stopped improving it (proven floor or
+abandoned after repeated regressions, respectively — see
+`results/paper/README.md` for the SOLVED/TERMINAL/ACTIVE judgment calls);
+`ACTIVE` (`llama-layer-fused-n1`) had not yet closed its gap to roofline as
+of the last completed round in this snapshot.
+
+> **Note on a number you may have seen elsewhere:** an earlier report
+> (`results/loop/FINAL_REPORT.md`, covering rounds 1-6 only, before
+> `llama-layer-fused-n1` existed) states a **3.08x** geometric-mean speedup
+> over 8 kernels. That number is for a different, smaller kernel set that
+> predates the last three rounds; 2.76x above is computed directly from the
+> current, complete 9-row `results/paper/kernels_final.csv` and is the
+> number to cite going forward.
+
+### Aggregate loop statistics (verified against source)
+
+The claim "10 rounds, 243+ iterations, total cost \$177.76, ~70 hours wall
+time" was checked directly against `results/loop/ledger.json`'s
+per-round rollup (`round1, round2, round2b, round3` through `round9`, plus a
+pre-round1 `smoke` test) rather than transcribed:
+
+| | value |
+|---|---:|
+| Rounds (smoke + round1, round2, round2b, round3-round9) | 11 entries / 10 named optimization rounds |
+| Total iterations | **243** (234 ok / 9 fail, 96.3% success) |
+| Total LLM cost | **$177.76** |
+| Total wall-clock time | **70.3 hours** |
+
+This **matches** the given figures almost exactly (the small
+"243+"/"~70 hours" hedge in the original claim was, if anything,
+conservative). **One important caveat:** at the time this snapshot was cut,
+a **Round 10** (`llama-lmhead-fused-n1`, see `results/loop/round10-prep.md`)
+had been launched (2026-09-17T23:58:34+08:00, `results/loop/round10-launch.sh`)
+but had **not yet produced any completed iterations** — its log
+(`out/loop/round10-llama-lmhead-fused-n1.log`, not copied here) shows only
+Ray/disk-pressure warnings, no iteration results. The 10-round/243-iteration/
+$177.76/70-hour figures above are therefore for rounds 1-9 plus the smoke
+test and **do not include** whatever Round 10 eventually produces.
+`results/loop/round10-prep.md` does document Round 10's baseline measurement
+(648,292 cycles, self-check passed) and its pre-registered analysis, which is
+where the 2.1% figure in Key findings below comes from.
+
+## Key findings
+
+- **Measured DRAM-facing bus (mbus) is 8 B/cycle, not the initially assumed
+  16 B/cycle.** Gemmini's weight/activation traffic crosses rocket-chip's
+  `MemoryBusKey` (`beatBytes = 8`), distinct from the 128-bit (16 B/cycle)
+  system bus width that `WithSystemBusWidth(128)` actually configures. This
+  correction (retracted from 16→8, see below) doubled every memory-bound
+  roofline. See `results/evidence/hardware-config-excerpts.md` §5 and
+  `results/paper/methodology.md` §4.
+- **L2 MSHR count (12) is the real bottleneck for large weight streams, not
+  DRAM bandwidth.** A stride-2048 weight stream saturates the 12-entry MSHR
+  pool on individual L2 banks before it comes anywhere near an 8 B/cycle
+  bandwidth ceiling; `LoadController`'s `nCmds = max_in_flight_mem_reqs/DIM +
+  1 = 2` (only 2 `mvin` commands ever in flight simultaneously) compounds
+  this. See `results/loop/FINAL_REPORT.md` §3(2)-(3) and
+  `results/evidence/hardware-config-excerpts.md` §2.
+- **4-row `mvin` outperforms 16-row `mvin`** for the large-weight lm_head
+  stream (634,507 cycles at 4 rows vs. 695k at 16 rows, per
+  `results/loop/FINAL_REPORT.md` §3(4)) — because wider per-command row
+  counts push more of that command's beats onto the same (≥512 B interleaved)
+  L2 bank, exhausting that bank's share of the 12 MSHRs and forcing
+  serialization; narrower, more numerous commands spread requests across
+  banks instead.
+- **Gemmini/Saturn overlap achieves ~13.2% on the fused decode-layer kernel
+  (`llama-layer-fused-n1`: 206,304 -> 179,033 cycles), but only ~2.1% on the
+  lm_head-sized shape** (`results/loop/round10-prep.md`: perfect overlap of
+  the lm_head kernel's non-stream Saturn work is worth at most 13,785 of
+  648,292 cycles). The mechanism: the fused kernel's companion Saturn work
+  (one attention head, ~28k cycles) is a large fraction of its own 206k-cycle
+  total (13.8%), but the LM head's companion work (RMSNorm + int8 quantize +
+  argmax, ~6.7k cycles) is tiny next to its own 4 MiB weight stream — the
+  companion work does not scale with the weight tile, so there is
+  "almost nothing to hide" at LM-head scale. This is also why the fused
+  kernel's 13.0-13.2% *own-kernel* reduction cannot be extrapolated uniformly
+  to whole-decode-step speedup (see Corrections history, item 3).
+- **A "warm L2" benchmark artifact inflated early throughput numbers.** The
+  harness fills weight buffer `B` in DRAM immediately before the timed
+  kernel call; descending-K (tail-first) streaming orders exploit
+  ~200-260 KiB of that fill still resident in the 512 KiB L2, achieving
+  7.92 B/cycle (99% of nominal mbus peak) — a number that looked like "at
+  the physical limit" but was really "partially warm." A genuinely cold,
+  ascending-order measurement instead gives 7.00 B/cycle (149,757 cycles).
+  See Corrections history and `results/paper/methodology.md` §6(a).
+
+## Corrections history
+
+Three retractions, documented transparently because each one materially
+changed a headline number. All three are cross-checked here against
+`results/loop/FINAL_REPORT.md` §7 ("2026-09-12 審計修正" / audit correction)
+and `results/paper/methodology.md`.
+
+1. **Roofline mbus bandwidth: 16 B/cycle -> 8 B/cycle (2026-09-09).**
+   *What was wrong:* every memory-bound roofline for Gemmini kernels
+   (n1/n16 GEMV, lm_head) was computed assuming the 16 B/cycle system-bus
+   width applied all the way to DRAM.
+   *How caught:* a physical roofline sanity check — Gemmini traffic
+   actually crosses rocket-chip's `MemoryBusKey` (`beatBytes = 8`), a
+   narrower bus than the sbus. Fixing this **doubled** every affected
+   roofline (e.g. n1/n16 GEMV: 65,536 -> 131,072 cycles; lm_head: 262,144 ->
+   524,288), which flipped the interpretation of several kernels from
+   "roughly 2x above the floor" to "already at the floor" — see
+   `results/loop/FINAL_REPORT.md` §3(1).
+
+2. **A "warm-cache" 6.26 tok/s figure, retracted (2026-09-12 audit).**
+   *What was wrong:* the headline N=1 decode throughput of 6.260 tok/s
+   (`results/loop/FINAL_REPORT.md` §2, `results/projections/projection_final.md`)
+   used the `llama-q8-gemv-gemmini-n1` "best" figure of 132,424 cycles,
+   which — per the warm-L2 finding above — is not a purely cold-cache
+   number.
+   *How caught:* re-deriving the cold-ascending-order measurement (149,757
+   cycles = 7.00 B/cycle) and comparing against the theoretical roofline
+   exposed the gap. The corrected N=1 figures
+   (`results/projections/projection_final_v2.md`) are **5.345 tok/s**
+   (cold upper bound, @1 GHz) / **5.014 tok/s** (cold lower bound, @1 GHz)
+   — or 2.673 / 2.507 tok/s at the RTL's actual 500 MHz. A second,
+   related fix in the same audit: the LM-head 634,507-cycle figure had
+   initially been described (in an agent transcript) as consistent with "a
+   DRAMSim2 cold-flow rate," which was independently checked and found
+   false — the simulator invocation never passes `+dramsim`/
+   `+dramsim_ini_dir`, so it runs the untimed `mm_magic_t` DRAM model, not
+   DRAMSim2. The real bottleneck is L2 MSHR/bank contention (see Key
+   findings above), not a DRAM timing model of any kind.
+3. **Uniform-extrapolation overlap projection (+14.9%/+15.2%) retracted to
+   0.3-1.4% (rounds 8-9).** *What was wrong:* `llama-layer-fused-n1`'s own
+   13.0-13.2% cycle reduction (vs. its sequential baseline) was applied
+   *uniformly* to the entire decode step's cycles/token, producing a
+   projected +14.9%/+15.2% end-to-end speedup.
+   *How caught:* comparing device-cycle shares — the fused kernel's own
+   Saturn-device share is 28,372/206,304 = 13.8% of that one kernel,
+   whereas a real decode step's Saturn device share is only 0.7-2.2%
+   (`loop/llama_project.py`'s `DEVICE_MAP`, depending on how attention is
+   device-assigned). A cycle-reduction ratio measured where the relevant
+   device is 13.8% of the workload cannot reproduce anywhere near the same
+   percentage where that device is an order of magnitude smaller a share.
+   The corrected, measured (not extrapolated) whole-decode effect —
+   `loop/llama_project.py --overlap`, using the fused kernel's own 0.611
+   Saturn-exposure ratio — is **0.3% to 1.4%**, not 13-15%. See
+   `results/paper/methodology.md` §6(f).
+
+## Known limitations
+
+- **All end-to-end (tok/s, decode-step) numbers are analytical cost-model
+  projections built by summing per-kernel measured/roofline cycles across a
+  fixed operator graph (`loop/llama_project.py`, `loop/llama_batch_project.py`)
+  — none of them are a directly measured end-to-end run.**
+- **No FireSim run.** All measurements are Verilator RTL simulation, not
+  FPGA-accelerated simulation.
+- **No Linux boot; no llama.cpp end-to-end run.** Kernels are measured as
+  isolated bare-metal invocations against synthetic (PRNG-seeded) data, not
+  inside a running model/OS.
+- **No ASIC synthesis or area data.** `loop/area.py` exists in this codebase
+  but no synthesis/area numbers are part of this results package.
+- **The cost model assumes a uniform 1 GHz clock; the RTL elaborates every
+  relevant bus (sbus/pbus/fbus/mbus/cbus) at 500 MHz** — a 2x-optimistic
+  bias on every wall-clock/tok-s figure (raw cycle counts from Verilator are
+  unaffected, since Verilator counts clock edges, not wall time). See
+  `results/evidence/hardware-config-excerpts.md` §1.
+- **`llama-lmhead-fused-n1` (Round 10) was never actually measured beyond its
+  baseline in this snapshot** — see the Round 10 caveat under
+  [Results summary](#results-summary). Its 648,292-cycle *baseline* was
+  measured and self-check-passed; no optimization iterations had completed
+  when this package was cut.
+- **The N=4/32/64 batch-decode rows in `results/loop/FINAL_REPORT.md` §5 are
+  a linear extrapolation** from exactly two measured points (N=1, N=16,
+  slope 668.9 cycles/column) — no N=4, N=32, or N=64 GEMV tile was ever
+  built or simulated.
+- **`llama-layer-fused-n1` covers only part of one decode layer**: one
+  Gemmini GEMV plus one attention head's QK^T/softmax/probs@V — it excludes
+  RMSNorm, RoPE, the residual add, the SiLU-gated MLP, every attention head
+  beyond the one modeled, the output projection, KV-cache write-back, and
+  all cross-layer/model-level work.
+
+## License / acknowledgments
+
+This example builds on the [CHIA](https://github.com/ucb-bar/chia) framework
+(`ucb-bar/chia`, the upstream this fork tracks as `upstream`) for the
+agentic build/simulate/score inner-loop infrastructure, LLM-node
+orchestration, and cost/profiler plumbing (`chia/models/claude.py`,
+`chia.chipyard.verilator_run_node`, etc., referenced throughout
+`results/paper/methodology.md`) that `loop/` is written against. The
+Saturn RVV core, Shuttle SoC generator, and Gemmini accelerator are from the
+respective `ucb-bar/saturn`, `ucb-bar/shuttle`, and `ucb-bar/gemmini`
+projects. This repository is licensed under the **BSD 3-Clause License**
+(see `LICENSE` at the repository root); this example's added content
+(`examples/aether/`) is distributed under that same license.

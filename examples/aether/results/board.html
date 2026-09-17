@@ -1,0 +1,1566 @@
+<title>AETHER 進度看板</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;700&display=swap">
+<style>
+:root{
+  --ground:#EDEFF3; --surface:#FFFFFF; --surface-2:#F5F7FA;
+  --line:#D3D9E2; --line-soft:#E3E7EE;
+  --ink:#171A20; --ink-2:#3C434E; --muted:#67707C;
+  --accent:#A85D2B; --accent-soft:#F1E3D7;
+  --ok:#2F7A57; --ok-soft:#DEEDE5;
+  --warn:#8A6A18; --warn-soft:#F2E9D1;
+  --risk:#A33030; --risk-soft:#F5DFDF;
+  --idle:#6B7482; --idle-soft:#E6E9EF;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#131720; --surface:#1A1F29; --surface-2:#20262F;
+    --line:#2F3846; --line-soft:#262D38;
+    --ink:#E6E9EE; --ink-2:#B8C0CA; --muted:#8B95A2;
+    --accent:#D98A4E; --accent-soft:#3A2A1C;
+    --ok:#5FBF8F; --ok-soft:#1C3228;
+    --warn:#D6AE55; --warn-soft:#332B17;
+    --risk:#E07E7E; --risk-soft:#3A2121;
+    --idle:#8B95A2; --idle-soft:#262D38;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#131720; --surface:#1A1F29; --surface-2:#20262F;
+  --line:#2F3846; --line-soft:#262D38;
+  --ink:#E6E9EE; --ink-2:#B8C0CA; --muted:#8B95A2;
+  --accent:#D98A4E; --accent-soft:#3A2A1C;
+  --ok:#5FBF8F; --ok-soft:#1C3228;
+  --warn:#D6AE55; --warn-soft:#332B17;
+  --risk:#E07E7E; --risk-soft:#3A2121;
+  --idle:#8B95A2; --idle-soft:#262D38;
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--ground); color:var(--ink);
+  font-family:"IBM Plex Sans","Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;
+  font-size:15px; line-height:1.6; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1120px; margin:0 auto; padding:32px 24px 64px; display:flex; flex-direction:column; gap:28px}
+
+/* ---------- masthead ---------- */
+.mast{display:flex; flex-wrap:wrap; align-items:flex-end; justify-content:space-between; gap:20px;
+  padding-bottom:20px; border-bottom:2px solid var(--ink)}
+.mast-id{display:flex; flex-direction:column; gap:6px}
+.eyebrow{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:11px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--accent); font-weight:500}
+h1{font-family:"IBM Plex Sans Condensed","Noto Sans TC",system-ui,sans-serif; font-weight:700;
+  font-size:clamp(30px,5vw,42px); letter-spacing:-.01em; line-height:1.05; margin:0; text-wrap:balance}
+.tagline{color:var(--ink-2); max-width:60ch; margin:0; font-size:14.5px}
+.mast-meta{display:flex; flex-direction:column; gap:4px; text-align:right;
+  font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:12px; color:var(--muted)}
+.mast-meta b{color:var(--ink); font-weight:500}
+
+/* ---------- shared blocks ---------- */
+.sec{display:flex; flex-direction:column; gap:14px}
+.sec-head{display:flex; align-items:baseline; gap:12px; border-bottom:1px solid var(--line); padding-bottom:8px}
+h2{font-family:"IBM Plex Sans Condensed","Noto Sans TC",system-ui,sans-serif; font-weight:600;
+  font-size:19px; margin:0; letter-spacing:.01em}
+.sec-note{font-size:12.5px; color:var(--muted); margin:0}
+
+.pill{display:inline-flex; align-items:center; gap:5px; padding:2px 9px; border-radius:3px;
+  font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:11px; font-weight:500;
+  letter-spacing:.04em; white-space:nowrap}
+.pill::before{content:""; width:5px; height:5px; border-radius:50%; background:currentColor}
+.p-ok{background:var(--ok-soft); color:var(--ok)}
+.p-run{background:var(--warn-soft); color:var(--warn)}
+.p-idle{background:var(--idle-soft); color:var(--idle)}
+.p-risk{background:var(--risk-soft); color:var(--risk)}
+
+/* ---------- stage rail ---------- */
+.stages{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px}
+.stage{background:var(--surface); border:1px solid var(--line-soft); border-top:3px solid var(--line);
+  border-radius:4px; padding:14px 16px 16px; display:flex; flex-direction:column; gap:9px}
+.stage.on{border-top-color:var(--accent)}
+.stage.done{border-top-color:var(--ok)}
+.stage-n{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:11px; color:var(--muted); letter-spacing:.1em}
+.stage h3{font-family:"IBM Plex Sans Condensed","Noto Sans TC",system-ui,sans-serif;
+  font-size:16px; font-weight:600; margin:0; line-height:1.25}
+.stage p{margin:0; font-size:13px; color:var(--ink-2); line-height:1.5}
+
+/* ---------- ladder ---------- */
+.tablewrap{overflow-x:auto}
+.ladder{width:100%; border-collapse:collapse; font-size:13.5px; background:var(--surface);
+  border:1px solid var(--line-soft); border-radius:4px; overflow:hidden}
+.ladder th,.ladder td{padding:9px 13px; text-align:left; border-bottom:1px solid var(--line-soft)}
+.ladder tr:last-child td{border-bottom:none}
+.ladder th{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:10.5px; letter-spacing:.08em;
+  text-transform:uppercase; color:var(--muted); font-weight:500; background:var(--surface-2)}
+.ladder td.step{font-family:"IBM Plex Mono",ui-monospace,monospace; color:var(--muted); width:30px;
+  font-variant-numeric:tabular-nums}
+.ladder th.c,.ladder td.c{text-align:center; width:104px}
+.mk{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:13px; font-weight:500}
+.mk-ok{color:var(--ok)} .mk-run{color:var(--warn)} .mk-no{color:var(--muted); opacity:.45}
+
+/* ---------- body grid ---------- */
+.cols{display:grid; grid-template-columns:minmax(0,1.55fr) minmax(0,1fr); gap:32px; align-items:start}
+@media (max-width:820px){ .cols{grid-template-columns:1fr; gap:28px} }
+
+/* ---------- log ---------- */
+.day{display:flex; flex-direction:column; gap:10px; margin-bottom:22px}
+.day-hd{display:flex; align-items:center; gap:10px}
+.day-date{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:12.5px; font-weight:500;
+  color:var(--ink); letter-spacing:.02em; font-variant-numeric:tabular-nums}
+.day-rule{flex:1; height:1px; background:var(--line-soft)}
+.day-count{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:11px; color:var(--muted)}
+.entries{list-style:none; margin:0; padding:0 0 0 2px; display:flex; flex-direction:column; gap:2px}
+.entry{display:grid; grid-template-columns:56px 1fr; gap:12px; padding:9px 10px 9px 0;
+  border-bottom:1px solid var(--line-soft)}
+.entry:last-child{border-bottom:none}
+.tag{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:10.5px; letter-spacing:.05em;
+  color:var(--muted); padding-top:3px; text-align:right}
+.t-verify{color:var(--ok)} .t-find{color:var(--accent)} .t-decide{color:var(--warn)}
+.entry-b{display:flex; flex-direction:column; gap:3px; min-width:0}
+.entry-b strong{font-weight:600; font-size:14.5px; line-height:1.4}
+.entry-b span{font-size:13px; color:var(--ink-2); line-height:1.5}
+code{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:12.5px;
+  background:var(--surface-2); border:1px solid var(--line-soft); border-radius:3px; padding:0 4px}
+
+/* ---------- aside ---------- */
+aside{display:flex; flex-direction:column; gap:28px; position:sticky; top:24px}
+@media (max-width:820px){ aside{position:static} }
+.card{background:var(--surface); border:1px solid var(--line-soft); border-radius:4px; overflow:hidden}
+.rows{list-style:none; margin:0; padding:0}
+.rows li{padding:11px 14px; border-bottom:1px solid var(--line-soft); display:flex; flex-direction:column; gap:4px}
+.rows li:last-child{border-bottom:none}
+.rows strong{font-size:13.5px; font-weight:600; line-height:1.4}
+.rows span{font-size:12.5px; color:var(--muted); line-height:1.5}
+.risk-li{border-left:3px solid var(--line); padding-left:11px}
+.risk-li.hi{border-left-color:var(--risk)}
+.risk-li.mid{border-left-color:var(--warn)}
+.kv{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:7px;
+  font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:12px}
+.kv li{display:flex; justify-content:space-between; gap:12px; align-items:baseline}
+.kv b{font-weight:500; color:var(--ink); font-variant-numeric:tabular-nums}
+.kv i{font-style:normal; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.bar{height:4px; background:var(--line-soft); border-radius:2px; overflow:hidden; margin-top:2px}
+.bar>div{height:100%; background:var(--accent)}
+.bar.tight>div{background:var(--risk)}
+
+/* ---------- next ---------- */
+.next{background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--accent);
+  border-radius:4px; padding:16px 18px; display:flex; flex-direction:column; gap:6px}
+.next h2{font-size:17px}
+.next p{margin:0; color:var(--ink-2); font-size:14px; max-width:70ch}
+.next ol{margin:4px 0 0; padding-left:19px; color:var(--ink-2); font-size:14px; display:flex; flex-direction:column; gap:5px}
+.next ol li{max-width:72ch}
+.key{background:var(--accent-soft); border-left:3px solid var(--accent); border-radius:3px;
+  padding:9px 13px; font-size:13.5px; color:var(--ink); line-height:1.55; margin:0}
+
+/* ---------- plan ---------- */
+.legend{display:flex; flex-wrap:wrap; gap:14px; font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:11.5px; color:var(--muted)}
+.legend b{font-weight:500}
+.ok-m{color:var(--ok)} .mid-m{color:var(--warn)} .no-m{color:var(--risk)}
+
+.ov{width:100%; border-collapse:collapse; font-size:13px; background:var(--surface);
+  border:1px solid var(--line-soft); border-radius:4px; overflow:hidden}
+.ov th,.ov td{padding:9px 12px; text-align:left; border-bottom:1px solid var(--line-soft); vertical-align:top}
+.ov tr:last-child td{border-bottom:none}
+.ov th{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:10.5px; letter-spacing:.08em;
+  text-transform:uppercase; color:var(--muted); font-weight:500; background:var(--surface-2)}
+.ov td.sid{font-family:"IBM Plex Mono",ui-monospace,monospace; font-weight:500; color:var(--ink); white-space:nowrap}
+.ov td.stt{white-space:nowrap; width:96px}
+.ov a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--accent-soft)}
+
+.plan{display:flex; flex-direction:column; gap:16px}
+.pcard{background:var(--surface); border:1px solid var(--line-soft); border-left:3px solid var(--line);
+  border-radius:4px; overflow:hidden; scroll-margin-top:20px}
+.pcard.done{border-left-color:var(--ok)}
+.pcard.on{border-left-color:var(--accent)}
+.pcard.blocked{border-left-color:var(--risk)}
+.pcard-hd{display:flex; align-items:center; flex-wrap:wrap; gap:10px;
+  padding:11px 16px; background:var(--surface-2); border-bottom:1px solid var(--line-soft)}
+.pcard-id{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:11px; letter-spacing:.1em;
+  color:var(--muted); font-weight:500}
+.pcard-hd h3{font-family:"IBM Plex Sans Condensed","Noto Sans TC",system-ui,sans-serif;
+  font-size:16px; font-weight:600; margin:0; flex:1; min-width:180px; line-height:1.3}
+.pbody{display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,1fr) minmax(0,1.1fr)}
+@media (max-width:900px){ .pbody{grid-template-columns:1fr} }
+.pblk{padding:13px 16px 15px; border-right:1px solid var(--line-soft); min-width:0}
+.pblk:last-child{border-right:none}
+@media (max-width:900px){
+  .pblk{border-right:none; border-bottom:1px solid var(--line-soft)}
+  .pblk:last-child{border-bottom:none}
+}
+.pblk h4{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:10.5px; letter-spacing:.08em;
+  text-transform:uppercase; color:var(--muted); font-weight:500; margin:0 0 8px}
+.pblk ul{margin:0; padding-left:17px; display:flex; flex-direction:column; gap:5px;
+  font-size:13px; color:var(--ink-2); line-height:1.5}
+.pblk p{margin:0 0 8px; font-size:13px; color:var(--ink-2); line-height:1.5}
+.flow{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:11.5px; line-height:1.7;
+  background:var(--surface-2); border:1px solid var(--line-soft); border-radius:3px;
+  padding:8px 10px; color:var(--ink-2); overflow-x:auto; white-space:nowrap; margin:0 0 8px}
+.files{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:7px}
+.files li{display:grid; grid-template-columns:14px minmax(0,1fr); gap:8px; align-items:start}
+.files .m{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:12.5px; line-height:1.45}
+.files .fb{min-width:0; display:flex; flex-direction:column; gap:1px}
+.files code{font-size:11.5px; word-break:break-all; background:none; border:none; padding:0; color:var(--ink)}
+.files em{font-style:normal; font-size:11.5px; color:var(--muted); line-height:1.45}
+
+/* ---------- loop diagram + node inventory ---------- */
+pre.mermaid{background:var(--surface); border:1px solid var(--line-soft); border-radius:4px;
+  padding:18px 14px; margin:0; overflow-x:auto; text-align:center; line-height:1.4}
+.nt{width:100%; border-collapse:collapse; font-size:12.5px; background:var(--surface);
+  border:1px solid var(--line-soft); border-radius:4px; overflow:hidden}
+.nt th,.nt td{padding:8px 11px; text-align:left; border-bottom:1px solid var(--line-soft); vertical-align:top}
+.nt tr:last-child td{border-bottom:none}
+.nt th{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:10px; letter-spacing:.08em;
+  text-transform:uppercase; color:var(--muted); font-weight:500; background:var(--surface-2)}
+.nt td.nid{font-family:"IBM Plex Mono",ui-monospace,monospace; font-weight:500; color:var(--ink);
+  white-space:nowrap; font-size:12px}
+.nt th.st,.nt td.st{text-align:center; width:38px}
+.nt td.st{font-size:14px}
+.nt code{font-size:11px; word-break:break-word}
+.nt tr.grouprow td{background:var(--surface-2); font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:10.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent); font-weight:500}
+.ov td.stt.mk{text-align:center; width:44px; font-size:14px}
+.ov td.sid.stt{text-align:center}
+
+ /* ---------- final section ---------- */
+.ladder td.num,.ladder th.num{text-align:right; font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-variant-numeric:tabular-nums; white-space:nowrap}
+.ladder td.num{font-size:12.5px}
+.ladder td.why{font-size:12.5px; color:var(--ink-2)}
+.kbig{display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px}
+.kbig div{background:var(--surface); border:1px solid var(--line-soft); border-top:3px solid var(--accent);
+  border-radius:4px; padding:12px 14px}
+.kbig b{display:block; font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:22px;
+  font-weight:500; color:var(--ink); letter-spacing:-.01em}
+.kbig span{display:block; font-size:12px; color:var(--muted); margin-top:2px; line-height:1.45}
+.findings{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px}
+.findings li{padding:9px 0; border-bottom:1px solid var(--line-soft); font-size:13.5px; color:var(--ink-2); line-height:1.55}
+.findings li:last-child{border-bottom:none}
+.findings b{color:var(--ink); font-weight:600}
+</style>
+
+<div class="wrap">
+
+  <header class="mast">
+    <div class="mast-id">
+      <div class="eyebrow">A³ Workshop · CHIA Hackathon · Proposal 1</div>
+      <h1>AETHER</h1>
+      <p class="tagline">在 Chipyard 上整合 Saturn（RVV 1.0）與 Gemmini（RoCC）的異質 RISC-V SoC，用 CHIA agentic loop 協同優化硬體微架構、組語 kernel 與 llama.cpp runtime。</p>
+    </div>
+    <div class="mast-meta">
+      <div>更新 <b>2026-09-11</b></div>
+      <div>階段 <b>CHIA loop 六輪完成 · kernel 到頂</b></div>
+      <div>已用 <b>$149.09</b> / $1,500</div>
+    </div>
+  </header>
+
+  <section class="sec">
+    <div class="sec-head">
+      <h2>四階段狀態</h2>
+      <p class="sec-note">依 proposal 的 Methodology 順序，前一階段未收斂不進下一階段</p>
+    </div>
+    <div class="stages">
+      <article class="stage done">
+        <div class="stage-n">STEP 01</div>
+        <h3>SoC 整合與基礎 ISA 驗證</h3>
+        <span class="pill p-ok">完成</span>
+        <p>Saturn 與 Gemmini <b>共存 config</b> 已成立（<code>GENV256D128GemminiShuttleConfig</code> / <code>...CosimConfig</code>），零 Scala 原始碼改動、注入在 image 內。sgemv 4277 與純 Shuttle 相同、tiled_matmul_ws rc=0、Gemmini cosim 2,360,330 commits 0 mismatch、Shuttle RVV cosim 0 mismatch。純量 <code>matmul</code> 仍是 1 小時 timeout（非失敗）。</p>
+      </article>
+      <article class="stage on">
+        <div class="stage-n">STEP 02</div>
+        <h3>Operator 協同設計與 Spike 驗證</h3>
+        <span class="pill p-run">進行中</span>
+        <p>Golden model 就緒（libgemmini + Spike RVV），Saturn 側 sgemv／softmax harness 可用。缺 Gemmini kernel harness 與 RMSNorm／RoPE —— 詳見 <a href="#s2" style="color:var(--accent)">S2</a>。</p>
+      </article>
+      <article class="stage">
+        <div class="stage-n">STEP 03</div>
+        <h3>FireSim 全系統部署</h3>
+        <span class="pill p-idle">未開始</span>
+        <p>目前無 FPGA 資源，改走 Verilator metasim 驗 Linux + llama.cpp 堆疊。</p>
+      </article>
+      <article class="stage">
+        <div class="stage-n">STEP 04</div>
+        <h3>CHIA 雙層優化迴圈</h3>
+        <span class="pill p-idle">未開始</span>
+        <p>Inner loop（kernel 優化）已端到端跑通；Outer loop 的五個零件（可呼叫的 inner、config 產生器＋pre-check、設計點樹 DB、params.h 重編＋Gemmini harness、面積 proxy）今日全部補齊，但還沒有一支 <code>loop/outer.py</code> 把它們串成一個會轉的迴圈。節點級盤點見上方<a href="#plan" style="color:var(--accent)">CHIA 雙層 agentic loop</a>。</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="sec">
+    <div class="sec-head">
+      <h2>驗證階梯</h2>
+      <p class="sec-note">elaborate 通過不等於能動 —— 到第 3 階才算硬體真的執行過指令</p>
+    </div>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead>
+          <tr><th class="step"></th><th>階段</th><th class="c">Saturn</th><th class="c">Gemmini</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="step">1</td><td>Chisel → Verilog elaborate</td>
+              <td class="c"><span class="mk mk-ok">✓ 36–41s</span></td>
+              <td class="c"><span class="mk mk-no">—</span></td></tr>
+          <tr><td class="step">2</td><td>Verilog → Verilator 模擬器</td>
+              <td class="c"><span class="mk mk-ok">✓ 72s</span></td>
+              <td class="c"><span class="mk mk-ok">✓</span></td></tr>
+          <tr><td class="step">3</td><td><strong>RTL 上執行測試</strong></td>
+              <td class="c"><span class="mk mk-ok">✓ 117/117</span></td>
+              <td class="c"><span class="mk mk-ok">✓ matmul_ws</span></td></tr>
+          <tr><td class="step">4</td><td>Spike golden model</td>
+              <td class="c"><span class="mk mk-no">—</span></td>
+              <td class="c"><span class="mk mk-ok">✓ 54 test</span></td></tr>
+          <tr><td class="step">5</td><td>Cosim lockstep 比對</td>
+              <td class="c"><span class="mk mk-ok">✓ Rocket</span><br><span class="mk mk-ok">✓ Shuttle</span></td>
+              <td class="c"><span class="mk mk-ok">✓ ws/tiled_ws</span><br><span class="mk mk-run">◐ plain matmul 逾時</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="sec" id="plan">
+    <div class="sec-head">
+      <h2>CHIA 雙層 agentic loop</h2>
+      <p class="sec-note">proposal Step 4 的 inner／outer 兩層，攤成節點圖。內圈已跑通，外圈整層待建 —— 這一節才是專案的主體，下面的「依賴」只是餵它的材料</p>
+    </div>
+
+    <pre class="mermaid">
+flowchart LR
+  subgraph IN["INNER LOOP · kernel 優化（硬體固定）· 已跑通"]
+    direction TB
+    L0["L0 種子基準<br/>pristine kernel → mcycle"]
+    L1["L1 agent 提案<br/>ClaudeCodeLLM + kernel_bash"]
+    L2["L2 封印重組<br/>stage_workspace"]
+    L3["L3 kernel 編譯<br/>RiscvBuildNode"]
+    L4["L4 RTL 模擬<br/>VerilatorRunNode"]
+    L5["L5 正確性閘<br/>benchmark 自檢 / cosim"]
+    L6["L6 metric mapper<br/>mcycle · minstret"]
+    L7["L7 回饋 + best 還原<br/>ledger + roofline %"]
+    L8["L8 DB + 成本<br/>aether.db · CostMeter"]
+    L0 --> L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7 --> L1
+    L6 --> L8
+  end
+  subgraph OUT["OUTER LOOP · 硬體微架構 DSE · 整層待建"]
+    direction TB
+    H1["H1 parent sampling<br/>從設計點樹挑父代"]
+    H2["H2 agent 提參數<br/>mesh · sp · FIFO · VLEN/DLEN"]
+    H3["H3 合法性 pre-check"]
+    H4["H4 config 產生器<br/>參數 → Scala"]
+    H5["H5 ChiselBuildNode<br/>elaborate + verilate"]
+    H6["H6 gemmini_params.h<br/>+ libgemmini 重編"]
+    H8["H8 面積／時序<br/>Sky130SynNode 或 proxy"]
+    H9["H9 多目標評分 + Pareto<br/>寫回設計點樹"]
+    H1 --> H2 --> H3 --> H4 --> H5 --> H6
+    H8 --> H9 --> H1
+  end
+  H6 -- "模擬器 + params.h 交棒" --> L0
+  L8 -- "best cycle · N 輪耗盡" --> H8
+
+  classDef ok fill:#DEEDE5,stroke:#2F7A57,stroke-width:1.5px,color:#14291F;
+  classDef mid fill:#F4EAD0,stroke:#8A6A18,stroke-width:1.5px,color:#2C2410;
+  classDef no fill:#F6DEDE,stroke:#A33030,stroke-width:1.5px,color:#301414;
+  class L0,L1,L2,L3,L6,L7,H3,H4,H6 ok;
+  class L4,L5,L8,H1,H5,H8 mid;
+  class H2,H9 no;
+    </pre>
+
+    <p class="legend">
+      <span><b class="ok-m">✓</b> 已實作且跑過</span>
+      <span><b class="mid-m">◐</b> 有東西但不完整／未接上</span>
+      <span><b class="no-m">✗</b> 缺，要寫</span>
+      <span>對照 CHIA 現成流程：<code>examples/timing_opt</code>（parent→child 分支樹）與 ChampSim evolve flow（<code>build_fn</code>／<code>run_fn</code>／<code>result_mapper_fn</code>）</span>
+    </p>
+
+
+    <div class="tablewrap">
+      <table class="nt">
+        <thead>
+          <tr><th>一個合格 CHIA loop 該有的元件</th><th>CHIA 的做法（出處）</th><th class="st">內圈</th><th class="st">外圈</th><th>AETHER 現況</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="nid">driver + profiler</td><td><code>ray.init(address="auto")</code> + <code>start_collector()</code>；<code>chia job submit</code> 提交</td><td class="st mk mk-ok">✓</td><td class="st mk mk-no">✗</td><td>已有；但目前直接跑 <code>python loop.py</code>，未用 <code>chia job submit</code>／<code>chia viz-profile</code></td></tr>
+          <tr><td class="nid">agent 節點</td><td><code>ClaudeCodeLLM</code> 掛 <code>resources={"llm":1}</code>，<code>resume_session</code> 串起多輪</td><td class="st mk mk-ok">✓</td><td class="st mk mk-no">✗</td><td>內圈的 kernel agent 已在跑；硬體參數 agent 完全沒有</td></tr>
+          <tr><td class="nid">與 agent 分離的 evaluator 鏈</td><td>build → run → 比對，agent 改不到（<code>ChiselBuildNode</code>／<code>RiscvBuildNode</code>／<code>VerilatorRunNode</code>）</td><td class="st mk mk-ok">✓</td><td class="st mk mk-no">✗</td><td>內圈的封印機制做得比多數 example 嚴（每輪從原始副本重組）</td></tr>
+          <tr><td class="nid">correctness gate 先於 quality metric</td><td>titan：判官早於被告；timing_opt：verilator 過了才看 slack</td><td class="st mk mk-run">◐</td><td class="st mk mk-no">✗</td><td>靠 benchmark 自檢，<code>vec-dotprod</code> 是假自檢；已驗證的 cosim 沒接進 loop</td></tr>
+          <tr><td class="nid">DB 是代與代之間的記憶</td><td>子類化 <code>SQLiteNode</code>，<code>pin_to_current_node=True</code>，schema 帶 <code>parent_id</code> + diff + fitness（<code>gem5_align/alignment_db.py</code>、<code>timing_opt/db.py</code>）</td><td class="st mk mk-run">◐</td><td class="st mk mk-run">◐</td><td><code>loop/db.py</code> 新增 <code>design_points</code> 表，<code>iters</code> 增加 <code>design_point_id</code>／<code>parent_id</code>／<code>diff</code>／<code>fitness</code>／<code>status</code>；<code>SQLiteNode</code> 慣例是<b>照抄</b>而非繼承（要能在沒有 Ray 時也能跑），<code>database</code> ray 資源仍未真正掛上</td></tr>
+          <tr><td class="nid">agent 讀得到 DB</td><td><code>spawn_query_tool()</code> 產一個唯讀 SQL MCP tool 給 agent 自己查歷史</td><td class="st mk mk-ok">✓</td><td class="st mk mk-run">◐</td><td>透過 CHIA <code>SQLiteQueryTool</code> 加上 <code>aether_db_query</code>／<code>aether_db_schema</code> 兩個 MCP tool（<code>AETHER_DB_TOOL=0</code> 可關）；工具已就緒，外圈 agent 要等 driver 接線後才會真的用到它</td></tr>
+          <tr><td class="nid">parent sampling（演化選擇）</td><td><code>db.top_k_entries(2)</code> → <code>random.choice</code>，再 <code>restore_state(parent)</code> 完整重建父代（<code>gem5_align_loop.py</code>）</td><td class="st mk mk-no">✗</td><td class="st mk mk-run">◐</td><td><code>loop/db.py</code> 的 <code>sample_parent()</code> 已實作 top-k + random、排除失敗設計點；內圈仍是單鏈貪心爬山，不需要這個</td></tr>
+          <tr><td class="nid">便宜的自評工具</td><td>agent 在付昂貴全流程前先 A/B：<code>timing_experiment</code> 子模組合成、gem5_align 的 <code>quick_run</code></td><td class="st mk mk-no">✗</td><td class="st mk mk-no">✗</td><td>沒有。共存 config 單次 sim 899s，這個缺口在外圈會被放大成致命傷</td></tr>
+          <tr><td class="nid">失敗處理 / debug retry</td><td>build 或 run 失敗 → 同 session <code>debug_failure</code> agent 修，重試上限；耗盡則不寫進選擇池</td><td class="st mk mk-run">◐</td><td class="st mk mk-no">✗</td><td>失敗會被格式化成回饋餵回去，但沒有專門的 debug agent、沒有 <code>chia_wait</code>／重試，node 掛掉無復原路徑；<code>sample_parent()</code> 已會排除失敗設計點</td></tr>
+          <tr><td class="nid">迭代 / 預算 / 收斂控制</td><td><code>MAX_ITERS</code>、wall-clock deadline，或 <code>while inflight</code> + 平行度 = min(可用 worker, MAX_PARALLEL)</td><td class="st mk mk-run">◐</td><td class="st mk mk-no">✗</td><td>新增 <code>--budget-usd</code>；但沒有收斂判定、沒有平行度（16 個 verilator slot 用 1 個）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="sec-note" style="margin-top:-4px">結論：<b>內圈是一條結構正確但單線的 CHIA loop</b>（agent／evaluator 分離、封印、profiler、成本計量都對），缺的是 CHIA 標準的<b>記憶與選擇</b>（<code>SQLiteNode</code> + <code>parent_id</code> + parent sampling + 唯讀 query tool）。<b>外圈則是整層不存在</b> —— proposal Step 4 的兩層裡，目前只有一層。</p>
+
+    <div class="sec-head" style="margin-top:10px">
+      <h2>節點清單</h2>
+      <p class="sec-note">每個節點：做什麼、對應哪個 CHIA node 與 ray 資源、輸入輸出、還缺什麼檔案</p>
+    </div>
+
+    <div class="tablewrap">
+      <table class="nt">
+        <thead>
+          <tr><th>節點</th><th>做什麼</th><th>CHIA node ／ 資源</th><th>輸入 → 輸出</th><th class="st">狀態</th><th>缺什麼檔案</th></tr>
+        </thead>
+        <tbody>
+          <tr class="grouprow"><td colspan="6">Inner loop — 硬體固定，agent 只能動一個 kernel 檔</td></tr>
+          <tr><td class="nid">L0 種子基準</td>
+              <td>用未改動的 kernel 跑一次，當成 iter 0 與所有回饋的分母</td>
+              <td><code>collateral.pristine_kernel</code> → <code>_attempt</code>；快取 <code>_cache/baseline-*.pkl</code></td>
+              <td>registry entry → <code>Measurement(4277, 1706)</code></td>
+              <td class="st mk mk-ok">✓</td>
+              <td>—</td></tr>
+          <tr><td class="nid">L1 agent 提案</td>
+              <td>單一 resumed session 讀回饋、改 kernel；強制先寫 HYPOTHESIS／CHANGE／EXPECTED</td>
+              <td><code>ClaudeCodeLLM</code>（opus, <code>--effort high</code>）+ <code>BashTool("kernel_bash")</code>；<code>llm:1</code></td>
+              <td>prompt + ledger → 容器內被改過的 <code>.S</code></td>
+              <td class="st mk mk-ok">✓</td>
+              <td>—</td></tr>
+          <tr><td class="nid">L2 封印重組</td>
+              <td>每輪把 16 個檔從原始副本重鋪，只讀回 agent 那一個檔；封印是機制不是 prompt</td>
+              <td><code>@ChiaFunction</code> <code>stage_workspace</code> ／ <code>read_kernel</code>；<code>riscv_build:0.05</code></td>
+              <td>agent workspace → 乾淨 build inputs</td>
+              <td class="st mk mk-ok">✓</td>
+              <td>—</td></tr>
+          <tr><td class="nid">L3 kernel 編譯</td>
+              <td>cross-compile 成 baremetal ELF（build_fn 的角色）</td>
+              <td><code>RiscvBuildNode.build_program</code>；<code>riscv_build:1</code></td>
+              <td>sealed sources → ELF ／ build_failure</td>
+              <td class="st mk mk-ok">✓</td>
+              <td>—</td></tr>
+          <tr><td class="nid">L4 RTL 模擬</td>
+              <td>把 ELF 丟進已建好的 Verilator 模擬器（run_fn 的角色）</td>
+              <td><code>VerilatorRunNode.run</code>；<code>verilator_run:1</code>（配置 16，實用 1）</td>
+              <td>ELF + 快取的 <code>BuildArtifact</code> → sim log</td>
+              <td class="st mk mk-run">◐</td>
+              <td>候選 fan-out：<code>placement_group</code> + <code>ThreadPoolExecutor</code>（抄 <code>gem5_align_loop.py</code>）；共存 config 單次 899s，串列跑不動 DSE</td></tr>
+          <tr><td class="nid" id="s2">L5 正確性閘</td>
+              <td>錯答案必須擋下來，否則 reward 是假的</td>
+              <td>benchmark 自檢 exit code；cosim 走 <code>VerilatorRunNode</code> + <code>+cospike-extension</code></td>
+              <td>sim log → pass ／ incorrect</td>
+              <td class="st mk mk-run">◐</td>
+              <td><code>vec-dotprod</code> 的 <code>main</code> 無條件回 0＝假自檢；cosim 已驗證但沒接進 loop（<code>constants.py</code> 註解「cospike is broken on Shuttle」已過時）</td></tr>
+          <tr><td class="nid">L6 metric mapper</td>
+              <td>從 log regex 出 cycle，換成 fitness（result_mapper_fn 的角色）</td>
+              <td><code>nodes.measure</code> + registry 的 <code>cycle_re</code>／<code>metric_agg</code></td>
+              <td>sim log → <code>Measurement(ok, kind, cycles, instret)</code></td>
+              <td class="st mk mk-ok">✓</td>
+              <td>—</td></tr>
+          <tr><td class="nid">L7 回饋</td>
+              <td>%-vs-baseline、%-vs-roofline、歷次嘗試帳本；退步時把最佳 kernel 原文回貼</td>
+              <td><code>agent.format_feedback</code> + <code>_ledger()</code>（driver 端）</td>
+              <td>Measurement + history → 下一輪 prompt</td>
+              <td class="st mk mk-ok">✓</td>
+              <td>—</td></tr>
+          <tr><td class="nid">L8 DB ／ 成本</td>
+              <td>每輪的 cycle、token、成本入庫</td>
+              <td><code>loop/db.py</code>（driver 端 SQLite）+ <code>costs.CostMeter</code>（chia profiler）</td>
+              <td>iter 結果 → <code>out/loop/aether.db</code></td>
+              <td class="st mk mk-run">◐</td>
+              <td>①<code>--budget-usd</code> 已加，收斂判定仍無；②<b>agent 讀得到 DB 了</b>：<code>aether_db_query</code>／<code>aether_db_schema</code> MCP tool 已接（CHIA <code>SQLiteQueryTool</code>）；③仍沒用 CHIA 的 <code>SQLiteNode</code>（照抄慣例而非繼承），<code>database</code> ray 資源仍閒置</td></tr>
+
+          <tr class="grouprow"><td colspan="6">Outer loop — agent 動硬體參數，每個設計點呼叫一次 inner loop</td></tr>
+          <tr><td class="nid">H1 parent sampling</td>
+              <td>從設計點樹挑一個父代來衍生，讓搜尋往強的分支長</td>
+              <td>應改用 <code>SQLiteNode</code>（<code>timing_opt/db.py</code> 的 <code>branches</code>／<code>parent_id</code> 模式）；<code>database:1</code></td>
+              <td>設計點樹 → parent 參數 + 其歷史</td>
+              <td class="st mk mk-run">◐</td>
+              <td><code>loop/db.py</code> 已有 <code>design_points</code> 表（<code>parent_id</code>、結構化硬體參數欄位）與 <code>sample_parent()</code>（top-k + random，排除失敗設計點）；但 <code>SQLiteNode</code> 慣例是照抄而非繼承，且還沒有 outer driver 去呼叫它</td></tr>
+          <tr><td class="nid">H2 agent 提參數</td>
+              <td>agent 讀父代的 (cycle, area, slack) 與被否決的組合，提下一組 mesh／scratchpad／FIFO／VLEN／DLEN</td>
+              <td><code>ClaudeCodeLLM</code>；<code>llm:1</code></td>
+              <td>parent 上下文 → 參數 dict</td>
+              <td class="st mk mk-no">✗</td>
+              <td><code>loop/prompts/explore_hw.md</code>（未寫）；<code>prompts/optimize.md</code> 是 kernel 用的，不能沿用。<code>hwconfig.default_grid()</code>／<code>neighbors()</code> 目前只給網格式候選，還不是 LLM 驅動的提案</td></tr>
+          <tr><td class="nid">H3 合法性 pre-check</td>
+              <td>先擋掉不合法組合，別把 30 分鐘的 build 花在必然失敗的點上</td>
+              <td>driver 端純函式，不佔 ray 資源</td>
+              <td>參數 dict → ok ／ reject + 理由（理由要回饋給 H2）</td>
+              <td class="st mk mk-ok">✓</td>
+              <td><code>loop/hwconfig.py</code> 的 <code>HwPoint.legal()</code> 已編碼 DLEN≤VLEN、mesh 與 scratchpad／accumulator bank 對齊等規則，每條都引用 Saturn／Gemmini 原始碼行號；自測通過</td></tr>
+          <tr><td class="nid">H4 config 產生器</td>
+              <td>參數 dict → 一顆具名 Scala config，注入 <code>GemminiConfigs.scala</code></td>
+              <td>應包成 <code>@ChiaFunction</code>，跑在 <code>chipyard:1</code> 上</td>
+              <td>參數 dict → config 名稱</td>
+              <td class="st mk mk-ok">✓</td>
+              <td><code>loop/hwconfig.py</code> 的 <code>render_config()</code>／<code>inject()</code> 把 <code>docker/add_coexist_config.py</code> 從一次性硬編 patch 改造成真正的模板產生器。待決：<code>dma_buswidth</code> 跟著 <code>sbus</code> 走，<code>dlen≥256</code> 也會動到 <code>gemmini_params.h</code>（連動 H6）</td></tr>
+          <tr><td class="nid">H5 ChiselBuild</td>
+              <td>elaborate + verilate 出這個設計點的模擬器</td>
+              <td><code>ChiselBuildNode</code>（<code>BuildTarget.VERILATOR</code>）；<code>chipyard:1</code></td>
+              <td>config 名稱 → <code>BuildArtifact</code></td>
+              <td class="st mk mk-run">◐</td>
+              <td>node 現成且 inner loop 已在用，但只被呼叫一次就快取；<code>chipyard</code> 資源只有 1，多設計點會塞車</td></tr>
+          <tr><td class="nid">H6 params.h 重編</td>
+              <td>硬體一換，<code>gemmini_params.h</code> 與 <code>libgemmini.so</code> 都要跟著重編，否則 kernel 與 golden model 都對不上</td>
+              <td>新 <code>@ChiaFunction</code>；<code>riscv_build:1</code></td>
+              <td>elaborate 產物 → 新的 header + <code>.so</code></td>
+              <td class="st mk mk-ok">✓</td>
+              <td><code>loop/nodes.py</code> 的 <code>gemmini_params_rebuild</code> node（重生 <code>gemmini_params.h</code>、可選重編 <code>libgemmini.so</code>、回傳 digest 供快取）已在真 CHIA node 上端到端驗證：verilator 819s，cosim 自檢過，cycles=2803。<code>rebuild_spike=True</code> 路徑尚未實跑過</td></tr>
+          <tr><td class="nid">H7 呼叫 inner</td>
+              <td>每個設計點跑 N 輪 inner loop，取最佳 cycle 當這個點的軟體上限</td>
+              <td>複用 L0–L8 全鏈</td>
+              <td>(模擬器, kernel) → best cycle + 該點成本</td>
+              <td class="st mk mk-run">◐</td>
+              <td><code>loop.py</code> 拆出 <code>build_sim()</code>／<code>run_inner(sim, kernel, iters, *, run_id, out_dir, budget_usd, no_cache, baseline_only, sim_key, meter, design_point_id) -&gt; InnerResult</code>，對 sim／baseline 做 in-process memo（沿用既有 <code>out/loop/_cache</code>），已用 cache-hit <code>--baseline-only</code> smoke 驗證（4277/1706）。缺的是真正發起呼叫的 <code>loop/outer.py</code> —— 這支 driver 本身還不存在</td></tr>
+          <tr><td class="nid" id="s5">H8 面積／時序</td>
+              <td>取回這個設計點的面積與 worst slack，當作 proposal 的「ASIC area／frequency 約束」</td>
+              <td><code>Sky130SynNode</code>（<code>VLSI:1</code>／<code>Syn:0</code>），與 H7 <b>平行</b>發（timing_opt 就是這樣）</td>
+              <td>Verilog → <code>SynthesisResult</code>(area, slack)</td>
+              <td class="st mk mk-run">◐</td>
+              <td>新 <code>loop/area.py</code> 的 <code>estimate_area(params) -&gt; AreaEstimate</code>（含 breakdown）已可跑，但<b>倉庫裡沒有任何真實面積數字</b>（<code>docs/paper.txt</code> 是 CHIA 論文，不是本專案的 synth 結果）——所有係數標記為 GUESS 數量級，只能做相對排序；<code>read_synth_area()</code> stub 已備好，換真 <code>Sky130SynNode</code> 時接上即可</td></tr>
+          <tr><td class="nid">H9 多目標評分</td>
+              <td>把 (cycle, area, slack) 合成分數與 Pareto front，寫回設計點樹供 H1 取樣</td>
+              <td>driver 端；寫入 <code>SQLiteNode</code></td>
+              <td>inner best + synth → 設計點 row + Pareto</td>
+              <td class="st mk mk-no">✗</td>
+              <td>評分函數未定（timing_opt 用 Iron Law 的 freq×IPC 乘積，AETHER 對應的是 tokens/s × 面積約束）；Pareto 繪圖未寫</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="sec-head" style="margin-top:10px">
+      <h2>迴圈的依賴</h2>
+      <p class="sec-note">不是階段，是餵給上面節點的材料 —— 缺了哪一項，對應的節點就轉不動</p>
+    </div>
+
+    <div class="tablewrap">
+      <table class="ov">
+        <thead>
+          <tr><th class="stt">狀態</th><th>依賴項</th><th>餵給哪個節點</th><th>現況</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="stt mk mk-ok">✓</td><td class="sid">cluster + 單一 image</td><td>全部</td>
+              <td><code>cluster/aether-local.yaml</code> + <code>up.sh</code>：1 head + 9 workers，<code>chipyard 1</code>／<code>llm 4</code>／<code>verilator_run 16</code>／<code>riscv_build 4</code>／<code>database 2</code>。三個修補與共存 config 已烘進 <code>chia-chisel-build-aether-cosim:local</code></td></tr>
+          <tr><td class="stt mk mk-ok">✓</td><td class="sid">固定硬體基準點</td><td>L0 · H5 的第一個設計點</td>
+              <td><code>GENV256D128GemminiShuttleConfig</code>／<code>...CosimConfig</code> 零 Scala 改動注入；sgemv 4277 與純 Shuttle 相同、Gemmini cosim 2,360,330 commits 0 mismatch</td></tr>
+          <tr><td class="stt mk mk-ok">✓</td><td class="sid">Saturn kernel harness</td><td>L3 · L5 · L6</td>
+              <td><code>loop/kernels.py</code> registry：<code>vec-sgemv</code>（4277）、<code>vec-softmax</code>（31769）可用。新增 kernel＝加一個 <code>Kernel(...)</code>，其餘檔案不動</td></tr>
+          <tr><td class="stt mk mk-run">◐</td><td class="sid">Spike golden model</td><td>L5</td>
+              <td><code>libgemmini.so</code> 在 image 的 <code>$RISCV/lib</code>，54 個 directed test 通過；但參數編死在 defaultConfig —— 是 H6 存在的理由</td></tr>
+          <tr><td class="stt mk mk-ok">✓</td><td class="sid">Gemmini kernel harness</td><td>L3 · L5 · L6</td>
+              <td><code>loop/kernels.py</code> 新增 <code>gemmini-tiled-matmul-ws</code>（agent 可改 <code>include/gemmini.h</code>，benchmark 用 CPU golden 自檢封印，ref 2324 cycles），端到端驗證過 cycles=2803；另有 <code>gemmini-tiled-matmul-ws-fast</code> 僅供 smoke，<b>不可用於計分</b></td></tr>
+          <tr><td class="stt mk mk-no">✗</td><td class="sid">RMSNorm ／ RoPE kernel</td><td>L3（proposal Step 2 明列）</td>
+              <td>benchmarks 樹裡沒有對應項</td></tr>
+          <tr><td class="stt mk mk-no">✗</td><td class="sid">Linux + llama.cpp metasim</td><td>交付物的 tokens/s</td>
+              <td>取代 FireSim 的降級路線。<code>FireMarshalNode</code> 在 <code>chia/chipyard/</code> 現成但完全未接；<code>repos/llama.cpp</code> 未 clone；驗收公式整段未定 —— <b>待使用者決定</b></td></tr>
+          <tr><td class="stt mk mk-no">✗</td><td class="sid"><code>vlsi</code> worker</td><td>H8</td>
+              <td><code>aether-local.yaml</code> 刻意未含（註解寫「Step 4 才需要」）；本機 <code>which genus</code> 找不到 —— <b>待使用者確認</b> license，否則走 proxy</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="sec-head" style="margin-top:10px">
+      <h2>Hackathon 交付物對照</h2>
+      <p class="sec-note">proposal 只有 Overview／Methodology／Expected Results／Cost 四節，沒有評分表 —— 交付物就是 Expected Results 這段字</p>
+    </div>
+
+    <div class="tablewrap">
+      <table class="ov">
+        <thead>
+          <tr><th>Proposal 承諾</th><th>由哪個迴圈元件產出</th><th class="stt">狀態</th><th>差距</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="sid">開源 Saturn+Gemmini SoC</td><td>H4 → H5</td><td class="stt mk mk-run">◐</td>
+              <td>單一共存 config 已成立並跑過 cosim，但沒有參數化產生器，交不出「一族」設計點</td></tr>
+          <tr><td class="sid">Linux + llama.cpp on FireSim</td><td>依賴：FireMarshal + VerilatorRun</td><td class="stt mk mk-no">✗</td>
+              <td>無 FPGA，改 metasim；整條未起步</td></tr>
+          <tr><td class="sid">verified end-to-end tokens/s 加速</td><td>L6 metric mapper 需擴充</td><td class="stt mk mk-no">✗</td>
+              <td>目前 fitness 只有單 kernel 的 <code>mcycle</code>。tokens/s 要嘛用 metasim 實測、要嘛用 cycle 反推 —— 公式未定</td></tr>
+          <tr><td class="sid">Pareto（throughput × 記憶體頻寬 × 面積）</td><td>H8 + H9</td><td class="stt mk mk-no">✗</td>
+              <td>兩個節點都不存在；面積來源（真 synth vs proxy）也未定</td></tr>
+          <tr><td class="sid">vs 純 RVV／scalar baseline</td><td>L0 種子基準</td><td class="stt mk mk-run">◐</td>
+              <td>kernel 層的 baseline 機制已在（每輪都比）；缺的是 SoC 層的對照設計點（純 RVV、純 scalar 各一個 H5 點）</td></tr>
+          <tr><td class="sid">$1,500 預算 · 100 iters × $8</td><td>L8 CostMeter</td><td class="stt mk mk-run">◐</td>
+              <td>計量已入庫，實測 <b>$2.02/iter</b>（遠低於估的 $8）；但沒有 budget cap，外圈開跑前要有停止條件。真正的預算風險在 compute：共存 config 單次 sim 899s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="sec-head" style="margin-top:10px">
+      <h2>迴圈啟動順序</h2>
+      <p class="sec-note">要讓 outer loop 轉<b>第一圈</b>（哪怕只有 2 個設計點、每點 3 輪 inner），最少要補這五項；<b>2026-09-03 五項全數完成</b>，順序不再是阻礙</p>
+    </div>
+
+    <div class="tablewrap">
+      <table class="ov">
+        <thead>
+          <tr><th class="stt">狀態</th><th>補了什麼</th><th>檔案</th><th class="stt">#</th><th>為什麼是它</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="stt mk mk-ok">✓</td><td class="sid">inner loop 可被呼叫</td>
+              <td><code>loop/loop.py</code>：拆出 <code>build_sim()</code> + <code>run_inner(...) -&gt; InnerResult</code>，<code>main()</code> 是它的 CLI 包裝；cache-hit <code>--baseline-only</code> smoke 驗證（4277/1706）</td>
+              <td class="stt">1</td>
+              <td>外圈的 H7 就是「呼叫 inner」。這是所有其他項的前提</td></tr>
+          <tr><td class="stt mk mk-ok">✓</td><td class="sid">H4 config 產生器 + H3 pre-check</td>
+              <td><code>loop/hwconfig.py</code>：<code>HwPoint</code>、<code>legal()</code>（規則引用 Saturn／Gemmini 原始碼行號）、<code>render_config()</code>／<code>inject()</code>（沿用 <code>add_coexist_config.py</code>）、<code>default_grid()</code>（9 個合法點）、<code>neighbors()</code></td>
+              <td class="stt">2</td>
+              <td>沒有它，H2 的參數提案落不了地。待決：<code>dma_buswidth</code> 隨 <code>sbus</code> 走，<code>dlen≥256</code> 也動到 <code>gemmini_params.h</code></td></tr>
+          <tr><td class="stt mk mk-ok">✓</td><td class="sid">DB 升級成設計點樹</td>
+              <td><code>loop/db.py</code>：<code>design_points</code> 表、<code>iters</code> 加 <code>design_point_id</code>／<code>parent_id</code>／<code>diff</code>／<code>fitness</code>／<code>status</code>、<code>sample_parent()</code>（top-k+random，排除失敗）；agent 端 <code>aether_db_query</code>／<code>aether_db_schema</code> MCP tool（<code>AETHER_DB_TOOL=0</code> 可關）；<code>out/loop/aether.db</code> 已原地遷移</td>
+              <td class="stt">3</td>
+              <td>H1 與 H9 都靠它；agent 讀得到 DB 這個 CHIA 標準元件也一併補上。<code>SQLiteNode</code> 慣例是照抄，不繼承（要能無 Ray 運作）</td></tr>
+          <tr><td class="stt mk mk-ok">✓</td><td class="sid">H6 params.h／libgemmini 重編 + Gemmini harness</td>
+              <td><code>loop/nodes.py</code> 的 <code>gemmini_params_rebuild</code>（可選重編 <code>.so</code>，回傳 digest 供快取）；<code>loop/kernels.py</code> 的 <code>gemmini-tiled-matmul-ws</code>（agent 改 <code>include/gemmini.h</code>，CPU golden 自檢，ref 2324）與 smoke-only 的 <code>-fast</code> 版本；真 CHIA node 端到端驗證 verilator 819s，cycles=2803</td>
+              <td class="stt">4</td>
+              <td>掃 mesh／scratchpad 卻用 defaultConfig 編的 kernel 與 golden model，量到的數字沒有意義。<code>rebuild_spike=True</code> 路徑尚未實跑</td></tr>
+          <tr><td class="stt mk mk-run">◐</td><td class="sid">H8 面積來源（proxy 先行）</td>
+              <td><code>loop/area.py</code> 的 <code>estimate_area(params) -&gt; AreaEstimate</code>（含 breakdown）＋ <code>read_synth_area()</code> stub</td>
+              <td class="stt">5</td>
+              <td>proposal 的 Pareto 至少要兩個軸；<b>倉庫裡沒有任何真實面積數字</b>，所有係數是 GUESS 數量級，只能相對排序 —— 真 synth 之後直接替換，不影響迴圈結構</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="sec-note" style="margin-top:2px"><b>五項零件全部就緒</b>，但「參數 → build → inner → 記錄 → 取樣下一點」這條線本身還沒有人接——<code>loop/outer.py</code> 尚不存在。剩下要做才能真正轉第一圈：① 寫 <code>loop/outer.py</code> 把 H1–H9 串起來；② 跨設計點的 parent kernel 要能注入新 workspace；③ <code>cache.sim_key()</code> 納入 Gemmini 參數，否則掃參數會誤中舊快取；④ H9 多目標評分公式；⑤ 平行化（多 <code>VerilatorRun</code> slot、L4 fan-out）不在這五項裡 —— 先讓迴圈轉起來，再談轉得快。</p>
+
+  </section>
+
+  <section class="sec">
+    <div class="sec-head">
+      <h2>Llama-3.2-1B kernel 實測</h2>
+      <p class="sec-note">GENV256D128GemminiShuttleConfig，Verilator，baseline-only（0 次 LLM 迭代）—— GEMV／GEMM 4 支 ＋ elementwise 11 支，全數量測、全 PASS，取代 op_inventory 的線性投影</p>
+    </div>
+
+    <div class="tablewrap">
+      <table class="ov">
+        <thead>
+          <tr><th>kernel</th><th>單位</th><th>shape</th><th>cycles</th><th>roofline</th><th>headroom</th><th>模擬秒</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="sid">llama-q8-gemv</td><td>Saturn RVV</td><td><code>y[512]=W[512×2048]·x</code></td><td>621,724</td><td>262,144</td><td>2.37×</td><td>571</td></tr>
+          <tr><td class="sid">llama-q8-gemm</td><td>Gemmini</td><td><code>C[64×256]=A[64×2048]·B</code></td><td>146,737</td><td>131,072</td><td>1.12×</td><td>945</td></tr>
+          <tr><td class="sid">llama-q8-gemv-gemmini-n1</td><td>Gemmini</td><td><code>1×2048×512</code></td><td>150,339</td><td>65,536</td><td>2.29×</td><td>~1124</td></tr>
+          <tr><td class="sid">llama-q8-gemv-gemmini-n16</td><td>Gemmini</td><td><code>16×2048×512</code></td><td>168,367</td><td>65,536</td><td>2.57×</td><td>~1124</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note" style="margin-top:-6px">全部 self-check PASS，<code>.bss</code> &lt; 1KB（權重在程式內生成到 ELF 以外的 DRAM，見 9/5 學到的載入時間教訓）。同 shape 下 Gemmini N=1 GEMV 比 Saturn 快 <b>4.1×</b>（7.0 vs 1.7 B/cycle），N=16 只多 12% cycles，證明 decode GEMV 純粹是權重 DMA bound —— decode 全部 GEMV 走 Gemmini。</p>
+
+    <div class="sec-head" style="margin-top:8px">
+      <h2 style="font-size:16px">Elementwise kernel（Saturn RVV，fp32 activation，decode shape，baseline-only，全 PASS）</h2>
+    </div>
+    <div class="tablewrap">
+      <table class="ov">
+        <thead>
+          <tr><th>kernel</th><th>shape</th><th>cycles</th><th>roofline</th><th>距下限</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="sid">llama-rmsnorm</td><td><code>N=2048</code></td><td>5,454</td><td>1,536</td><td>3.6×</td></tr>
+          <tr><td class="sid">llama-rope</td><td><code>Q32×64+K8×64, pos 511</code></td><td>4,695</td><td>1,280</td><td>3.7×</td></tr>
+          <tr><td class="sid">llama-attn-scores</td><td><code>1 head, S=512, d=64, fp32 KV</code></td><td>60,147</td><td>8,192</td><td>7.3×</td></tr>
+          <tr><td class="sid">llama-attn-scores-q8kv</td><td><code>同上, int8 KV + fp32 q</code></td><td>68,571</td><td>24,576</td><td>2.8×</td></tr>
+          <tr><td class="sid">llama-attn-scores-int8</td><td><code>同上, int8 KV + int8 q</code></td><td>51,280</td><td>8,192</td><td>6.3×</td></tr>
+          <tr><td class="sid">llama-softmax</td><td><code>N=512</code></td><td>21,906</td><td>2,560</td><td>8.6×</td></tr>
+          <tr><td class="sid">llama-attn-pv</td><td><code>1 head, S=512, d=64, fp32 V</code></td><td>44,765</td><td>8,192</td><td>5.5×</td></tr>
+          <tr><td class="sid">llama-attn-pv-q8kv</td><td><code>int8 V + fp32 P</code></td><td>62,541</td><td>24,576</td><td>2.5×</td></tr>
+          <tr><td class="sid">llama-attn-pv-int8</td><td><code>int8 V + int8 P</code></td><td>22,856</td><td>8,192</td><td>2.8×</td></tr>
+          <tr><td class="sid">llama-silu-mul</td><td><code>N=8192</code></td><td>361,260</td><td>~45k</td><td>8×</td></tr>
+          <tr><td class="sid">llama-add</td><td><code>N=2048</code></td><td>3,937</td><td>1,536</td><td>2.6×</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note" style="margin-top:-6px">fp32／q8kv／int8 三版 <code>attn-scores</code> 與 <code>attn-pv</code> 是 KV cache 量化策略的對照實驗，不是三個獨立算子。</p>
+
+    <p class="key"><b>全實測投影（1 GHz，GEMV 走 Gemmini，attention 用 int8 KV 版）：</b>decode S=512 = <b>261.7M cycles/token = 3.8 tok/s</b>（roofline 12.5）；prefill N=64 = <b>16.4M cycles = 61 tok/s</b>（roofline 230）。若切換全 int8 attention：decode 232.5M cycles = 4.3 tok/s（+12.5%）、prefill 14.6M cycles = 68.6 tok/s。</p>
+
+    <p class="sec-note"><b>decode 佔比</b>：Gemmini GEMV 53%、LM head 14%、attn_scores 13%、attn_pv 12%、softmax 4%、silu_mul 2%、其餘 &lt;0.2%。Gemmini 68%／Saturn 32%。</p>
+    <p class="sec-note" style="margin-top:-6px"><b>prefill 佔比</b>：silu_mul 35%、Gemmini GEMM 26%、attn_scores 14%、attn_pv 12%、softmax 4%。</p>
+
+    <div class="sec-head" style="margin-top:8px">
+      <h2 style="font-size:16px">兩個發現</h2>
+    </div>
+    <ol style="margin:0; padding-left:19px; color:var(--ink-2); font-size:14px; display:flex; flex-direction:column; gap:8px">
+      <li>之前「elementwise 只佔 1%」是 roofline×4 的估計，naive RVV baseline 實測佔 decode 32%。inner loop 值得花預算的目標從 1 支變 5 支：<b>Gemmini GEMV</b>（DMA 效率 44%→100%）、<code>attn_scores</code>、<code>attn_pv</code>、<code>softmax</code>、<code>silu_mul</code>（各 5–8× headroom）。</li>
+      <li>KV cache 單邊量化會變慢（int8 KV + fp32 q 比 fp32 慢 14–40%，因每元素多兩個 int8→fp32 轉換，DLEN128 只有 4 lane）；q／P 也量化走整數管線才贏（<code>attn-pv</code> 快 1.96×，量化誤差 rel-L2 0.17%／0.29%，容限 3e-2）。這是 attention contract 的決定，不是 kernel 優化。</li>
+    </ol>
+
+    <p class="key" style="margin-top:8px"><b>流程收穫：</b>kernel 先在本機 docker 的 Spike（<code>--isa=rv64gcv_zvl256b_zfh_zvfh</code>）驗功能再送 Verilator，9 支一次全過。loop 可加這道「Spike 先驗」擋掉錯的 kernel。</p>
+
+    <p class="sec-note" style="margin-top:2px">修掉的坑：<code>run_id</code> 秒級碰撞（加隨機後綴）；<code>llama_project --device</code> 被量測條目覆蓋；baseline cache key 未含 kernel 名（共用可改檔的 kernel 會拿到彼此數字，已把 kernel 名混入 key，舊 baseline <code>.pkl</code> 失效需重量）；<code>constants.py</code> 過時的 cospike 註解已更新。</p>
+
+  </section>
+
+  <section class="sec">
+    <div class="sec-head">
+      <h2>Inner loop Round 1 結果</h2>
+      <p class="sec-note">Fable 5.1，<b>$20.66</b>，3h46m，config <code>GENV256D128GemminiShuttleConfig</code>，5 支平行、費用不設上限全記錄</p>
+    </div>
+
+    <div class="tablewrap">
+      <table class="ov">
+        <thead>
+          <tr><th>kernel</th><th>baseline</th><th>best</th><th>倍數</th><th>iters</th><th>費用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="sid">llama-softmax</td><td>21,906</td><td>1,752</td><td><b>12.5×</b></td><td>4</td><td>$2.94</td></tr>
+          <tr><td class="sid">llama-attn-scores-int8</td><td>51,280</td><td>8,574</td><td><b>6.0×</b></td><td>6</td><td>$3.90</td></tr>
+          <tr><td class="sid">llama-silu-mul</td><td>361,260</td><td>66,811</td><td><b>5.4×</b></td><td>6</td><td>$2.31</td></tr>
+          <tr><td class="sid">llama-attn-pv-int8</td><td>22,856</td><td>4,853</td><td><b>4.7×</b></td><td>6</td><td>$2.77</td></tr>
+          <tr><td class="sid">llama-q8-gemv-gemmini-n1</td><td>150,339</td><td>132,653</td><td><b>1.13×</b></td><td>8</td><td>$8.75</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note" style="margin-top:-6px">全部 best <b>self-check PASS</b>。失敗路徑也驗證過：1 次 <code>build_failed</code>（Gemmini 編譯線缺 RVV intrinsics header，LLM 下一輪改 inline asm 繞過）、1 次 <code>selfcheck_failed</code>（越界預取），兩次皆正確記錄且 run 繼續，未污染 best。</p>
+
+    <p class="sec-note">LLM 主要手法：RVV 向量化、LMUL 1→4/8、累加器常駐暫存器、<code>vfdiv</code>→<code>vfrec7</code>+牛頓迭代、exp 多項式近似+<code>vfmacc</code>、softmax 平移不變性、inline asm 取代 libm。Gemmini GEMV 試了手動分塊、K 掃描順序、host 端預取、CPU 分擔尾端列——搜尋空間已飽和（iter 5/8 起皆空 diff 回退）。</p>
+
+    <p class="key"><b>投影（1 GHz，GEMV 走 Gemmini，attention 全 int8）：</b>decode S=512 從 3.82 → <b>6.04 tok/s（1.58×）</b>（roofline 12.5）；prefill N=64 從 60.9 → <b>138.3 tok/s（2.27×）</b>（roofline 229.7）。</p>
+
+    <div class="tablewrap">
+      <table class="ov">
+        <thead>
+          <tr><th></th><th>decode S=512</th><th>prefill N=64</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="sid">baseline</td><td>3.82 tok/s</td><td>60.9 tok/s</td></tr>
+          <tr><td class="sid">Round 1</td><td><b>6.04 tok/s（1.58×）</b></td><td><b>138.3 tok/s（2.27×）</b></td></tr>
+          <tr><td class="sid">roofline</td><td>12.5 tok/s</td><td>229.7 tok/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note" style="margin-top:-6px">Round 1 後 decode 佔比：<b>Gemmini GEMV 74.4%</b>、LM head 20.1%、attention 兩段合計 4.2%、其餘 &lt;1.2%。</p>
+
+    <p class="sec-note">敏感度：Gemmini GEMV 若到 DMA roofline → decode <b>9.68 tok/s（+1.60×）</b>；若 Saturn 算子全部到 roofline，只剩 +1.04×。<b>下一步唯一有意義的目標是 Gemmini GEMV 的權重 DMA 效率。</b></p>
+
+    <p class="sec-note" style="margin-top:2px"><b>Cluster 共用問題：</b><code>titan_loop.py</code> 用 <code>ray.init(address="auto")</code> 連同一個 6379 head，唯一的 <code>chipyard</code> slot 被其 placement group 佔了 35 分鐘。yaml 裡 head 啟動前有 <code>ray stop</code>，會殺掉本機所有 Ray，兩專案要分開跑需先協調時間。</p>
+
+  </section>
+
+  <section class="sec">
+    <div class="sec-head">
+      <h2>Inner loop Round 2 結果</h2>
+      <p class="sec-note">Fable 5.1，<b>$31.24</b>，2026-09-08 11:00 以 <code>--seed best</code> 重啟（首次啟動於 09-07 晚被 Claude session 限額打斷）→ 15:20 完成，6 個 run</p>
+    </div>
+
+    <div class="tablewrap">
+      <table class="ov">
+        <thead>
+          <tr><th>kernel</th><th>baseline</th><th>round 1</th><th>round 2</th><th>roofline</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="sid">llama-softmax</td><td>1,752</td><td>1,630</td><td><b>1,568</b></td><td>1,472</td></tr>
+          <tr><td class="sid">llama-silu-mul</td><td>66,811</td><td>50,256</td><td><b>35,774</b></td><td>30,720</td></tr>
+          <tr><td class="sid">llama-attn-pv-int8</td><td>4,853</td><td>4,853</td><td>4,853<span class="pill p-idle" style="margin-left:6px">無進展</span></td><td>4,096</td></tr>
+          <tr><td class="sid">llama-attn-scores-int8</td><td>8,574</td><td>8,574</td><td><b>8,233</b></td><td>6,144</td></tr>
+          <tr><td class="sid">llama-q8-gemv-gemmini-n1</td><td>150,339</td><td>132,653</td><td>132,424<span class="pill p-idle" style="margin-left:6px">幾乎沒動</span></td><td>65,536</td></tr>
+          <tr><td class="sid">llama-q8-gemv-gemmini-lmhead <span class="pill p-ok" style="margin-left:6px">新 kernel</span></td><td>740,101</td><td>—</td><td><b>659,142</b></td><td>262,144</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note" style="margin-top:-6px">前四欄的 baseline／round1／round2 是各 kernel 自己 loop 前後的實測 cycles（見 <code>out/llama-profile/projection_round2.md</code>）；<code>lmhead</code> 是 round2 新增、第一次直接量測的獨立 tile kernel（M=2048/K=2048），取代先前用 n1-basis 線性外插的估計值。</p>
+
+    <p class="key"><b>投影（1 GHz，GEMV 走 Gemmini，attention 全 int8）：</b>decode S=512 從 6.04 → <b>6.21 tok/s</b>（roofline 12.54）；prefill N=64 從 138.3 → <b>148.9 tok/s</b>（roofline 229.7）。</p>
+
+    <div class="tablewrap">
+      <table class="ov">
+        <thead>
+          <tr><th></th><th>decode S=512</th><th>prefill N=64</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="sid">Round 1</td><td>6.04 tok/s</td><td>138.3 tok/s</td></tr>
+          <tr><td class="sid">Round 2</td><td><b>6.21 tok/s（1.029×）</b></td><td><b>148.9 tok/s（1.077×）</b></td></tr>
+          <tr><td class="sid">roofline</td><td>12.54 tok/s</td><td>229.7 tok/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="sec-note">Round 2 準備工作：roofline 重新計算、loop 加上 <code>--seed</code>（可從上一輪 best 重啟）、Gemmini 編譯線加 <code>-v</code>、新增 <code>lmhead</code> 獨立 kernel、watchdog 改用 log mtime 判斷卡死（而非只看行程存活）。</p>
+
+    <p class="key" style="margin-top:8px"><b>結論：</b>Saturn 側的 elementwise／attention kernel（softmax、silu_mul、attn_scores）已經很接近 roofline；瓶頸完全在 Gemmini GEMV 的權重 DMA 效率（約 16 B/cycle 理論頻寬的 50%），round 2 對它幾乎沒有進展。下一步需要對 GEMV 給更具體的硬體提示，或考慮硬體側調整（例如把 decode GEMV batch 到 N=16，或提高假設頻寬），單靠 prompt 調校內圈 kernel 已經摸到頂。</p>
+
+  </section>
+
+  <div class="cols">
+
+    <main class="sec">
+      <div class="sec-head">
+        <h2>進度紀錄</h2>
+        <p class="sec-note">新的在上</p>
+      </div>
+
+      <div class="day">
+        <div class="day-hd">
+          <span class="day-date">2026-09-08</span>
+          <span class="day-rule"></span>
+          <span class="day-count">1 則</span>
+        </div>
+        <ul class="entries">
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Inner loop Round 2 收工：decode 6.21 tok/s（1.029×）、prefill 148.9 tok/s（1.077×）</strong>
+              <span>11:00 以 <code>--seed best</code> 從 Round 1 的最佳 kernel 重啟（首次啟動於 9/7 晚被 Claude session 限額打斷），15:20 完成，共 6 個 run，<b>$31.24</b>。softmax／silu-mul／attn-scores-int8 三支繼續縮小與 roofline 的差距，attn-pv-int8 無進展；新增獨立量測的 <code>lmhead</code> kernel（740,101 → 659,142 cycles）。<b>Gemmini GEMV</b>（<code>llama-q8-gemv-gemmini-n1</code>）幾乎沒動（132,653 → 132,424），確認瓶頸卡在權重 DMA 效率（約 50% of 16 B/cycle），已到 prompt 調校的極限。詳見上方「Inner loop Round 2 結果」。</span>
+            </span>
+          </li>
+
+        </ul>
+      </div>
+
+      <div class="day">
+        <div class="day-hd">
+          <span class="day-date">2026-09-07</span>
+          <span class="day-rule"></span>
+          <span class="day-count">3 則</span>
+        </div>
+        <ul class="entries">
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Smoke test 通過，db／工具鏈／計費全正常；查出第一次啟動卡死是別的專案搶了同一個 Ray head</strong>
+              <span><code>llama-softmax</code> 跑 2 iters（<b>Fable 5.1</b>，<code>LLM_MODEL=claude-fable-5-1</code>）：21,906 → 4,312 cycles，<b>$0.65</b>，11 分鐘，db 紀錄、<code>aether_db</code> 工具、self-check、計費全數正常。第一次啟動卡死的根因：同帳號的 <code>hackathon/titan</code> 專案在 02:34 改了 <code>aether/cluster/aether-local.yaml</code> 並重跑 <code>chia up</code>，Ray head 重啟導致本專案的 worker 認證失敗、simulator 變孤兒——見下方「Cluster 共用問題」。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong><code>SIM_CONFIG</code> 預設改為 <code>GENV256D128GemminiShuttleConfig</code></strong>
+              <span>所有 <code>llama-*</code> baseline（9/5 的兩張表）都是在這顆共存 config 上量的，Round 1 沿用同一顆，數字可直接比較。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-decide">決策</span>
+            <span class="entry-b">
+              <strong>Inner loop Round 1 正式開跑：5 支目標 kernel 平行</strong>
+              <span>smoke test 通過後，對 9/5 盤點出的五支目標 kernel（Gemmini GEMV、<code>attn_scores</code>、<code>attn_pv</code>、<code>softmax</code>、<code>silu_mul</code>）同時開 5 支平行 inner loop。LLM 費用不設上限，但每輪全記錄進 <code>aether.db</code>。結果見下方「Inner loop Round 1 結果」。</span>
+            </span>
+          </li>
+
+        </ul>
+      </div>
+
+      <div class="day">
+        <div class="day-hd">
+          <span class="day-date">2026-09-05</span>
+          <span class="day-rule"></span>
+          <span class="day-count">6 則</span>
+        </div>
+        <ul class="entries">
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Llama kernel 實測完成，決定性結論：decode GEMV 全走 Gemmini</strong>
+              <span>四支 kernel 在 <code>GENV256D128GemminiShuttleConfig</code> 上量出 baseline：<code>llama-q8-gemv</code>（Saturn，621,724 cycles，2.37× roofline）、<code>llama-q8-gemm</code>（Gemmini GEMM，146,737，1.12×）、<code>llama-q8-gemv-gemmini-n1</code>／<code>-n16</code>（Gemmini GEMV，150,339／168,367）。同 shape 下 Gemmini N=1 比 Saturn 快 <b>4.1×</b>，N=16 只多 12% cycles，證明純粹是權重 DMA bound。詳見下方新增的「Llama-3.2-1B kernel 實測」表；修正後 decode 投影降到約 5.5 tok/s，先前 111 tok/s 的線性外插是錯的。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Gemmini 共存 config 全 sweep 結案：56 支跑完，54 PASS、2 預期 FAIL</strong>
+              <span>56 支 <code>gemmini-rocc-tests</code> bareMetalC 全數收斂：<b>54 PASS、2 預期 FAIL</b>（<code>matmul_spad</code>／<code>mvin_mvout_spad</code>，需外部 scratchpad，屬上游已知項）。原本 9 支撞 3h timeout 的測試，放寬到 12h 後有 7 支 PASS；<code>conv_perf</code>／<code>conv_dw_perf</code> 真因不是計算量，而是 4MB／8MB 的 static heap 落在 <code>.bss</code>，Verilator 經 TSI 載入清零要數小時，且 bare-metal harness 不吃 argv。把 heap 縮到 256KB、尺寸寫死（batch 1、24×24、16ch、3×3）後兩支皆 PASS（各約 55 分鐘，幾乎全是載入時間）。結果見 <code>out/gemmini-probe/coexist-sweep{,-rerun,-small3}/summary.txt</code>。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">發現</span>
+            <span class="entry-b">
+              <strong>重要教訓：Verilator 載入時間與 ELF 靜態資料量成正比，非計算量</strong>
+              <span>256KB 的 <code>.data</code>+<code>.bss</code> ≈ 50 分鐘載入時間，與程式實際跑多少指令無關。<b>loop 的 kernel 必須把靜態資料壓在 64KB 以下</b>——大矩陣要在程式內用固定種子生成、寫到 ELF 以外的 DRAM 位址，不能靠編譯期塞進 <code>.bss</code>。這條直接影響接下來所有 Llama kernel 的資料佈局設計。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong>Spike 狀態盤點：僅供 cospike lockstep，不單獨跑，不給 cycle 數</strong>
+              <span>容器內 Spike 1.1.1-dev，支援 RVV 1.0（VLEN 用 isa 字串 <code>zvl256b</code> 設定，無 <code>--varch</code>），<code>libgemmini.so</code> 已建好且對應 <code>DIM=16</code>。全專案至今只拿 Spike 做 cospike lockstep 對答案（共存 cosim 0 mismatch），從未單獨跑過，Spike 本身不輸出 cycle 數。<code>constants.py</code> 內「cospike 在 Shuttle 壞掉」的註解已過時，應更新或移除。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-decide">決策</span>
+            <span class="entry-b">
+              <strong>方向決定：先不做 outer loop，專注 inner loop；workload 換成 Llama-3.2-1B decoder layer</strong>
+              <span>使用者定案：outer loop 五項零件已就緒但暫緩接線，力氣全押 inner loop。Workload 從 llama2.c 改為真實 LLM——以 <b>Llama-3.2-1B</b> 的 decoder layer 為 kernel 目標（hidden 2048、FFN 8192、16 層、32 Q heads／8 KV heads、head_dim 64、vocab 128256）。整個模型在 Verilator 跑不了，做法是：盤點一層所有算子 → 每支 kernel 量效能 → 用每 token 呼叫次數投影端到端 tokens/s。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong>三個 subagent 平行推進中：GEMV/GEMM kernel、算子盤點工具、看板更新</strong>
+              <span>(a) <code>llama-q8-gemv</code>（Saturn RVV，K=2048、M tile 512）與 <code>llama-q8-gemm</code>（Gemmini，N=64、K=2048、M=512）兩支 kernel 註冊進 <code>loop/kernels.py</code> 並量 baseline；(b) <code>loop/llama_model.py</code>＋<code>loop/llama_project.py</code> 做算子盤點與投影工具，輸出 <code>out/llama-profile/op_inventory.md</code>；(c) 本看板更新（本則）。</span>
+            </span>
+          </li>
+
+        </ul>
+      </div>
+
+      <div class="day">
+        <div class="day-hd">
+          <span class="day-date">2026-09-04</span>
+          <span class="day-rule"></span>
+          <span class="day-count">2 則</span>
+        </div>
+        <ul class="entries">
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>共存 config 下 Gemmini 指令覆蓋驗證開跑：56 支 <code>gemmini-rocc-tests</code>，33/56 完成、31 PASS</strong>
+              <span>共存 config <code>GENV256D128GemminiShuttleConfig</code>（注入在 image <code>chia-chisel-build-aether-cosim:local</code> 的 <code>generators/gemmini/chipyard/GemminiConfigs.scala</code> 第 71／81 行，由 <code>docker/add_coexist_config.py</code> 產生，diff 見 <code>out/coexist/GemminiConfigs.scala.diff</code>，<code>loop/hwconfig.render_config()</code> 可重現）之上，正用它的 Verilator simulator 跑全部 56 支 <code>gemmini-rocc-tests</code> bareMetalC（14 路平行，單測 3h timeout）。截至目前 <b>33/56 完成：31 PASS、2 FAIL</b>（<code>matmul_spad</code>、<code>mvin_mvout_spad</code>，為上游已知預期失敗）。最慢 <code>conv_with_pool</code> 76 分鐘 PASS。結果見 <code>out/gemmini-probe/coexist-sweep/summary.txt</code>（完成後產生）、逐測 log 在 <code>logs/</code>。9/1 舊 sweep（55 支，53 PASS）早於共存 config 建成，推測是 Gemmini-only config，<b>這次才是共存版的真正驗證</b>。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-decide">決策</span>
+            <span class="entry-b">
+              <strong>llama.cpp 評估結論：不整包移植，改走手寫 kernel microbenchmark 路徑</strong>
+              <span>已 clone 到 <code>aether/repos/llama.cpp</code>，commit <code>0ef4d560</code>（2026-09-03）。工具鏈 gcc 13.2.0 可編 rv64gcv／zvl256b／zvfh，RVV 1.0 intrinsics OK。有用的部分：<code>ggml/src/ggml-cpu/arch/riscv/quants.c</code> 已有 VLEN=256 專用的 q8_0／q4_0 dot-product（Saturn kernel 抄寫來源）；<code>ggml-cpu/spacemit/</code> 示範用 <code>tensor_traits</code> 攔截 <code>MUL_MAT</code> 給矩陣加速器（Gemmini 接法範本）。但 Verilator 約 1.1k cycles/s，cycle 預算：stories260K ≈ 90s/token（可完整生成）；stories15M ≈ 1h/token（只能 demo 幾個 token）；≥0.5B 模型 &gt;12h/token，不可行——llama.cpp 本身的 graph build／scheduler 開銷在小模型上會比算術還大。建議路徑：<b>C</b>（手寫 int8 GEMV(Saturn) + GEMM(Gemmini) microbenchmark，用 stories260K 真實 shape 64×64／64×172／64×512，註冊進 <code>loop/kernels.py</code>）先行；<b>B</b>（llama2.c <code>runq.c</code> 約 900 行做端到端 demo）收尾；<b>A</b>（整包 llama.cpp，45k 行 + pthread／hwprobe shim）否決。尚未動手，待使用者確認。</span>
+            </span>
+          </li>
+
+        </ul>
+      </div>
+
+      <div class="day">
+        <div class="day-hd">
+          <span class="day-date">2026-09-03</span>
+          <span class="day-rule"></span>
+          <span class="day-count">5 則</span>
+        </div>
+        <ul class="entries">
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>外圈五項零件全部補齊：inner 可呼叫、H3/H4、設計點樹 DB、H6+Gemmini harness、H8 proxy</strong>
+              <span><code>loop/loop.py</code> 拆出 <code>build_sim()</code>／<code>run_inner(sim, kernel, iters, *, run_id, out_dir, budget_usd, no_cache, baseline_only, sim_key, meter, design_point_id) -&gt; InnerResult</code>，對既有 <code>out/loop/_cache</code> 做 in-process memo，cache-hit <code>--baseline-only</code> smoke 驗證 4277/1706，新增 <code>--budget-usd</code>。<code>loop/hwconfig.py</code>：<code>HwPoint</code>、<code>legal()</code>（規則引用 Saturn／Gemmini 原始碼行號）、<code>render_config()</code>／<code>inject()</code>（沿用 <code>add_coexist_config.py</code>）、<code>default_grid()</code> 9 個合法點、<code>neighbors()</code>，自測通過。<code>loop/db.py</code> 新增 <code>design_points</code> 表，<code>iters</code> 加 <code>design_point_id</code>／<code>parent_id</code>／<code>diff</code>／<code>fitness</code>／<code>status</code>，<code>sample_parent()</code>（top-k+random，排除失敗），agent 端 <code>aether_db_query</code>／<code>aether_db_schema</code> MCP tool（CHIA <code>SQLiteQueryTool</code>，<code>AETHER_DB_TOOL=0</code> 可關），<code>SQLiteNode</code> 慣例照抄非繼承（需無 Ray 也能跑），<code>out/loop/aether.db</code> 已原地遷移。<code>loop/nodes.py</code> 的 <code>gemmini_params_rebuild</code>（重編 <code>gemmini_params.h</code>／可選 <code>libgemmini.so</code>，回傳 digest 供快取）+ <code>loop/kernels.py</code> 的 <code>gemmini-tiled-matmul-ws</code>（agent 改 <code>include/gemmini.h</code>，CPU golden 自檢封印，ref 2324）與 smoke-only 的 <code>-fast</code> 版本，已在真 CHIA node 端到端驗證：verilator 819s，cosim 自檢過，cycles=2803；<code>rebuild_spike=True</code> 尚未實跑。<code>loop/area.py</code> 的 <code>estimate_area(params) -&gt; AreaEstimate</code>（含 breakdown）＋ <code>read_synth_area()</code> stub —— <b>倉庫裡沒有真實面積數字</b>，係數全標 GUESS 數量級，只能相對排序。仍缺：<code>loop/outer.py</code> 驅動迴圈本身、跨設計點 kernel 注入、<code>cache.sim_key()</code> 納入 Gemmini 參數、多目標評分、平行 <code>VerilatorRun</code> slot。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-decide">決策</span>
+            <span class="entry-b">
+              <strong>看板加上明確的 stage 執行計畫（S0–S6）</strong>
+              <span>把「四階段狀態」的 proposal 視角，展開成可執行的 S0 基礎設施／S1 SoC 整合／S2 kernel 協同設計／S3 metasim／S4a inner loop／S4b 硬體 DSE／S5 面積時序／S6 彙整，每個 stage 標明使用的 CHIA node（<code>ChiselBuildNode</code>／<code>RiscvBuildNode</code>／<code>VerilatorRunNode</code>／<code>ClaudeCodeLLM</code>／<code>Sky130SynNode</code>）、上下游資料流與檔案就緒狀態。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Saturn + Gemmini 共存 config 成立，零 Scala 改動</strong>
+              <span><code>GENV256D128GemminiShuttleConfig</code>／<code>...CosimConfig</code> 由 <code>docker/add_coexist_config.py</code> 注入在 image 內的 <code>generators/gemmini/chipyard/GemminiConfigs.scala</code>（第 71／81 行，diff 見 <code>out/coexist/GemminiConfigs.scala.diff</code>）。<code>out/coexist/summary.txt</code>：elaborate 129s／47s、verilate 59s／58s 全 rc=0；sgemv <b>4277</b>（與純 Shuttle 完全相同，代表掛上 Gemmini 不拖累向量路徑）、daxpy 1750、tiled_matmul_ws rc=0；帶 gemmini extension 的 cosim <b>2,360,330 commits 0 mismatch</b>，Shuttle RVV cosim 亦 0 mismatch。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong>單一 image + <code>cluster/up.sh</code> 一鍵啟動，重啟驗證通過</strong>
+              <span>build worker 換成 <code>chia-chisel-build-aether-cosim:local</code>（<code>docker/AetherCosimDockerfile</code>，把 debug_rob Bug 1／Bug 2、cospike custom-extension、三顆 config 全烘進去）。SSH 掛載改成 <code>-v ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent</code>，沒有 agent 時退回 <code>/dev/null</code> 而不是崩潰。<code>out/chia-up-20260903-002119.log</code>：1 head + 9 workers 全起來，ray 資源表有 <code>chipyard 1.0</code>／<code>llm 4.0</code>／<code>verilator_run 16</code>／<code>riscv_build 4</code>／<code>database 2</code>。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">卡點</span>
+            <span class="entry-b">
+              <strong>共存 config 下 loop baseline 跑通，但單次 sim 慢到 899 秒</strong>
+              <span><code>out/loop-coexist-baseline.log</code>：<code>--config GENV256D128GemminiShuttleConfig --baseline-only</code> 量到 4277／1706，與參考值一致。但 simulator build 181s、單次模擬 899s（純 Shuttle 約 2 分），整輪 18 分鐘。RTL 大了一圈，<b>模擬取代 LLM 成為新瓶頸</b> —— inner loop 的每輪時間估算要重算，也讓「4 個閒置 verilator worker 沒被用到」這件事變得更值錢。</span>
+            </span>
+          </li>
+
+        </ul>
+      </div>
+
+      <div class="day">
+        <div class="day-hd">
+          <span class="day-date">2026-09-02</span>
+          <span class="day-rule"></span>
+          <span class="day-count">13 則</span>
+        </div>
+        <ul class="entries">
+
+          <li class="entry">
+            <span class="tag t-find">發現</span>
+            <span class="entry-b">
+              <strong>結論：vec-sgemv baseline 已達微架構極限，非引導問題</strong>
+              <span>4277 cycle = roofline 的 96%（16384 element-FMA ÷ DLEN=128bit／4 elem-per-cycle ≈ 4096 cycle 硬下限），剩下 181 cycles 是兩段 pass 各自的 prologue／epilogue／drain。三個 session 累計 <b>9 次</b>嘗試，沒有一次低於 4277。判定：<b>這顆 kernel 已經到頂，繼續在同一顆 kernel 上調 prompt 不會再有進展。</b></span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong><code>--iters 4</code> 結果：4304 → 4281 → 4283 → 4277，LLM 自行宣告到頂</strong>
+              <span><code>out/loop-iters4.log</code>：iter1 4304、iter2 4281、iter3 4283、iter4 4277（回到 baseline）。<code>minstret</code> 全程穩定在 1704–1706，不再像先前那樣狂砍 scalar 指令。退步幅度也從舊 prompt 的 +4.9～5.2% 收斂到新 prompt 的 +0.1～0.6%，最後一輪 LLM 主動判斷已達極限並停止提案。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>simulator／baseline 快取驗證有效</strong>
+              <span><code>loop/loop.py --baseline-only</code> 冷啟（無快取）約 2.5–3 分鐘；命中 <code>out/loop/_cache/sim-*.pkl</code>、<code>baseline-*.pkl</code> 後熱啟只要約 1.8 秒，<code>--iters 4</code> 整輪跑 log 也確認 <code>Simulator ... loaded from cache in 0.0s</code>／<code>Baseline loaded from cache in 0.0s</code>。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-decide">決策</span>
+            <span class="entry-b">
+              <strong>重寫 <code>loop/prompts/optimize.md</code>，回饋機制同步升級</strong>
+              <span>新 prompt 補上 DLEN roofline 算法（16384 element-FMA ÷ 4 elem/cycle ≈ 4096 cycle）、已排除方向表（單 pass row-major 重排 +4.9～5.2%、砍 scalar 不影響 mcycle）、Saturn 文件實測事實（load／store／各 FMA pipe 各自 DLEN 寬可互相 chaining；LMUL=8 時 chime=16 已完全蓋掉 4 級 FMA 延遲；Shuttle 的 <code>vsetvli</code> 幾乎免費；strided／indexed 存取會掉到 1 elem/cycle，禁用），並強制每輪先寫 <code>HYPOTHESIS/CHANGE/EXPECTED</code> 三行、退步時把上一輪最佳 kernel 原文回貼給它、每輪回饋都附上歷次嘗試帳本與距 roofline 的百分比。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Gemmini RTL cosim 通過 — matmul_ws／tiled_matmul_ws 皆 PASS</strong>
+              <span><code>out/gemmini-cosim/run2/summary.txt</code>：帶 <code>+cospike-extension=gemmini</code> 的 <code>matmul_ws_ext</code>（rc=0，1977s）與 <code>tiled_matmul_ws_ext</code>（rc=0，1949s）全程無 PC mismatch，確認 Gemmini RTL 真的執行了指令並通過 cosim。純量 <code>matmul_ext</code>／<code>matmul_extlib</code> rc=124 是 1 小時 timeout（逐指令比對太慢，非錯誤）；<code>matmul_noext</code> rc=1 PC mismatch 是預期中的對照組（未載入 gemmini extension）。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Agent 迭代端到端跑通兩次，尚未拉開差距</strong>
+              <span><code>out/loop/20260902-044927/</code>（<code>--iters 2</code>，44.5 分）與 <code>out/loop-iters3.log</code>（<code>--iters 3</code>）皆完整跑完。baseline mcycle=4277／minstret=1706；iters2 最佳 4270/1452（+0.2%）；iters3 三輪 4487/1321、4277/1456、4501/1319，best 仍 4277（+0.0%）。觀察：LLM 持續在減 scalar 指令數（minstret −15～23%），對 mcycle 幾乎無效甚至更慢 —— 瓶頸在向量 load/store 與管線延遲，非指令數，下一步要調整 prompt 引導方向。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">卡點</span>
+            <span class="entry-b">
+              <strong>loop 第一輪空轉根因：跨 container 工具邊界</strong>
+              <span>kernel 檔在 <code>riscv_build</code> container，claude CLI 在 <code>llm</code> container，只能透過 <code>kernel_bash</code> MCP 工具存取。已修 <code>loop/prompts/optimize.md</code>、<code>loop/llm.py</code>（把 kernel inline 進首輪 prompt）與 <code>loop/loop.py</code>，iters3 第一輪已可直接改到 kernel。另加上 simulator build 與 baseline 快取（<code>out/loop/_cache/sim-*.pkl</code>、<code>baseline-*.pkl</code>），<code>--no-cache</code> 可停用。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>最小 loop baseline 跑通</strong>
+              <span><code>python loop/loop.py --baseline-only</code>：<code>GENV256D128ShuttleConfig</code> Verilator build 149s，量到 <code>mcycle=4277</code>、<code>minstret=1706</code>，與參考值一致。產物見 <code>out/loop/20260902-040304/history.json</code> 與 <code>kernel_baseline.S</code>。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Shuttle Cosim Bug 2 修好並驗證</strong>
+              <span>DebugROB DPI 介面向量化後修法固化於 <code>docker/ShuttleCosimFixDockerfile</code> + <code>docker/fix_debug_rob_vec.py</code>。<code>out/shuttle-cosim/shuttle-fixed/</code> 已 ALLDONE：同一顆 ELF 跑 10 次 <code>add10.summary</code> 全 rc=0 且 md5 一致；<code>isa.summary</code> 51/52（唯一失敗 <code>rv64ui-p-ma_data</code> 是已知的 misaligned 項）；<code>bench.summary</code> 的 vec-daxpy／vec-memcpy／vec-strcmp 各跑 3 次全過。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>build 節點 blocker 解除</strong>
+              <span><code>eval $(ssh-agent -s) && ssh-add ~/.ssh/id_rsa && chia up -y cluster/aether-local.yaml</code> 後，ray 資源表出現 <code>chipyard 1.0</code>（見 <code>out/chia-up3.log</code>）。cluster yaml 未改。<code>SSH_AUTH_SOCK</code> 是 per-shell，之後每次 <code>chia up</code> 前都要重做這步，或改 yaml 拿掉 <code>-v $SSH_AUTH_SOCK:/ssh-agent</code>（待定）。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong>必須用 conda env 裡的 ray / chia</strong>
+              <span>系統內建 ray 2.9.1 與 cluster 用的 2.54.0 版本不合，一律改用 <code>~/.conda/envs/chia_env/bin/</code> 下的 ray／chia／python。<code>~/aether</code> 為專案 symlink，未變。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">卡點</span>
+            <span class="entry-b">
+              <strong>叢集 8/9 節點就緒，build 節點被 ssh-agent 卡住</strong>
+              <span>head / database / llm / cosim&times;4 / riscv_build 都 ready，<code>ray status</code> 有 864 CPU。只有 build 節點失敗：本機 <code>SSH_AUTH_SOCK</code> 是空的，CHIA 產生的 <code>docker run -v $SSH_AUTH_SOCK:/ssh-agent</code> 變成 <code>-v :/ssh-agent</code>，docker 回 <code>invalid spec: empty section between colons</code>（exit 125）。所以 <code>chipyard</code> 資源當時還沒出現 —— 已在同日以 ssh-agent 補上解決（見上）。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong>四個 node 的 <code>pull_before_run</code> 全關掉</strong>
+              <span>image 都已在本地，但 <code>True</code> 會讓 30.6GB 的 chisel-build 對 registry 逐層驗證，撞上 600s timeout。之後要用 <code>chia-chisel-build-cosimfix:local</code> 這種純本地 tag 時本來也不能 pull。</span>
+            </span>
+          </li>
+
+        </ul>
+      </div>
+
+      <div class="day">
+        <div class="day-hd">
+          <span class="day-date">2026-09-01</span>
+          <span class="day-rule"></span>
+          <span class="day-count">16 則</span>
+        </div>
+        <ul class="entries">
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Cosim Bug 1 修好並驗證</strong>
+              <span>同一顆 ELF 跑 10 次：未修 <b>5/10</b> → 修好 <b>10/10</b> 且 trace md5 全同。riscv-tests 63 支：<b>41/63 → 62/63</b>（唯一失敗是 Rocket 不支援 misaligned 的已知項）。衍生 image <code>chia-chisel-build-cosimfix:local</code>，build 僅 2.9 秒。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">發現</span>
+            <span class="entry-b">
+              <strong>Gemmini 進 cosim 是可行的</strong>
+              <span><code>cospike_impl.cc</code> 目前沒有載入 spike extension 的路徑，但 hook 點現成、<code>libgemmini.so</code> 也在 image 裡。加 <code>dlopen</code> + <code>register_extension</code> 兩行即可，不是架構性阻礙。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong>最小 loop 寫好（656 行）</strong>
+              <span><code>~/aether/loop/</code>：agent 只能改 <code>vec-sgemv.S</code>，其餘 16 個檔每輪從原始副本重組，封印是機制不是 prompt。硬體固定、模擬器只建一次。另修好 chia 因搬家而失效的 editable 安裝。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Saturn RTL 確認能執行向量指令</strong>
+              <span>riscv-tests <b>129/130</b>、RVV 自檢測試 <b>117/117</b>（39 種指令）、benchmark <code>vec-sgemv</code>／<code>vec-softmax</code>／<code>vec-dotprod</code> 全通過，softmax 對純量 5.7x。覆蓋率 3.8%，未涵蓋 vdiv／mask／segment／MMU。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">發現</span>
+            <span class="entry-b">
+              <strong>迭代成本遠低於預期</strong>
+              <span>Verilator build 全新只要 72 秒（原估幾十分鐘）。改一行 Scala 後完整重建 211 秒，其中 92 秒是 sbt 重打 fat jar。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">發現</span>
+            <span class="entry-b">
+              <strong>Shuttle 的 cospike 不可用</strong>
+              <span>在向量指令之前、bootrom 首條指令就 PC mismatch。已列為最高風險。下一步先用 Rocket 的 Cosim config 做隔離測試 —— 隔日（9/2）已定位為 DebugROB DPI 未向量化並修好，見上方紀錄。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-decide">決策</span>
+            <span class="entry-b">
+              <strong>三項待決事項定案</strong>
+              <span>Host core 用 <b>Shuttle</b>；LLM 用 <b>Claude Code</b>；FireSim 目前<b>無 FPGA 資源</b>，Step 3／4 全走 Verilator metasim。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong>工作區搬到 /share1</strong>
+              <span><code>~/aether</code> 與 <code>~/hackathon</code> 皆為 symlink。home 只剩 114G，大型產物一律放 <code>/share1</code>。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">發現</span>
+            <span class="entry-b">
+              <strong>釐清：elaborate 通過 ≠ 硬體能動</strong>
+              <span>先前兩次 probe 都沒建過 Verilator 模擬器，兩邊 RTL 都還沒執行過任何指令。Gemmini 的 54 個 PASS 是跑在 Spike golden model 上，不是 RTL。已補上驗證階梯追蹤。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Gemmini probe 通過 — Spike golden model 開箱可用</strong>
+              <span><code>libgemmini.so</code> 已由 <code>build-setup.sh</code> 內建在 image 的 <code>$RISCV/lib</code>，Dockerfile 不用改。<code>bareMetalC</code> 56 個 directed test 跑 <b>54 PASS</b>（2 個是上游 Makefile 就排除的）。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-verify">驗證</span>
+            <span class="entry-b">
+              <strong>Saturn probe 通過 — 直接可 elaborate</strong>
+              <span><code>MINV128D64RocketConfig</code> 36 秒、<code>GENV256D128ShuttleConfig</code> 41 秒產出 Verilog。26 個現成 config，<code>CONFIG_PACKAGE=chipyard</code>，靠 build.sbt 的 optionalModules 自動掛載。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">發現</span>
+            <span class="entry-b">
+              <strong>Saturn 不支援 BOOM，host core 必須換</strong>
+              <span>Saturn 只有 Rocket 與 Shuttle 兩份 integration。不能照抄 CHIA <code>riscv_extensions</code> 的 MegaBOOM 設定。Shuttle 的 Tile 同時有 <code>BuildRoCC</code> 與 vector port，兩者不衝突。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong>Clone gemmini / saturn-vectors / shuttle</strong>
+              <span>全部 pin 在 chipyard <code>chia_artifact</code> 的 submodule SHA，與 image 內版本逐一核對一致。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag">環境</span>
+            <span class="entry-b">
+              <strong>磁碟盤點</strong>
+              <span><code>/share1/saves/max410011</code> 可寫、該碟剩 960G，是唯一夠放 rootfs／模型／build 產物的地方。<code>/home</code> 只剩 114G。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-find">發現</span>
+            <span class="entry-b">
+              <strong>CHIA 能力盤點</strong>
+              <span>Chisel build、cosim、riscv-dv、FireMarshal、FireSim、Hammer synth 皆有現成 library node 可複用。Gemmini／Saturn／llama.cpp 相關則全需自建。</span>
+            </span>
+          </li>
+
+          <li class="entry">
+            <span class="tag t-decide">決策</span>
+            <span class="entry-b">
+              <strong>鎖定 Proposal 1（AETHER）先做</strong>
+              <span>Proposal PDF 兩頁為兩個獨立提案；Proposal 2（Titan VME）暫緩。</span>
+            </span>
+          </li>
+
+        </ul>
+      </div>
+    </main>
+
+    <aside>
+
+      <section class="sec">
+        <div class="sec-head"><h2>已定案</h2></div>
+        <div class="card">
+          <ul class="rows">
+            <li>
+              <strong>Host core：Shuttle</strong>
+              <span>Saturn 不支援 BOOM。Shuttle 的 Tile 同時有 RoCC 與 vector port，效能與 edge 定位也較合。</span>
+            </li>
+            <li>
+              <strong>LLM：Claude Code</strong>
+              <span>與 proposal 一致，CHIA 的 <code>chia-claude-code</code> image 現成可用。</span>
+            </li>
+            <li>
+              <strong>FireSim：暫不上板</strong>
+              <span>目前無 FPGA 資源。Step 3／4 改以 Verilator metasim 驗證，效能數字改用 cycle 而非實測 tokens/s。</span>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-head"><h2>待使用者決定（2026-09-07 更新）</h2></div>
+        <div class="card">
+          <ul class="rows">
+            <li>
+              <strong>何時分開 cluster</strong>
+              <span><code>hackathon/titan</code>（同帳號）與 AETHER 共用同一個 Ray head，9/7 已因此卡死一次、Round 1 又被佔走 35 分鐘的 <code>chipyard</code> slot。分開需 aether 改用獨立 port + <code>loop.py</code> 明確指定 <code>address</code>，兩邊協調時間執行。</span>
+            </li>
+            <li>
+              <strong>Round 2 的 Gemmini GEMV 策略</strong>
+              <span>三個方向：①給 LLM 更多硬體資訊（scratchpad banks、DMA 頻寬、mvin 排程）；②開放 Gemmini 編譯線 <code>-march</code> 加 <code>v</code> 讓 Saturn 分擔（Gemmini 7 + Saturn 4 B/cycle，理論 1.5×）；③改動 kernel 介面本身。Round 1 的手動分塊／掃描順序／host 預取已飽和，需要使用者選一條路再開 Round 2。</span>
+            </li>
+            <li>
+              <strong>Cadence Genus license 有無</strong>
+              <span>決定 <a href="#s5" style="color:var(--accent)">S5</a> 走真 Sky130 synth（抄 titan 的 <code>synth_node.py</code>）還是退回 proxy 面積模型。本機 <code>which genus</code> 找不到。</span>
+            </li>
+            <li>
+              <strong>S3 無 FPGA 的替代驗收條件</strong>
+              <span>proposal 的 tokens/s 與 TTFT 無法實測，需要一組以 cycle 反推的公式與可接受的模型大小。目前整段空白。</span>
+            </li>
+            <li>
+              <strong>llama.cpp 的投入程度</strong>
+              <span>要不要真的把 runtime 跑起來，還是只做 operator 層級的數字。<code>repos/llama.cpp</code> 尚未 clone。</span>
+            </li>
+            <li>
+              <strong><code>SIM_CONFIG</code> 是否切共存 config</strong>
+              <span>切了才能在同一顆 SoC 上比較 Saturn 與 Gemmini kernel，但單次 sim 從約 2 分變 899 秒。</span>
+            </li>
+            <li>
+              <strong><code>dma_buswidth</code> 跟隨 <code>sbus</code> 走，還是固定 128 <span class="pill p-idle" style="margin-left:6px">outer 暫緩</span></strong>
+              <span>H4 config 產生器的參數化尚未定這條規則；<code>dlen≥256</code> 也會連動 <code>gemmini_params.h</code>（見 H6）。方向已定先做 inner loop，這條與 outer 掛鉤，暫緩。</span>
+            </li>
+            <li>
+              <strong>proxy 面積模型只能拿來相對排序 <span class="pill p-idle" style="margin-left:6px">outer 暫緩</span></strong>
+              <span><code>loop/area.py</code> 的係數全標 GUESS 數量級，倉庫裡沒有任何真實 synth 數字——H9 的多目標評分在拿到真 <code>Sky130SynNode</code> 結果前，面積軸的絕對值不可信，只能比大小。方向已定先做 inner loop，這條與 outer 掛鉤，暫緩。</span>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-head"><h2>風險</h2></div>
+        <div class="card">
+          <ul class="rows">
+            <li class="risk-li">
+              <strong>Shuttle Cosim Bug 2 — 已修</strong>
+              <span>DebugROB DPI 介面向量化後修好並驗證（isa/add10/bench 全過），修法固化於 <code>docker/ShuttleCosimFixDockerfile</code>。</span>
+            </li>
+            <li class="risk-li mid">
+              <strong><code>gemmini_params.h</code> 重編 — build step 已加，未全面壓測</strong>
+              <span><code>loop/nodes.py</code> 的 <code>gemmini_params_rebuild</code> 已在真 CHIA node 端到端跑過（verilator 819s，cycles=2803）。剩下風險：<code>rebuild_spike=True</code>（順帶重編 <code>libgemmini.so</code>）路徑尚未實跑，且 <code>cache.sim_key()</code> 還沒把 Gemmini 參數納入 key，掃參數時可能誤中舊快取。</span>
+            </li>
+            <li class="risk-li mid">
+              <strong>Cosim 看不到 Gemmini 內部狀態</strong>
+              <span>RoCC 指令不寫回 rd，commit log 只能比 PC 與指令碼。Gemmini 端要靠自我檢查的 directed test 補強。</span>
+            </li>
+            <li class="risk-li mid">
+              <strong>riscv-dv 蓋不到 RVV</strong>
+              <span>免費的 pyflow 只有 base ISA；完整 vector 流程需 Xcelium license。短期先靠 directed test。</span>
+            </li>
+            <li class="risk-li mid">
+              <strong>無 FPGA，端到端數字會打折</strong>
+              <span>Metasim 跑不動完整 llama.cpp 推論，proposal 承諾的 tokens/s 與 TTFT 需改以 cycle 估算或縮小模型。另 proposal 寫的 f1.2xlarge 已被 CHIA 淘汰，只支援 f2。</span>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-head"><h2>迭代成本</h2></div>
+        <div class="card" style="padding:14px">
+          <ul class="kv">
+            <li><i>Verilator build（全新）</i><b>72s</b></li>
+            <li><i>換 config，Scala 未動</i><b>34s</b></li>
+            <li><i>改一行 Scala 後重建</i><b>211s</b></li>
+            <li><i>&nbsp;&nbsp;└ 其中 sbt fat jar</i><b>92s</b></li>
+            <li><i>baseline loop（Shuttle config）</i><b>149s</b></li>
+            <li><i>共存 config build</i><b>181s</b></li>
+            <li><i>共存 config 單次 sim</i><b>899s</b></li>
+            <li><i>熱快取下每輪 optimize loop</i><b>10–15 分</b></li>
+            <li><i>實測每輪 LLM 成本</i><b>$2.02</b></li>
+          </ul>
+          <p style="margin:12px 0 0; font-size:12.5px; color:var(--muted); line-height:1.5">
+            純 Shuttle config 下瓶頸是 LLM 推理（effort=high，每輪 10–15 分）。但切到 Saturn+Gemmini <b>共存 config</b> 後，單次模擬從約 2 分暴增到 <b>899 秒</b>（RTL 大得多），模擬本身反而成為新瓶頸 —— 每輪成本與時間估算需重算。
+            預算面：proposal 抓 $1,500（LLM $900 = 100 iters × $8 + compute $600），實測 <code>aether.db</code> 只有 <b>$2.02/iter</b>，LLM 端遠低於預估。</p>
+        </div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-head"><h2>環境</h2></div>
+        <div class="card" style="padding:14px">
+          <ul class="kv">
+            <li><i>gemmini</i><b>8c3f992</b></li>
+            <li><i>saturn-vectors</i><b>dfe75de</b></li>
+            <li><i>shuttle</i><b>622f08b</b></li>
+            <li><i>chipyard branch</i><b>chia_artifact</b></li>
+          </ul>
+          <p style="margin:12px 0 0; font-size:12.5px; color:var(--muted); line-height:1.5">
+            ray／chia／python 一律用 <code>~/.conda/envs/chia_env/bin/</code> 下的版本（系統內建 ray 2.9.1 與 cluster 2.54.0 不合）。<code>~/aether</code> 為專案 symlink。</p>
+          <div style="margin-top:14px; display:flex; flex-direction:column; gap:9px">
+            <div>
+              <ul class="kv"><li><i>/share1 可用</i><b>960G</b></li></ul>
+              <div class="bar"><div style="width:27%"></div></div>
+            </div>
+            <div>
+              <ul class="kv"><li><i>/ (docker) 可用</i><b>379G</b></li></ul>
+              <div class="bar"><div style="width:45%"></div></div>
+            </div>
+            <div>
+              <ul class="kv"><li><i>/home 可用</i><b>114G</b></li></ul>
+              <div class="bar tight"><div style="width:2%"></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </aside>
+  </div>
+
+  <section class="sec" id="round36">
+    <div class="sec-head">
+      <h2>Round 3–6 與最終結論</h2>
+      <p class="sec-note">2026-09-08 → 09-11 · 完整報告 <code>out/loop/FINAL_REPORT.md</code>、投影 <code>out/llama-profile/projection_final.md</code></p>
+    </div>
+
+    <div class="kbig">
+      <div><b>196</b><span>iterations（187 ok / 9 fail），32 runs</span></div>
+      <div><b>$149.09</b><span>六輪累計成本（ledger.json）</span></div>
+      <div><b>37.97 h</b><span>累計 wall-clock</span></div>
+      <div><b>1.010x</b><span>n1 GEMV / roofline：mbus 峰值 99%</span></div>
+      <div><b>8.62x</b><span>batch 16 的 decode 總吞吐增益</span></div>
+    </div>
+
+    <p class="sec-note" style="margin-top:4px">六輪、196 次 iteration 之後，八顆 kernel 全部收斂到實際硬體上限——<b>kernel 層已無空間</b>。decode 每個 token 必須把 1.236 GB 的 int8 權重整份搬過 8 B/cycle 的 mbus，零重用；20 個 operator 有 18 個在 roofline 上是 memory-bound，端到端 headroom 只剩 1.0x。唯一剩下的槓桿是 batch。</p>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:8px 0 0">六輪摘要</h3>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>輪次</th><th>日期</th><th class="num">wall</th><th>kernel</th><th class="num">iters</th><th class="num">成本</th><th>主要成果</th></tr></thead>
+        <tbody>
+          <tr><td>round1</td><td>09-07</td><td class="num">3h46m</td><td class="why">n1, scores, pv, silu, softmax</td><td class="num">35</td><td class="num">$20.66</td><td class="why">一輪吃掉大部分紅利：softmax 12.5x、scores 6.0x、silu 5.4x、pv 4.7x；n1 GEMV 已達 1.012x roofline</td></tr>
+          <tr><td>round2</td><td>09-07</td><td class="num">36m</td><td class="why">+ lmhead</td><td class="num">17</td><td class="num">$7.37</td><td class="why">開跑 36 分鐘被 session-limit 429 全數中斷；只新增 lmhead kernel（740,101→691,515）</td></tr>
+          <tr><td>round2b</td><td>09-08</td><td class="num">4h21m</td><td class="why">6 顆全部 --seed best 重啟</td><td class="num">41</td><td class="num">$31.25</td><td class="why">n1 GEMV →132,424（此後五輪未被超越）、scores→8,233、lmhead→659,142</td></tr>
+          <tr><td>round3</td><td>09-08→09</td><td class="num">13h34m</td><td class="why">+ q8-gemm（9 runs）</td><td class="num">57</td><td class="num">$61.87</td><td class="why">最貴一輪。pv→4,814、silu→31,024、softmax→1,555、gemm 138,892；兩顆 GEMV 被 429 打斷後人工重啟。輪末抓到 <b>roofline 帶寬 bug（16→8 B/cycle）</b></td></tr>
+          <tr><td>round4</td><td>09-09→10</td><td class="num">8h44m</td><td class="why">lmhead, gemm, n1 探針</td><td class="num">26</td><td class="num">$14.38</td><td class="why">第一輪完全在修正後 8 B/cycle 基準下分析。lmhead→634,507（只快 1.002x）、gemm→137,246；n1 探針確認不動</td></tr>
+          <tr><td>round5</td><td>09-11</td><td class="num">4h22m</td><td class="why">n16-gemv</td><td class="num">11</td><td class="num">$8.00</td><td class="why">攻 batched decode 的 N=16 tile：168,367→<b>142,458</b>（1.182x）</td></tr>
+          <tr><td>round6</td><td>09-11</td><td class="num">2h21m</td><td class="why">n16-gemv 續跑</td><td class="num">6</td><td class="num">$4.92</td><td class="why">4 次 iteration 全部退步，<b>無新 best</b> → 判定到頂，迴圈結束</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:12px 0 0">每顆 kernel 最終結果</h3>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>kernel</th><th class="num">baseline</th><th class="num">final</th><th class="num">floor</th><th class="num">倍數</th><th class="num">/floor</th><th>判定理由</th></tr></thead>
+        <tbody>
+          <tr><td>q8-gemv n1</td><td class="num">150,339</td><td class="num">132,424</td><td class="num">131,072</td><td class="num">1.135x</td><td class="num">1.010x</td><td class="why">實測 7.92 B/cycle＝mbus 峰值 99%，純 DMA-bound</td></tr>
+          <tr><td>q8-gemv n16</td><td class="num">168,367</td><td class="num">142,458</td><td class="num">131,072</td><td class="num">1.182x</td><td class="num">1.087x</td><td class="why">round6 四次嘗試全退步、零新 best</td></tr>
+          <tr><td>q8-gemv lmhead</td><td class="num">740,101</td><td class="num">634,507</td><td class="num">524,288</td><td class="num">1.166x</td><td class="num">1.210x</td><td class="why">那 1.21x 是冷 DRAM 6.61 B/cycle 對名義 8 的差距，不是 kernel 差</td></tr>
+          <tr><td>q8-gemm</td><td class="num">146,737</td><td class="num">137,246</td><td class="num">131,072</td><td class="num">1.069x</td><td class="num">1.047x</td><td class="why">compute-bound，兩輪後只剩 4.7%</td></tr>
+          <tr><td>attn-scores</td><td class="num">51,280</td><td class="num">8,233</td><td class="num">6,144</td><td class="num">6.229x</td><td class="num">1.340x</td><td class="why">Saturn 單一 in-order 向量算術管線，beat 模型已對齊</td></tr>
+          <tr><td>attn-pv</td><td class="num">22,856</td><td class="num">4,814</td><td class="num">4,096</td><td class="num">4.748x</td><td class="num">1.175x</td><td class="why">同上，round3 只再擠出 39 cycles</td></tr>
+          <tr><td>silu-mul</td><td class="num">361,260</td><td class="num">31,024</td><td class="num">30,720</td><td class="num">11.645x</td><td class="num">1.010x</td><td class="why">距地板 1%，Cephes exp 鏈已完全 LMUL=4 管線化</td></tr>
+          <tr><td>softmax</td><td class="num">21,906</td><td class="num">1,555</td><td class="num">1,472</td><td class="num">14.087x</td><td class="num">1.056x</td><td class="why">距地板 5.6%，round3 起未再改善</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:12px 0 0">端到端投影：batch 是唯一槓桿</h3>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>情境</th><th class="num">cycles/token</th><th class="num">tok/s 總吞吐</th><th class="num">tok/s 每序列</th><th class="num">roofline (8 B/cyc)</th><th>說明</th></tr></thead>
+        <tbody>
+          <tr><td>decode N=1</td><td class="num">159.73M</td><td class="num">6.260</td><td class="num">6.260</td><td class="num">6.352</td><td class="why">headroom 1.0x — 每顆 kernel 打到地板也只 +1.5%</td></tr>
+          <tr><td>decode N=16</td><td class="num">18.53M</td><td class="num">53.956</td><td class="num">3.372</td><td class="num">79.283</td><td class="why">8.62x 總吞吐，單序列砍半；唯一有實測 kernel 的 batch 點</td></tr>
+          <tr><td>decode N=32 *</td><td class="num">13.83M</td><td class="num">72.322</td><td class="num">2.260</td><td class="num">128.438</td><td class="why">* tile cycles 為 N=1/N=16 線性外推（估計）；邊際收益已跌到 +34%</td></tr>
+          <tr><td>prefill N=64</td><td class="num">7.39M</td><td class="num">135.312</td><td class="num">—</td><td class="num">209.620</td><td class="why">含未量測的 lm_head_gemm placeholder；apples-to-apples 約 157.2 tok/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note">batch 有效是因為權重只搬一次：N=1→N=16，GEMV tile 只多花 7.6% cycle 卻做 16 倍算術。代價是單序列速率 6.26→3.37 tok/s。break-even：單序列需 ≥5 tok/s 時 batch 上限約 4–5；需 ≥3 tok/s 可到 16–20。<b>batch 後瓶頸會換人</b>——GEMV 佔比從 94.8% 掉到 54.9%，attention（scores+pv+softmax）升到 40.3%，而這三顆分別是 roofline 的 4.02x / 2.35x / 3.04x，<b>真的還有空間</b>。</p>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:12px 0 0">關鍵發現與教訓</h3>
+    <ul class="findings">
+      <li><b>roofline 帶寬 bug（16→8 B/cycle）。</b>Gemmini 走 rocket-chip mbus（<code>MemoryBusParams(beatBytes=8)</code>），實體只有 8 B/cycle。修正讓 memory-bound roofline 全部加倍，把「還有 2x 空間」的錯覺變成「已貼著地板」。</li>
+      <li><b>大權重全冷 DRAM 只有 6.6–7.4 B/cycle。</b>lmhead tile 實測 6.60 B/cycle，8 B/cycle 的名義帶寬在冷流上不可達——這正是 lmhead 卡在「1.21x roofline」的原因（8/6.61＝1.21）。</li>
+      <li><b>LoadController <code>nCmds=2</code>、XactTracker 16 槽。</b><code>max_in_flight_mem_reqs=16</code>、<code>nCmds = 16/DIM + 1 = 2</code>：同時只有兩條 mvin 能展開，1 行的 mvin 因此退化到約 1 B/cycle。</li>
+      <li><b>rows/cmd 曲線非單調。</b>16 行 695k、8 行 690k、cols&gt;64 觸發硬體 assert、rows=1/2 受主機發射率限制 → 「4 行 × 64 B 是 stride-2048 權重流唯一可行點」。在飛請求數 6→649k、8→632k、16→687k，太多反而讓 DRAM row buffer 打架。</li>
+      <li><b>warm L2 尾巴。</b>≈9k cycle 的尾段懲罰完全由 harness 留下的髒行狀態決定；round6 調的已經是量測雜訊層級的東西。</li>
+      <li><b>主機 RoCC 命令 ≈10.7 cycle/條</b>（原假設 20–52）。lmhead 的 ~33,000 條命令在 636k cycle 內每 19 cycle 一條，已貼著發射率上限。</li>
+      <li><b>Saturn 分攤不可行。</b>Gemmini 串 896 KiB + Saturn 從 L2 讀 128 KiB 暖尾巴，比 Gemmini 自己串完整 1 MiB 還慢——兩者共用同一條 tile-egress/L2/DRAM 路徑，任何主機記憶體流量都是淨負。</li>
+      <li><b>harness printf 修正（2026-09-11，round5 前落地）。</b>printf 走 HTIF 成本高到吃掉整個量測，探針 iteration 只能刻意放棄分數，而探針數字跑完就消失。修正：<code>loop/loop.py</code> 每個 iteration 另存 <code>out/loop/&lt;run&gt;/simlog_NN.txt</code>；<code>loop/llm.py</code> 新增 <code>_benchmark_stdout_tail</code>，讓 <b>通過的</b> iteration 的 feedback 也附「=== benchmark stdout (tail) ===」（<code>PROBE</code> 前綴行）；測試 <code>loop/tests/test_llm_feedback.py</code>（4 passed）。效果：round5 的 <code>agent_04/05/09/10.txt</code> 可直接引用 simlog 的 PROBE 數字（T2−T3＝11,207、A2048_cold 5,593），round4 以前的探針數字則全部遺失。</li>
+      <li><b>教訓：429 中斷</b>（round2 全滅、round3 兩顆 GEMV 被打斷）靠 <code>--seed best</code> 續跑救回；<b>watchdog 時區誤判</b>（把 "resets 5pm America/Los_Angeles" 當本地時間）導致自動重啟失效、改人工重啟；<b>根碟被 Ray spill 塞爆</b>，緊急搬到 /share1；<b>探針數字只活在 agent 對話裡</b>（DB 只存 fitness），已於 round5 前用 simlog + stdout tail 修正，round4 以前的只能靠 grep 撈回。</li>
+      <li><b>教訓：成本分布極不均。</b>round3 一輪燒 $61.87（41.5%）只換到 1.0003x 端到端改善；n1 一顆 kernel 累計 $48.99 卻從 round2b 之後就沒動過。收斂偵測該自動化——round4 用 $1.83 的 2-iteration 探針確認一顆 kernel 沒動，才是正確做法。</li>
+    </ul>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:16px 0 0">審計修正（09-12）</h3>
+    <p class="sec-note">2026-09-12 · 完整推導 <code>out/llama-profile/projection_final_v2.md</code>、修正版報告節 <code>out/loop/FINAL_REPORT.md</code> §7</p>
+    <p class="sec-note" style="margin-top:4px">上面整個 round36 節的 6.26 tok/s 是<b>暖態</b>投影：n1 GEMV tile 含約 200 KiB harness 暖 L2 尾巴、lm_head 用 n1-basis 外推得到 9.22 B/cycle（超過 mbus 8 B/cycle 物理上限，不可能發生）、時脈假設 1 GHz 未經 RTL 驗證。以下為修正後數字，供對照。</p>
+
+    <div class="kbig">
+      <div><b>7.00 B/c</b><span>GEMV 冷態上界（升序實測 149,757 cyc）</span></div>
+      <div><b>6.43 B/c</b><span>GEMV 冷態下界（agent_07 曲線擬合）</span></div>
+      <div><b>6.61 B/c</b><span>lm_head 冷態（4 MiB tile 634,507 cyc）</span></div>
+      <div><b>500 MHz</b><span>RTL 實測 bus 時脈（elaborate log，非假設的 1 GHz）</span></div>
+    </div>
+
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>情境</th><th class="num">cycles/token</th><th class="num">tok/s @1GHz</th><th class="num">tok/s @500MHz</th><th>說明</th></tr></thead>
+        <tbody>
+          <tr><td>N=1 暖態舊值</td><td class="num">159.73M</td><td class="num">6.260</td><td class="num">3.130</td><td class="why">沿用含暖 L2 尾巴的 tile 132,424 cyc，偏樂觀</td></tr>
+          <tr><td>N=1 冷態上界</td><td class="num">187.10M</td><td class="num">5.345</td><td class="num">2.673</td><td class="why">GEMV 7.00 B/c、lm_head 6.61 B/c（<code>--cold upper</code>）</td></tr>
+          <tr><td>N=1 冷態下界</td><td class="num">199.43M</td><td class="num">5.014</td><td class="num">2.507</td><td class="why">GEMV 6.43 B/c、lm_head 6.61 B/c（<code>--cold lower</code>）</td></tr>
+          <tr><td>N=16 冷態上界</td><td class="num">20.37M</td><td class="num">49.082</td><td class="num">24.541</td><td class="why">tile N=16 沿用暖態的 N1→N16 成長比例外推，假設</td></tr>
+          <tr><td>N=32 冷態上界 *</td><td class="num">14.82M</td><td class="num">67.493</td><td class="num">33.747</td><td class="why">* 對 N 仍是線性外推，未量測</td></tr>
+          <tr><td>prefill N=64</td><td class="num">7.39M</td><td class="num">135.312</td><td class="num">67.656</td><td class="why">GEMM compute-bound，不受本次 GEMV/lm_head 冷態修正影響</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="sec-note" style="margin-top:8px"><b>工具改動：</b><code>loop/llama_project.py</code>、<code>loop/llama_batch_project.py</code> 新增 <code>--gemv-bytes-per-cycle</code> / <code>--lmhead-bytes-per-cycle</code> / <code>--cold {upper,lower}</code>，讓 GEMV/lm_head 直接用冷態 B/cycle 計價，取代原本的 tile 線性外推；<code>--clock-ghz</code>（預設 1.0）兩支工具原本就有。不加新旗標時輸出與修正前逐 bit 相同（<code>--self-test</code> 全通過）。</p>
+
+    <h4 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:14px;margin:12px 0 0">kernel 層剩餘空間（審計結論，供下一輪參考）</h4>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>方向</th><th class="num">預估增益</th><th>說明</th></tr></thead>
+        <tbody>
+          <tr><td>Gemmini/Saturn 重疊執行</td><td class="num">+4–5%</td><td class="why">記憶體流量重疊已證明是淨負（共用同一條 tile-egress/L2/DRAM 路徑），只有純算術部分能疊到 DMA 等待窗口上</td></tr>
+          <tr><td>Saturn 四顆 kernel 打 2x</td><td class="num">+2%</td><td class="why">attn-scores/attn-pv/softmax/silu-mul 已在 1.01–1.34x roofline 附近，2x 需架構層改動（LMUL、管線寬度），且合計 cycle 佔比本就只有 ~30%</td></tr>
+          <tr><td>in-flight 請求數匹配 L2 MSHR 數</td><td class="num">0–3%</td><td class="why">rows/cmd 曲線非單調（6→649k、8→632k、16→687k cycle），甜蜜點理論上有救但曲線已經很平</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note">合計理論空間 ≈ +6–10%，遠小於 batch 的 +862%（N=1→N=16）——kernel 層仍然「沒有空間」，只是把數字從「0%」修正為「個位數 %，且都需要架構層改動」。<b>硬體突破</b>只有 mbus 加寬到 128-bit <b>同時</b> L2 MSHR 12→24 才有效：單獨加寬 mbus 沒用（瓶頸是 MSHR/bank 衝突，不是頻寬本身——見下方對「DRAMSim2 冷流」的訂正）；單獨加 MSHR 又受限於 mbus 位寬，兩者互為前提。</p>
+
+    <p class="sec-note" style="margin-top:8px"><b>訂正：</b>上面「大權重全冷 DRAM 只有 6.6–7.4 B/cycle」一條所引用的「8 B/cycle 名義帶寬在 <b>DRAMSim2 冷流</b>上不可達」是<b>錯誤解釋</b>——模擬器啟動指令從未帶 <code>+dramsim</code>，跑的是無時序的 <code>mm_magic_t</code> 記憶體模型，DRAMSim2 根本沒有在跑。真正瓶頸是 <b>L2 的 MSHR 佔用與 bank 衝突</b>：stride-2048 的權重流下，同一條 mvin 命令的 8/16 個請求全落在同一個 L2 bank 上，超過該 bank 的 MSHR 數就必須串行化，這才是「634,507 cyc 是底線」的物理原因。</p>
+
+    <p class="sec-note" style="margin-top:8px"><b>下一步（Round 7）：</b>層級融合 kernel（把 Gemmini 權重串流與 Saturn attn/softmax/norm 的純算術部分疊在一起跑，取代目前純序列相加的投影模型）+ in-flight 請求數探針（掃 L2 MSHR 數附近的甜蜜點，取代目前非單調、只能事後解讀的 rows/cmd 曲線）。</p>
+  </section>
+
+  <section class="sec">
+    <div class="sec-head">
+      <h2>Round 7–9：融合 kernel 與重疊</h2>
+      <p class="sec-note">2026-09-13 → 09-17 · kernel <code>llama-layer-fused-n1</code>（<code>loop/kernels.py:4224</code>）、投影 <code>out/llama-profile/projection_round{7,8,9}.md</code>、論文附錄 <code>out/paper/{probes,methodology,timeline}.md</code></p>
+    </div>
+
+    <div class="kbig">
+      <div><b>206,304 → 179,033</b><span>cycles，單一融合 kernel，−13.2%（純序列基準 vs. round9 最佳）</span></div>
+      <div><b>$177.76</b><span>迴圈累計成本（smoke 起算，含 round9）</span></div>
+      <div><b>243</b><span>累計 iterations（62 runs）</span></div>
+      <div><b>0.3–1.4%</b><span>同一 13.2% 用 <code>--overlap</code> 實測套到整個 decode 的效果 —— 不是 15.2%</span></div>
+    </div>
+
+    <p class="sec-note" style="margin-top:4px"><code>llama-layer-fused-n1</code> 把一個 decode 層的一部分（Gemmini 上 1×2048×512 int8 GEMV，1 MiB 冷權重）跟 Saturn 上一顆 attention head 的 QK^T／softmax／probs@V 塞進同一個計時區間，測「兩顆引擎能不能疊起來跑」。三輪調參把序列基準 206,304 cycles 壓到 179,033 cycles，但這顆 kernel 本身的 Saturn 佔比（13.8%）跟整個 decode 的 Saturn 佔比（0.7–2.2%）差了一個數量級——把單一 kernel 量到的重疊比例直接套用到整個 decode，是一個已被證偽、必須撤回的外推（見下方訂正）。</p>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:8px 0 0">三輪結果</h3>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>輪次</th><th>run_id</th><th class="num">iters</th><th class="num">cycles</th><th class="num">vs. baseline</th><th>主要改動</th></tr></thead>
+        <tbody>
+          <tr><td>baseline</td><td>—</td><td class="num">—</td><td class="num">206,304</td><td class="num">—</td><td class="why">純序列相加（各子算子分開計時後加總），無重疊</td></tr>
+          <tr><td>round7</td><td class="why">首次引入融合 kernel</td><td class="num">—</td><td class="num">189,851</td><td class="num">−8.0%</td><td class="why">Gemmini 權重串流與 Saturn 算術部分首次疊在同一計時區間內</td></tr>
+          <tr><td>round8</td><td class="why">20260915-060820-a93a</td><td class="num">6</td><td class="num">179,585</td><td class="num">−13.0%</td><td class="why">進一步重疊/重排 tiling，逼近 1.277x roofline</td></tr>
+          <tr><td><b>round9</b></td><td class="why">20260916-195958-36b4</td><td class="num">4</td><td class="num"><b>179,033</b></td><td class="num"><b>−13.2%</b></td><td class="why">iter4：RoCC 運算元改成增量更新（不重建位址），省下純量開銷 552 cycles；1.273x roofline</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:12px 0 0">179,033 的拆解：Saturn 仍暴露 61%，不是「幾乎全藏住」</h3>
+    <p class="sec-note" style="margin-top:-2px">round9 加了 <code>sat_done</code>（Saturn 算完自己那份工作的時刻）vs. <code>gemv_end</code>（整顆 kernel結束時刻）探針，三次 iteration 都落在 55.6–57.6%，曾被誤讀為「Saturn 早就做完、幾乎全被藏起來」。這是<b>幾何巧合</b>：1 MiB 權重流是 4,096 個 mvin，每 16 個 mvin 才叫一次 Saturn，但只有前 ~130 次呼叫有真工作（一顆 head 的 QK^T/softmax/PV 是固定的小工作量）——Saturn 必然在串流跑到約一半時就把分配到的工作做完，跟「有多少成本真的被藏住」無關。真正的暴露量要看 <b>mvin 速率</b>：</p>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>區段</th><th class="num">mvin 數</th><th class="num">c/mvin</th><th>說明</th></tr></thead>
+        <tbody>
+          <tr><td>Saturn 仍在工作</td><td class="num">2,080</td><td class="num">50.18</td><td class="why">前段，跟 Saturn 算術爭用</td></tr>
+          <tr><td>Saturn 已空閒</td><td class="num">2,016</td><td class="num">39.12</td><td class="why">後段，純權重串流</td></tr>
+          <tr><td>Saturn 完全移除（對照）</td><td class="num">4,096</td><td class="num">39.47</td><td class="why">161,687/4,096，探針 <code>stream=</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note" style="margin-top:-2px">179,033 = 161,687（純串流）+ 17,346（<b>Saturn 仍暴露</b>，佔總數 9.7%）。<code>17,346 / 28,372 = 0.611</code> 就是 <code>loop/llama_project.py</code> 新增的 <code>DEFAULT_OVERLAP_FACTOR</code>——61.1% 的 Saturn 自身運算仍是暴露的，跟 round8 自己量到的 17,898 cycle 殘留基本上是同一件事，round9 四次迭代（DMA 暖身、對半切粒度、host 派發探針）都沒能解決它。</p>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:12px 0 0">Round 9 退役的四個假設</h3>
+    <ul class="findings">
+      <li><b>iter1：DMA 暖身操作元。</b>提前把 Saturn 要用到的 K8/V8 暖進 L2，退步到 185,374——暖身本身的命令開銷比省下的還多。</li>
+      <li><b>iter2：Saturn 呼叫粒度減半。</b>把 phase-1/phase-4 拆更細塞進 DMA 空檔，180,107，幾乎打平（+522）——暴露量沒有實質變化，排除「單位大小超過 DMA 佇列深度」這個機制。</li>
+      <li><b><code>sat_done</code> 早於 <code>gemv_end</code> 代表 Saturn 已幾乎全藏住。</b>本節已訂正：那是 mvin/Saturn 呼叫排程的幾何結果（見上方拆解），跟藏住比例無關。</li>
+      <li><b>mvin/DMA 發射路徑是瓶頸。</b>iter3 探針顯示 <code>mvin_stall_sampled</code> 平均只有 ~5.0 cycle/次取樣，DMA 發射幾乎從不卡住 host——真正還暴露、還可壓的是 host 每個 unit-call 的純量位址重算（~190.6 cycle/call），iter4 已針對這點改善，但只吃掉其中一小塊。</li>
+    </ul>
+
+    <div class="callout" style="border:1px solid var(--risk);background:var(--risk-soft);border-radius:6px;padding:10px 14px;margin:12px 0">
+      <p class="sec-note" style="margin:0"><b style="color:var(--risk)">訂正：重疊比例不可外推。</b>先前版本把融合 kernel 的 13.2% cycle 縮減<b>均勻套用</b>到整個 decode 的 cycle 數，得到 N=1 冷態 4.419 → 5.092 tok/s @1GHz（+15.2%）、2.209 → 2.546 tok/s @500MHz。<b>這個外推已被撤回</b>：融合 kernel自己的 Saturn 裝置佔比是 28,372/206,304 = <b>13.8%</b>，而整個 decode token 的 Saturn 裝置佔比只有 <b>0.7–2.2%</b>（視 attention 配置在 Gemmini 或 Saturn 而定）——把一個 13.8%-Saturn 的 kernel 量到的比例，套到一個 0.7–2.2%-Saturn 的工作量上，並期待同樣的整體百分比效果，是這個外推犯的算術錯誤。正確做法是用 <code>loop/llama_project.py</code> 新增的 <code>--overlap</code> 旗標（<code>DEFAULT_OVERLAP_FACTOR = 17,346/28,372 = 0.611</code>），對整個 decode 實測：</p>
+      <div class="tablewrap" style="margin-top:8px">
+        <table class="ladder">
+          <thead><tr><th>情境</th><th class="num">cycles/token</th><th class="num">tok/s @1GHz</th><th class="num">tok/s @500MHz</th><th class="num">減幅</th></tr></thead>
+          <tbody>
+            <tr><td>冷態基準（無重疊）</td><td class="num">226.30M</td><td class="num">4.419</td><td class="num">2.209</td><td class="num">—</td></tr>
+            <tr><td>attention 配在 Gemmini（<code>DEVICE_MAP</code> 字面預設）</td><td class="num">225.65M</td><td class="num">4.432</td><td class="num">2.216</td><td class="num">0.29%</td></tr>
+            <tr><td>attention 配在 Saturn（複製融合 kernel 的裝置分配）</td><td class="num">223.05M</td><td class="num">4.483</td><td class="num">2.242</td><td class="num">1.43%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="sec-note" style="margin:8px 0 0">指令：<code>python -m loop.llama_project --scenario decode --S 512 --measured out/llama-profile/measured_cycles_round9.json --device int8_gemv=gemmini --device lm_head_gemv=gemmini [--device attn_scores=saturn --device attn_pv=saturn] --gemv-bytes-per-cycle 5.67 --overlap --clock-ghz {1.0,0.5}</code>。四點外推限制（<code>OVERLAP_NOTE_MD</code>，<code>loop/llama_project.py</code>）：① 只量了一種 shape、一個 head；② lm_head（decode ~20.5% cycle 佔比）串流時完全沒有 attention 工作可疊，是模型最弱的一環；③ 0.611 是四輪手動調參後的成果，不是通用 runtime 行為；④ 剩餘暴露不是位元組問題——暖 DMA 反而變慢（iter1）、對半切粒度沒差（iter2），host 純量開銷才是可壓的部分。</p>
+    </div>
+
+    <p class="sec-note" style="margin-top:8px"><b>下一步：</b>對 <code>lm_head</code> 的 4 MiB 權重串流形狀跑一個對應的融合 kernel（目前完全沒有 attention/FFN 工作可疊在它底下），驗證重疊比例是否真的因 shape 而異——這是把 0.611 的外推限制①②變成實測數字唯一的路。次要方向不變：host 命令發射/批次化（iter4 已示範可行方向）、批次維度（batch）仍是目前唯一有兩位數百分比空間的槓桿。</p>
+  </section>
+
+  <section class="next">
+    <h2>下一步</h2>
+    <p>kernel 層的搜尋已經結束，再投 iteration 只會買到量測雜訊。若要繼續，方向是系統層：(1) 實測 <b>batched attention</b>（把 B 條序列的 Q 併成 GEMM 打 Gemmini，可能遠優於目前保守的 ×B 假設，而 attention 在 batch 後已是 40% 的成本且距 roofline 還有 2.4–4.0x）；(2) 補上從未量測的 <code>lm_head_gemm</code>，它是 prefill 投影最大的未知數；(3) 實測 N=32 的 GEMV tile，取代目前的線性外推；(4) 對 <code>lm_head</code> 形狀跑對應的融合 kernel，驗證 Round 7–9 的重疊比例外推限制。</p>
+  </section>
+
+</div>
