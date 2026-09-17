@@ -1,0 +1,30 @@
+# chia-chisel-build + Bug 1 fix (debug_rob_pop_trace uninitialized DPI outputs)
+#
+# debug_rob.cc is only a resource file inside the chipyard tree; it is copied into
+# gen-collateral at elaboration time and compiled by the Verilator build.  Patching
+# it therefore needs no toolchain rebuild -- this layer is a few seconds.
+FROM ghcr.io/ucb-bar/chia-chisel-build:latest
+
+USER root
+ARG DR=/home/ray/chipyard/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc
+
+COPY fix_debug_rob.py /tmp/fix_debug_rob.py
+RUN cp ${DR} ${DR}.orig && python3 /tmp/fix_debug_rob.py ${DR} && rm /tmp/fix_debug_rob.py
+
+# --- verification: fail the build loudly if the patch did not land ---
+RUN grep -q '\*trace_cause = 0;' ${DR} \
+ && grep -q '\*trace_exception = 0;' ${DR} \
+ && grep -q '\*trace_interrupt = 0;' ${DR} \
+ && grep -q '\*trace_iaddr = 0;' ${DR} \
+ && grep -q '\*trace_insn = 0;' ${DR} \
+ && grep -q '\*trace_priv = 0;' ${DR} \
+ && grep -q '\*trace_tval = 0;' ${DR} \
+ && grep -q 'memset(trace_wdata, 0, WDATA_BYTES);' ${DR} \
+ && test "$(grep -c 'memset(trace_wdata, 0, WDATA_BYTES);' ${DR})" = "1" \
+ && echo "debug_rob.cc Bug1 patch verified"
+
+# it must still compile standalone
+RUN g++ -fsyntax-only -x c++ ${DR} && echo "debug_rob.cc compiles"
+
+RUN chown ray:users ${DR} ${DR}.orig
+USER ray

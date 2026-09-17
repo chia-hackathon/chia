@@ -1,0 +1,111 @@
+# AETHER cosim image = chia-chisel-build-cosimfix (Bug 1: debug_rob DPI outputs)
+#                    + Bug 2: vectorized DebugROB DPI  (from ShuttleCosimFixDockerfile)
+#                    + cospike custom-extension support (from GemminiCosimDockerfile)
+#                    + Rocket+Gemmini cosim config      (from GemminiCosimDockerfile)
+#                    + Saturn+Gemmini co-existence configs (new)
+#
+# The two previous images (chia-chisel-build-shuttlecosimfix / -gemmini-cosim) were
+# sibling layers on the same base, so nothing they do overlaps: one touches
+# rocket-chip/shuttle DebugROB sources, the other touches testchipip's
+# cospike_impl.cc and gemmini's GemminiConfigs.scala.  This Dockerfile merges them
+# into a single line and keeps every grep / -fsyntax-only verification from both.
+#
+# Only Scala + C++/Verilog resource files are touched, so this layer is seconds;
+# the real work happens when a config is elaborated.
+FROM chia-chisel-build-cosimfix:local
+
+USER root
+ARG CY=/home/ray/chipyard
+ARG CP=/home/ray/chipyard/generators/testchipip/src/main/resources/testchipip/csrc/cospike_impl.cc
+ARG GC=/home/ray/chipyard/generators/gemmini/chipyard/GemminiConfigs.scala
+
+# ----------------------------------------------------------------------------
+# Layer A -- Bug 2: vectorize the DebugROB DPI so a multi-issue Shuttle core
+# does not interleave N push/pop blackboxes over one shared deque.
+# ----------------------------------------------------------------------------
+COPY fix_debug_rob_vec.py /tmp/fix_debug_rob_vec.py
+RUN cp ${CY}/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc      ${CY}/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc.prevec  && \
+    cp ${CY}/generators/rocket-chip/src/main/resources/vsrc/debug_rob.v       ${CY}/generators/rocket-chip/src/main/resources/vsrc/debug_rob.v.prevec   && \
+    cp ${CY}/generators/rocket-chip/src/main/scala/rocket/DebugROB.scala      ${CY}/generators/rocket-chip/src/main/scala/rocket/DebugROB.scala.prevec  && \
+    cp ${CY}/generators/shuttle/src/main/scala/exu/Core.scala                 ${CY}/generators/shuttle/src/main/scala/exu/Core.scala.prevec            && \
+    python3 /tmp/fix_debug_rob_vec.py ${CY} && rm /tmp/fix_debug_rob_vec.py
+
+RUN grep -q 'debug_rob_pop_trace_vec' ${CY}/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc \
+ && grep -q 'debug_rob_push_trace_vec' ${CY}/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc \
+ && grep -q 'debug_rob_push_wb_vec'    ${CY}/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc \
+ && grep -q 'memset(trace_wdata, 0, WDATA_BYTES);' ${CY}/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc \
+ && grep -q 'module DebugROBPopTraceVec'  ${CY}/generators/rocket-chip/src/main/resources/vsrc/debug_rob.v \
+ && grep -q 'module DebugROBPushTraceVec' ${CY}/generators/rocket-chip/src/main/resources/vsrc/debug_rob.v \
+ && grep -q 'module DebugROBPushWbVec'    ${CY}/generators/rocket-chip/src/main/resources/vsrc/debug_rob.v \
+ && grep -q 'def popTraceVec'  ${CY}/generators/rocket-chip/src/main/scala/rocket/DebugROB.scala \
+ && grep -q 'def pushTraceVec' ${CY}/generators/rocket-chip/src/main/scala/rocket/DebugROB.scala \
+ && grep -q 'def pushWbVec'    ${CY}/generators/rocket-chip/src/main/scala/rocket/DebugROB.scala \
+ && grep -q 'DebugROB.popTraceVec'  ${CY}/generators/shuttle/src/main/scala/exu/Core.scala \
+ && grep -q 'DebugROB.pushTraceVec' ${CY}/generators/shuttle/src/main/scala/exu/Core.scala \
+ && grep -q 'DebugROB.pushWbVec'    ${CY}/generators/shuttle/src/main/scala/exu/Core.scala \
+ && echo "debug_rob Bug2 vectorization patch verified"
+
+# Rocket must still use the scalar path
+RUN grep -q 'DebugROB.popTrace(clock, reset, io.hartid)'  ${CY}/generators/rocket-chip/src/main/scala/rocket/RocketCore.scala \
+ && grep -q 'class DebugROBPopTrace('                     ${CY}/generators/rocket-chip/src/main/scala/rocket/DebugROB.scala \
+ && echo "Rocket scalar DebugROB path untouched"
+
+RUN g++ -fsyntax-only -x c++ ${CY}/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc && echo "debug_rob.cc compiles"
+
+# ----------------------------------------------------------------------------
+# Layer B -- cospike custom-extension support + Gemmini cosim configs
+# ----------------------------------------------------------------------------
+COPY fix_cospike_extension.py /tmp/fix_cospike_extension.py
+COPY add_gemmini_cosim_config.py /tmp/add_gemmini_cosim_config.py
+COPY add_coexist_config.py /tmp/add_coexist_config.py
+RUN cp ${CP} ${CP}.orig && python3 /tmp/fix_cospike_extension.py ${CP} \
+ && cp ${GC} ${GC}.orig && python3 /tmp/add_gemmini_cosim_config.py ${GC} \
+ && python3 /tmp/add_coexist_config.py ${GC} \
+ && rm /tmp/fix_cospike_extension.py /tmp/add_gemmini_cosim_config.py /tmp/add_coexist_config.py
+
+RUN grep -q '#include <riscv/extension.h>' ${CP} \
+ && grep -q '+cospike-extension=' ${CP} \
+ && grep -q '+cospike-extlib=' ${CP} \
+ && grep -q 'COSPIKE_EXTENSIONS' ${CP} \
+ && grep -q 'info->isa += tok;' ${CP} \
+ && test "$(grep -c 'cospike_split_list' ${CP})" = "5" \
+ && echo "cospike_impl.cc extension patch verified"
+
+RUN grep -q 'class GemminiRocketCosimConfig extends Config(' ${GC} \
+ && grep -q 'chipyard.harness.WithCospike' ${GC} \
+ && grep -q 'gemmini.DefaultGemminiConfig' ${GC} \
+ && test "$(grep -c 'class GemminiShuttleConfig' ${GC})" = "1" \
+ && echo "GemminiConfigs.scala cosim config verified"
+
+# --- the new AETHER co-existence configs ---
+RUN test "$(grep -c 'class GENV256D128GemminiShuttleConfig extends Config(' ${GC})" = "1" \
+ && test "$(grep -c 'class GENV256D128GemminiShuttleCosimConfig extends Config(' ${GC})" = "1" \
+ && grep -q 'saturn.shuttle.WithShuttleVectorUnit(256, 128, saturn.common.VectorParams.genParams)' ${GC} \
+ && grep -q 'shuttle.common.WithShuttleDebugROB' ${GC} \
+ && grep -q 'shuttle.common.WithShuttleTileBeatBytes(16)' ${GC} \
+ && echo "AETHER Saturn+Gemmini coexistence configs verified"
+
+# the fragments those configs reference must actually exist in the tree
+RUN grep -rq 'class WithShuttleVectorUnit' ${CY}/generators/saturn/src/main/scala/shuttle/Configs.scala \
+ && grep -rq 'class WithShuttleDebugROB'   ${CY}/generators/shuttle/src/main/scala/common/Configs.scala \
+ && grep -rq 'class DefaultGemminiConfig'  ${CY}/generators/gemmini/src/main/scala/gemmini/Configs.scala \
+ && echo "referenced config fragments exist"
+
+# base image's Bug 1 fix must still be present
+RUN grep -q 'memset(trace_wdata, 0, WDATA_BYTES);' \
+      ${CY}/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc \
+ && echo "base image Bug1 fix still present"
+
+RUN g++ -fsyntax-only -std=c++17 -x c++ \
+      -I/home/ray/chipyard/.conda-env/riscv-tools/include \
+      -I/home/ray/chipyard/generators/testchipip/src/main/resources/testchipip/csrc \
+      ${CP} && echo "cospike_impl.cc compiles"
+
+RUN test -f ${CY}/.conda-env/riscv-tools/lib/libgemmini.so \
+ && objdump -x ${CY}/.conda-env/riscv-tools/lib/libriscv.so \
+      | grep -q 'RPATH .*riscv-tools/lib' \
+ && echo "libgemmini.so present and on libriscv RPATH"
+
+RUN chown -R ray:users ${CY}/generators/rocket-chip/src/main/resources ${CY}/generators/rocket-chip/src/main/scala/rocket ${CY}/generators/shuttle/src/main/scala/exu \
+ && chown ray:users ${CP} ${CP}.orig ${GC} ${GC}.orig
+USER ray

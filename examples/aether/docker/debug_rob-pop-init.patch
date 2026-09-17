@@ -1,0 +1,22 @@
+--- a/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc
++++ b/generators/rocket-chip/src/main/resources/csrc/debug_rob.cc
+@@ -92,6 +92,19 @@
+ 				    long long int* trace_tval,
+ 				    long long int* trace_wdata) {
+   *trace_valid = 0;
++  /* Bug 1 fix: initialize *all* DPI outputs. Verilator copies these back into
++     the RTL unconditionally, and testchipip/cospike.v triggers on
++     (trace_0_valid || trace_0_exception || trace_0_cause) without a valid gate,
++     so leaving them as uninitialized stack garbage causes nondeterministic
++     spurious cospike traps. */
++  *trace_iaddr = 0;
++  *trace_insn = 0;
++  *trace_priv = 0;
++  *trace_exception = 0;
++  *trace_interrupt = 0;
++  *trace_cause = 0;
++  *trace_tval = 0;
++  memset(trace_wdata, 0, WDATA_BYTES);
+   if (debug_robs.find(hartid) == debug_robs.end()) return;
+   if (debug_robs[hartid]->rob.empty()) return;
+ 
