@@ -1,5 +1,5 @@
 {
-  "rounds_file": "out/loop/rounds.json",
+  "rounds_file": "/share1/saves/max410011/hackathon/aether/out/loop/rounds.json",
   "rounds": [
     {
       "name": "smoke",
@@ -3545,14 +3545,97 @@
         "pass_rate": 1.0,
         "total_cost_usd": 6.472411
       }
+    },
+    {
+      "name": "round10",
+      "round_note": "launched 2026-09-17 15:58 Taipei, ended ~2026-09-18 03:36 Taipei (overnight). This round tested the new kernel llama-lmhead-fused-n1, asking whether the 'overlap ratio can be extrapolated' hypothesis from the llama-layer-fused-n1 work (round7-9; Saturn compute increasingly hidden behind Gemmini weight-stream / host dispatch, ~61% overlap assumed by DEFAULT_OVERLAP_FACTOR) generalizes to lm_head. Single run: llama-lmhead-fused-n1, run_id 20260917-155834-2887, 4 iterations, baseline 648292, roofline 532232 -> iterations 676825 (iter1, regression), 651726 (iter2, regression, close to baseline), 689999 (iter3, probe-only, regression), 698428 (iter4, regression). Baseline 648292 was NEVER beaten in this round; speedup 1.000x (+0.0%), a clear negative result. iter1 probe decomposed the Saturn pipeline into phases: stream=634821 rms=7296 quant=2496 argmax=2980 (total 647593); excluding 'stream', the overlappable Saturn-side work is only rms+quant+argmax=12772 cycles, ~2.0% of the iteration total -- far smaller than layer-fused's overlap-relevant share. iter2 probe measured host-side exposure (held_*) per stage instead of raw stage duration: held_rms1=5984 held_rms2=8990 held_quant=6552 held_amax1=2093 held_amax2=3532 (sum 27151, total 653221) -- larger than iter1's 12772, likely reflecting host/sync-boundary wall-clock exposure (and possibly double-counting split sub-stages) rather than raw Saturn compute time; not fully reconciled. iter3 swept a busy-wait spin parameter (0/80/250/600) before checking the Saturn pipeline, sampling ~32 periods each: spin0 period_sum=154598 cnt=32, spin80=154376 cnt=32, spin250=150380 cnt=32, spin600=145647 cnt=31 (iteration total 663023) -- tighter polling (higher spin) modestly reduces sampled sync-wait period, but iter4 (698428, applying findings from the spin scan) still did not beat baseline, confirming lm_head's exposure problem is structural, not a scheduling-tuning issue. Conclusion: lm_head's overlappable Saturn work is proportionally too small (and/or too exposed at host sync points) for the layer-fused overlap findings to transfer; a single global overlap factor should not be assumed across kernel families.",
+      "rows": [
+        {
+          "round": "round10",
+          "kernel": "llama-lmhead-fused-n1",
+          "run_id": "20260917-155834-2887",
+          "iter": 0,
+          "status": "ok",
+          "cycles": 648292,
+          "ratio_vs_baseline": 1.0,
+          "ratio_vs_roofline": 1.218062799681342,
+          "new_best": true,
+          "cost_usd": 0.0,
+          "agent_note": null,
+          "agent_note_source": null
+        },
+        {
+          "round": "round10",
+          "kernel": "llama-lmhead-fused-n1",
+          "run_id": "20260917-155834-2887",
+          "iter": 1,
+          "status": "ok",
+          "cycles": 676825,
+          "ratio_vs_baseline": 1.0440125745805902,
+          "ratio_vs_roofline": 1.2716728794961596,
+          "new_best": false,
+          "cost_usd": 0.749957,
+          "agent_note": "Now compile-check with the harness's flags.\u7f16\u8bd1\u901a\u8fc7\uff08`rc=0`\uff0c\u6c47\u7f16\u4e2d\u51fa\u73b0 7 \u5904 `rdcycle`\uff1a\u6211\u52a0\u7684 5 \u5904 + harness \u7684 2 \u5904\uff09\u3002\n\n**\u672c\u8f6e\u603b\u7ed3\uff1a** \u8c03\u5ea6\u4e0e\u56db\u6bb5\u5185\u5faa\u73af\u5b8c\u5168\u672a\u52a8\uff0c\u4ec5\u5728\u9636\u6bb5\u8fb9\u754c\u63d2\u5165 `rdcycle` \u5e76\u5728\u5168\u90e8\u5de5\u4f5c\u5b8c\u6210\u540e\u8f93\u51fa `PROBE stream= / rms= / quant= / argmax= /...",
+          "agent_note_source": "agent_txt"
+        },
+        {
+          "round": "round10",
+          "kernel": "llama-lmhead-fused-n1",
+          "run_id": "20260917-155834-2887",
+          "iter": 2,
+          "status": "ok",
+          "cycles": 651726,
+          "ratio_vs_baseline": 1.0052969957981897,
+          "ratio_vs_roofline": 1.2245148732131852,
+          "new_best": false,
+          "cost_usd": 0.662428,
+          "agent_note": "\u8fed\u4ee3 1 \u7684\u9884\u6d4b\u4e0e\u5b9e\u6d4b\u5bf9\u7167\uff1astream \u9884\u6d4b 637,000 \u2192 \u5b9e\u6d4b **634,821**\uff08\u51b7\u6001\u60e9\u7f5a\u53ea\u6709 ~300 cycles\uff0c\u800c\u975e\u6211\u4f30\u8ba1\u7684 2.5k\u2014\u20144 MiB \u6d41\u4e0a \"warm tail\" \u4fe1\u7528\u51e0\u4e4e\u4e3a\u96f6\uff0cdescending K \u5728\u6b64\u5df2\u65e0\u610f\u4e49\uff09\uff1brms 7,296 / quant 2,496 / argmax 2,980 \u4e0e\u9884\u6d4b\u543b\u5408\uff08argmax \u7565\u9ad8\uff1aLG...",
+          "agent_note_source": "agent_txt"
+        },
+        {
+          "round": "round10",
+          "kernel": "llama-lmhead-fused-n1",
+          "run_id": "20260917-155834-2887",
+          "iter": 3,
+          "status": "ok",
+          "cycles": 689999,
+          "ratio_vs_baseline": 1.0643336644598422,
+          "ratio_vs_roofline": 1.2964252431270573,
+          "new_best": false,
+          "cost_usd": 0.392242,
+          "agent_note": "\u8fed\u4ee3 2 \u7684\u9884\u6d4b 641,500 **DIED**\uff1a\u5b9e\u6d4b 651,726\uff0c\u6bd4\u4e32\u884c\u57fa\u7ebf\uff08printf-free 647,593\uff09\u8fd8**\u6162 4,100**\u3002exposure = 651,726 \u2212 634,821 = **16,905**\uff0cserialised Saturn = 12,772 \u2192 **exposure ratio = 1.32 > 1.0**\u3002\u8fd9\u8bf4\u660e\u6211\u7684\u673a\u5668\u6a21\u578b\u9519\u5728\uff1a\u4e3b\u673a\u79bb\u5f00\u53bb\u8dd1\u4e00\u4e2a...",
+          "agent_note_source": "agent_txt"
+        },
+        {
+          "round": "round10",
+          "kernel": "llama-lmhead-fused-n1",
+          "run_id": "20260917-155834-2887",
+          "iter": 4,
+          "status": "ok",
+          "cycles": 698428,
+          "ratio_vs_baseline": 1.0773355216476526,
+          "ratio_vs_roofline": 1.3122623216942988,
+          "new_best": false,
+          "cost_usd": 0.590935,
+          "agent_note": "\u8fed\u4ee3 3 \u7684\u9884\u6d4b **SURVIVED**\uff1a`held_total` = 5,984+8,990+6,552+2,093+3,532 = **27,151**\uff08\u9884\u6d4b 27,000\uff09\uff1bexposure = 653,221 \u2212 634,821 = 18,400\uff0c\u6240\u4ee5 80 \u6b21\"\u4e3b\u673a\u79bb\u5f00\"\u603b\u5171\u53ea\u9690\u85cf\u4e86 27,151 \u2212 18,400 = 8,751 cycles \u2248 **\u6bcf\u6b21\u79bb\u5f00\u51c0\u9690\u85cf ~109...",
+          "agent_note_source": "agent_txt"
+        }
+      ],
+      "missing_run_ids": [],
+      "summary": {
+        "iterations": 5,
+        "ok": 5,
+        "pass_rate": 1.0,
+        "total_cost_usd": 2.395562
+      }
     }
   ],
   "overall": {
-    "iterations": 243,
-    "ok": 234,
-    "pass_rate": 0.963,
-    "total_cost_usd": 177.759582,
-    "ledger_total_cost_usd": 177.759582,
+    "iterations": 248,
+    "ok": 239,
+    "pass_rate": 0.9637,
+    "total_cost_usd": 180.155144,
+    "ledger_total_cost_usd": 180.155144,
     "cost_reconciles": true
   }
 }

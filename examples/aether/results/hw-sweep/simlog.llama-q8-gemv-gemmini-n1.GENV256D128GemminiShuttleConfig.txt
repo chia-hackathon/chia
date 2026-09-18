@@ -1,0 +1,17 @@
+llama-q8-gemv-gemmini N,K,M = 1,2048,512
+Starting gemmini gemv
+PROBE warm_gemv_cycles=132435
+PROBE warm_bytes_per_cycle_x100=791
+PROBE passthru_loop_issue_cycles=38
+PROBE passthru_64mvin_accept_cycles=15126
+PROBE passthru_loop_plus_mvins_total_cycles=15333
+PROBE flush_cycles=274464
+PROBE cold_gemv_cycles=184837
+PROBE cold_bytes_per_cycle_x100=567
+Cycles taken: 660409
+C checksum = 7991950
+PASSED (8 sampled outputs)
+%Warning: System has stack size 8192 kb which may be too small; suggest 'ulimit -c 15671' or larger
+[UART] UART0 is here (stdin/stdout).
+- /home/ray/chipyard/sims/verilator/generated-src/chipyard.harness.TestHarness.GENV256D128GemminiShuttleConfig/gen-collateral/TestDriver.v:179: Verilog $finish
+

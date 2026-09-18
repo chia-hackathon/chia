@@ -1,0 +1,9 @@
+llama-q8-gemv-gemmini-lmhead N,K,M = 1,2048,2048
+Starting gemmini gemv
+Cycles taken: 472616
+C checksum = -7507930
+PASSED (8 sampled outputs)
+%Warning: System has stack size 8192 kb which may be too small; suggest 'ulimit -c 15659' or larger
+[UART] UART0 is here (stdin/stdout).
+- /home/ray/chipyard/sims/verilator/generated-src/chipyard.harness.TestHarness.GENV256D128GemminiShuttleWideMbusConfig/gen-collateral/TestDriver.v:179: Verilog $finish
+

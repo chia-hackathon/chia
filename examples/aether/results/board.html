@@ -769,7 +769,7 @@ flowchart LR
 
     <p class="sec-note">Round 2 準備工作：roofline 重新計算、loop 加上 <code>--seed</code>（可從上一輪 best 重啟）、Gemmini 編譯線加 <code>-v</code>、新增 <code>lmhead</code> 獨立 kernel、watchdog 改用 log mtime 判斷卡死（而非只看行程存活）。</p>
 
-    <p class="key" style="margin-top:8px"><b>結論：</b>Saturn 側的 elementwise／attention kernel（softmax、silu_mul、attn_scores）已經很接近 roofline；瓶頸完全在 Gemmini GEMV 的權重 DMA 效率（約 16 B/cycle 理論頻寬的 50%），round 2 對它幾乎沒有進展。下一步需要對 GEMV 給更具體的硬體提示，或考慮硬體側調整（例如把 decode GEMV batch 到 N=16，或提高假設頻寬），單靠 prompt 調校內圈 kernel 已經摸到頂。</p>
+    <p class="key" style="margin-top:8px"><b>結論：</b>Saturn 側的 elementwise／attention kernel（softmax、silu_mul、attn_scores）已經很接近 roofline；瓶頸完全在 Gemmini GEMV 的權重 DMA 效率（約 16 B/cycle 理論頻寬的 50%——此為 round 2 當時認知，round3 末訂正記憶匯流排實際為 8 B/cycle，見 Round 7–9 節），round 2 對它幾乎沒有進展。下一步需要對 GEMV 給更具體的硬體提示，或考慮硬體側調整（例如把 decode GEMV batch 到 N=16，或提高假設頻寬），單靠 prompt 調校內圈 kernel 已經摸到頂。</p>
 
   </section>
 
@@ -793,7 +793,7 @@ flowchart LR
             <span class="tag t-verify">驗證</span>
             <span class="entry-b">
               <strong>Inner loop Round 2 收工：decode 6.21 tok/s（1.029×）、prefill 148.9 tok/s（1.077×）</strong>
-              <span>11:00 以 <code>--seed best</code> 從 Round 1 的最佳 kernel 重啟（首次啟動於 9/7 晚被 Claude session 限額打斷），15:20 完成，共 6 個 run，<b>$31.24</b>。softmax／silu-mul／attn-scores-int8 三支繼續縮小與 roofline 的差距，attn-pv-int8 無進展；新增獨立量測的 <code>lmhead</code> kernel（740,101 → 659,142 cycles）。<b>Gemmini GEMV</b>（<code>llama-q8-gemv-gemmini-n1</code>）幾乎沒動（132,653 → 132,424），確認瓶頸卡在權重 DMA 效率（約 50% of 16 B/cycle），已到 prompt 調校的極限。詳見上方「Inner loop Round 2 結果」。</span>
+              <span>11:00 以 <code>--seed best</code> 從 Round 1 的最佳 kernel 重啟（首次啟動於 9/7 晚被 Claude session 限額打斷），15:20 完成，共 6 個 run，<b>$31.24</b>。softmax／silu-mul／attn-scores-int8 三支繼續縮小與 roofline 的差距，attn-pv-int8 無進展；新增獨立量測的 <code>lmhead</code> kernel（740,101 → 659,142 cycles）。<b>Gemmini GEMV</b>（<code>llama-q8-gemv-gemmini-n1</code>）幾乎沒動（132,653 → 132,424），確認瓶頸卡在權重 DMA 效率（約 50% of 16 B/cycle，同上，round3 後訂正為 8 B/cycle），已到 prompt 調校的極限。詳見上方「Inner loop Round 2 結果」。</span>
             </span>
           </li>
 
@@ -1558,9 +1558,112 @@ flowchart LR
     <p class="sec-note" style="margin-top:8px"><b>下一步：</b>對 <code>lm_head</code> 的 4 MiB 權重串流形狀跑一個對應的融合 kernel（目前完全沒有 attention/FFN 工作可疊在它底下），驗證重疊比例是否真的因 shape 而異——這是把 0.611 的外推限制①②變成實測數字唯一的路。次要方向不變：host 命令發射/批次化（iter4 已示範可行方向）、批次維度（batch）仍是目前唯一有兩位數百分比空間的槓桿。</p>
   </section>
 
+  <section class="sec">
+    <div class="sec-head">
+      <h2>Round 10：lm_head 融合與負結果</h2>
+      <p class="sec-note">2026-09-17 → 09-18 · kernel <code>llama-lmhead-fused-n1</code>（<code>loop/kernels.py</code>）、run <code>20260917-155834-2887</code>、投影 <code>out/llama-profile/projection_round10.md</code>、探針 <code>out/paper/probes.md</code></p>
+    </div>
+
+    <div class="kbig">
+      <div><b>648,292 → 648,292</b><span>cycles，baseline 四次 iteration 全數未被超越，加速比 1.000x</span></div>
+      <div><b>1.97% vs. 13.8%</b><span>lm_head 融合 kernel 的 Saturn 佔比，對比 round9 <code>llama-layer-fused-n1</code> 自己的 13.8%</span></div>
+      <div><b>1.218x</b><span>最佳可能（baseline）/ roofline（532,232 cycles）——連 roofline 都沒被 iteration 逼近</span></div>
+      <div><b>$2.3956</b><span>本輪成本；四次 iteration 全部是負結果</span></div>
+    </div>
+
+    <p class="sec-note" style="margin-top:4px">Round 7–9 節結尾預告的驗證：把 Round 9 學到的重疊比例（<code>DEFAULT_OVERLAP_FACTOR = 0.611</code>）套到另一個形狀——<code>lm_head</code> 的 4 MiB 權重串流（RMSNorm + quant + argmax 疊在 Gemmini GEMV 底下）——是否也能複製 13.2% 的縮減。答案是明確的負結果：<b>baseline 648,292 cycles 在四次 iteration 中沒有一次被超越</b>，加速比鎖死在 1.000x。這正是 round10 設計要驗證的「重疊比例可否跨 kernel family 外推」這個效度威脅，答案是<b>不可以</b>，且原因可以被結構性地解釋（見下方）。</p>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:8px 0 0">四次 iteration</h3>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>iteration</th><th class="num">cycles</th><th class="num">vs. baseline</th><th>PROBE / 改動</th></tr></thead>
+        <tbody>
+          <tr><td>baseline</td><td class="num">648,292</td><td class="num">—</td><td class="why">未融合，各子算子分開計時後加總</td></tr>
+          <tr><td>iter1</td><td class="num">676,825</td><td class="num">+4.4%</td><td class="why">phase split 探針：<code>stream=634,821 rms=7,296 quant=2,496 argmax=2,980</code>，序列化 Saturn 總和 12,772</td></tr>
+          <tr><td>iter2</td><td class="num">651,726</td><td class="num">+0.5%</td><td class="why">把 fence 往後移，期望套用 0.611 重疊比例；結果暴露比例反而 &gt;1.0（實測 1.32），比純序列基準（647,593）還差</td></tr>
+          <tr><td>iter3</td><td class="num">689,999</td><td class="num">+6.4%</td><td class="why"><code>held_*</code> 探針：<code>held_rms1=5,984 held_rms2=8,990 held_quant=6,552 held_amax1=2,093 held_amax2=3,532</code>，總和 27,151，比 iter1 的序列基準 12,772 還大</td></tr>
+          <tr><td>iter4</td><td class="num">698,428</td><td class="num">+7.7%</td><td class="why">spin-wait 掃描（0/80/250/600 週期），只找到約 109 cycle 的淨隱藏下限；總數仍未回到 baseline</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:12px 0 0">為什麼 0.611 套不上：1.97% vs. 13.8%</h3>
+    <p class="sec-note" style="margin-top:-2px">round9 的 <code>llama-layer-fused-n1</code> 之所以能疊出 13.2% 的縮減，是因為這顆 kernel 自身的 Saturn 裝置佔比高達 <b>13.8%</b>（28,372/206,304）——有足夠大的非 Saturn 工作量可以疊在它旁邊。<code>llama-lmhead-fused-n1</code> 完全不同：iter1 量到的序列化 Saturn 工作（<code>rms+quant+argmax = 12,772</code> cycles）只佔整個 printf-free iteration 總量（647,593）的 <b>1.97%</b>——比 round9 kernel 自己的佔比小了一個數量級。critical path 上根本沒有足夠的非 Saturn 工作可以疊，重疊比例外推在算術上就不成立，跟 host 排程調得多細都無關。</p>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:12px 0 0">三組 PROBE 的解讀</h3>
+    <ul class="findings">
+      <li><b>iter1：phase split。</b>把 Saturn 端拆成 <code>rms</code>／<code>quant</code>／<code>argmax</code> 三段分別計時，序列化總和 12,772 cycles，確認這顆 kernel 能疊的量本來就很小（1.97%）。</li>
+      <li><b>iter3：<code>held_*</code> 探針，27,151 遠大於 12,772。</b>照理交錯排程應該把 Saturn 成本部分藏進權重串流，量到的暴露量卻反而比序列基準還大超過一倍。最可能的解釋：交錯排程把相鄰的 Saturn phase 在權重串流中拉開約 16K-block（530 KiB），超過 512 KiB 的 L2 容量，導致 <code>X</code>／<code>xn</code>／<code>LG</code> 在兩次造訪之間被逐出——每個 phase 的第二次造訪（<code>rms2</code>、<code>amax2</code>）從 L2 命中變成 DRAM 冷抓取，把 held 時間吃到遠超過原本的序列成本。</li>
+      <li><b>iter4：spin-wait 掃描。</b>在 spin 週期 0/80/250/600 之間掃描，<code>period_sum</code>（154,598 / 154,376 / 150,380 / 145,647）隨 spin 週期遞減，只顯示出約 109 cycle 的淨隱藏下限——是個結構性的地板，不是排程沒調好，整體 iteration 仍以 698,428 未能回到 648,292 baseline。</li>
+    </ul>
+
+    <div class="callout" style="border:1px solid var(--risk);background:var(--risk-soft);border-radius:6px;padding:10px 14px;margin:12px 0">
+      <p class="sec-note" style="margin:0"><b style="color:var(--risk)">13,785 與 12,772 的對齊。</b>round10 前期估算曾用 13,785（<code>648,292</code> 融合 baseline − <code>634,507</code> round4 GEMV-only 最佳，同一權重串流）作為重疊的理論上限，跟 iter1 探針量到的 12,772 對不起來，一度被記為「無法從單一 PROBE 行重建、待釐清」。<code>out/llama-profile/projection_round10.md</code> 末尾（2026-09-18 新增一節）已釐清：兩者量的是不同東西，都對。12,772 是 <code>rms+quant+argmax</code> 三段 Saturn phase 本身的序列成本，是原則上可以被藏住的量；13,785 是把同一件事對到 baseline（而非 probe build）算出的上限，多出的 ~700–1,000 cycles 來自冷 L2 罰時與 fence（<code>648,292 − 634,821 = 13,471</code>，加上探針總量 647,593 與 baseline 之間的差額）。兩個數字都正確，實測結果是<b>兩者皆未被藏住——重疊比例是 0</b>。</p>
+    </div>
+
+    <p class="sec-note" style="margin-top:8px"><b>累計結果（loop 全部結束，smoke + round1–10）：</b>63 runs、248 iterations、$180.16、約 73 h 58 m（~74 小時）wall clock。整體最佳成果仍是 <code>llama-layer-fused-n1</code> 的 <b>179,033</b>（對 206,304 baseline 為 <b>−13.2%</b>，round9），<code>llama-lmhead-fused-n1</code> 以 TERMINAL／負結果收尾（648,292，1.000x，roofline 比 1.218）。10 顆 kernel 的整體幾何平均加速比 <b>2.50×</b>（不含 round10 這顆負結果 kernel 為 2.76×；此前誤植、排除 ACTIVE kernel 又只算 8 顆的 3.08× 已訂正，見 <code>out/paper-submission/README.md</code> 訂正史第 4 條）。</p>
+
+    <p class="sec-note" style="margin-top:4px"><b>loop 到此收工，下一步是論文。</b>round10 是設計來關閉「單一 kernel 量到的重疊比例可否外推到別的 kernel family／shape」這個效度威脅的實驗，結果乾淨且明確：不可以，且原因（Saturn 佔比差一個數量級、交錯排程反而製造 L2 冷抓取）已用三組 PROBE 交叉驗證，不是量測雜訊或排程沒調好。不再投入新的 iteration；剩下的工作是把 11 輪、63 runs、248 iterations、三次訂正歷史寫成 4 頁論文（<code>out/paper-submission/</code>）。</p>
+  </section>
+
+  <section class="sec" id="hwsweep">
+    <div class="sec-head">
+      <h2>硬體 sweep：mbus 寬度 vs L2 MSHR</h2>
+      <p class="sec-note">2026-09-19 · proposal 第四步（outer loop）的單一維度部分達成 · 四個設計點 × 兩個 kernel · 原始資料 <code>out/hw-sweep/</code> · 完整報告 <code>out/hw-sweep/README.md</code> · 論文檔 <code>out/paper/hardware_sweep.csv</code>、<code>out/paper/methodology.md</code> §7、<code>out/paper/timeline.md</code> incident 7</p>
+    </div>
+
+    <div class="kbig">
+      <div><b>+57%</b><span>單獨加寬 mbus（8→16 B/cycle）的 n1 冷態收益，拿到兩項合計增益的 98.6%</span></div>
+      <div><b>+6.5% / +0.01%</b><span>單獨加深 L2 MSHR（12→24）的收益：n1 冷態 6.5%，lmhead 冷態幾乎為零</span></div>
+      <div><b>1.51x</b><span>WideDeep 設計點的 decode 端到端投影加速（@500 MHz，2.29→3.47 tok/s）</span></div>
+      <div><b>第 5 次訂正</b><span>「L2 MSHR 是瓶頸」的舊結論被推翻——真正瓶頸是 memory bus 寬度</span></div>
+    </div>
+
+    <p class="sec-note" style="margin-top:4px">round7 的 in-flight 請求數掃描（6/8/10/12/16 in-flight → 6.31/6.63/6.06/5.83/5.78 B/cyc）曾被讀成「L2 MSHR=12 卡住吞吐」，並寫進 <code>FINAL_REPORT.md</code>、<code>projection_final_v2.md</code> 與多份 board 當作結論。那個掃描只在固定 8 B/cycle 的 mbus 下改變 in-flight 數，從未把 mbus 寬度跟 MSHR 數分開控制。這次用四個獨立的 RTL 設計點（不是曲線推論）直接量測，結果與假說相反——見下表。</p>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:8px 0 0">四個設計點（冷態，llama-q8-gemv-gemmini-n1 = 1 MiB、llama-q8-gemv-gemmini-lmhead = 4 MiB）</h3>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>設計點</th><th class="num">mbus</th><th class="num">L2 MSHR</th><th class="num">n1 cycles</th><th class="num">n1 B/c</th><th class="num">n1 加速</th><th class="num">lmhead cycles</th><th class="num">lmhead 加速</th></tr></thead>
+        <tbody>
+          <tr><td>control</td><td class="num">8 B/c</td><td class="num">12</td><td class="num">184,837</td><td class="num">5.67</td><td class="num">1.000x</td><td class="num">634,507</td><td class="num">1.000x</td></tr>
+          <tr><td>DeepMshr</td><td class="num">8 B/c</td><td class="num">24</td><td class="num">173,633</td><td class="num">6.04</td><td class="num">1.065x</td><td class="num">634,580</td><td class="num">0.9999x</td></tr>
+          <tr><td>WideMbus</td><td class="num">16 B/c</td><td class="num">12</td><td class="num">117,526</td><td class="num">8.92</td><td class="num">1.573x</td><td class="num">472,616</td><td class="num">1.343x</td></tr>
+          <tr><td>WideDeep</td><td class="num">16 B/c</td><td class="num">24</td><td class="num">115,865</td><td class="num">9.05</td><td class="num">1.595x</td><td class="num">472,093</td><td class="num">1.344x</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout" style="border:1px solid var(--risk);background:var(--risk-soft);border-radius:6px;padding:10px 14px;margin:12px 0">
+      <p class="sec-note" style="margin:0"><b style="color:var(--risk)">訂正（推翻先前結論）：</b>先前結論「memory bus 已飽和、真正瓶頸是 L2 MSHR=12」是錯的。證據：control 本身<b>暖態</b> 7.92 B/cycle 對 8 B/cycle 匯流排已是 <b>99.0% roofline</b>，沒有 MSHR 形狀的餘裕；先前用來支持 MSHR 假說的 in-flight 掃描，量到的是<b>窄匯流排上的壅塞</b>，不是 MSHR 不足。正確結論：<b>decode 受限於 memory bus 寬度，加寬一項就拿到 98.6% 的收益，L2 MSHR 不用動。</b>加寬後兩個 kernel 收斂到同一個新天花板（8.87–9.05 B/cycle，新匯流排的 56–57%），代表限制已經移到 Gemmini 的 StreamReader／L2 佔用，再加寬到 32 B/cycle 不會有同樣幅度的收益。這是專案的<b>第 5 次</b>文件化訂正。</p>
+    </div>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:12px 0 0">端到端 decode 投影（Llama-3.2-1B，S=512，冷態）</h3>
+    <div class="tablewrap">
+      <table class="ladder">
+        <thead><tr><th>設計點</th><th class="num">n1 冷 B/c</th><th class="num">lmhead B/c</th><th class="num">Mcyc/token</th><th class="num">tok/s @500 MHz</th><th class="num">tok/s @1 GHz</th></tr></thead>
+        <tbody>
+          <tr><td>control</td><td class="num">5.67</td><td class="num">6.61</td><td class="num">218.6</td><td class="num">2.29</td><td class="num">4.58</td></tr>
+          <tr><td>DeepMshr</td><td class="num">6.04</td><td class="num">6.61</td><td class="num">208.1</td><td class="num">2.40</td><td class="num">4.81</td></tr>
+          <tr><td>WideMbus</td><td class="num">8.92</td><td class="num">8.87</td><td class="num">145.9</td><td class="num">3.43</td><td class="num">6.85</td></tr>
+          <tr><td><b>WideDeep（最佳）</b></td><td class="num"><b>9.05</b></td><td class="num"><b>8.89</b></td><td class="num"><b>144.3</b></td><td class="num"><b>3.47</b></td><td class="num"><b>6.93</b></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sec-note" style="margin-top:-2px">投影工具：<code>loop/llama_project.py --scenario decode --S 512 --gemv-bytes-per-cycle G --lmhead-bytes-per-cycle L --clock-ghz F</code>（decode 有 99.0% 是 Gemmini、每 token 讀 1.25 GB，所以 tok/s 近似與串流速率線性）。最佳設計點是 <b>1.51x 端到端 decode 加速</b>（218.6→144.3 Mcycles/token；n1 GEMV 單獨 1.57x、lm-head 單獨 1.34x），代價是把 memory bus 寬度加倍；多出的 MSHR 只貢獻 1.1%，不值得換來的面積。</p>
+
+    <h3 style="font-family:'IBM Plex Sans Condensed','Noto Sans TC',system-ui,sans-serif;font-size:15px;margin:12px 0 0">實作方式：兩個 config fragment 與驗證方法</h3>
+    <ul class="findings">
+      <li><b>加寬 memory bus</b> — <code>WithAetherMemoryBusWidth(bits)</code> 覆寫 <code>freechips.rocketchip.subsystem.MemoryBusKey</code> 的 <code>beatBytes</code>。rocket-chip 預設 <code>beatBytes = 8</code>，AETHER 的 config chain 從未覆寫過它；<code>WithSystemBusWidth(128)</code> 只動 <code>SystemBusKey</code>，跟 mbus 無關。AXI4 mem port 與 testchipip 的 <code>SimDRAM</code> 都跟著 <code>MemoryBusKey.beatBytes</code> 走，不需要另外改。</li>
+      <li><b>加深 L2 MSHR 檔</b> — <code>WithAetherL2MemCycles(cycles)</code> 覆寫 <code>InclusiveCacheKey</code> 的 <code>memCycles</code>；MSHR 數是<b>推導</b>出來的，<code>all_mshrs = 2 + max(2, ceil(memCycles / blockBeats))</code>，<code>memCycles=40</code> 給 12（control），<code>memCycles=88</code> 給 24。兩個 fragment 都必須放在 <code>chipyard.config.AbstractConfig</code> 左邊才能生效覆寫。</li>
+      <li><b>驗證參數真的生效</b>（從<b>產生的產物</b>驗證，不只是相信 <code>rc=0</code>）：生成的 <code>.dts</code> 裡 <code>sifive,mshr-count</code> 依序是 12 / 12 / 24 / 24；生成的 <code>TestHarness.sv</code> 裡 <code>SimDRAM</code> 的 <code>.DATA_BITS()</code> 依序是 64 / 128 / 64 / 128 位元——確認 AXI4 mem port 與 DRAM 模型都真的跟著 mbus 寬度走。四個設計點 elaborate 全部 <code>rc=0</code>；原本的 control config 未被改動，<code>hwconfig.self_test()</code> 仍 PASS。</li>
+      <li><b>限制</b>：只測了兩個 kernel（都是記憶體受限的 GEMV）；只測了 8/16 B/cycle 兩點，沒有 32 B 的點；沒有做中間 MSHR 值的掃描（只有 12/24 兩點）；模擬器用的是零額外延遲的 <code>mm_magic_t</code> DRAM 模型（<code>+dramsim</code> 從未被傳入），所以這是「鏈路寬度」實驗，不是真實 DRAM 時序實驗；沒有面積或功耗數據，不是完整 Pareto 前緣。</li>
+    </ul>
+  </section>
+
   <section class="next">
     <h2>下一步</h2>
-    <p>kernel 層的搜尋已經結束，再投 iteration 只會買到量測雜訊。若要繼續，方向是系統層：(1) 實測 <b>batched attention</b>（把 B 條序列的 Q 併成 GEMM 打 Gemmini，可能遠優於目前保守的 ×B 假設，而 attention 在 batch 後已是 40% 的成本且距 roofline 還有 2.4–4.0x）；(2) 補上從未量測的 <code>lm_head_gemm</code>，它是 prefill 投影最大的未知數；(3) 實測 N=32 的 GEMV tile，取代目前的線性外推；(4) 對 <code>lm_head</code> 形狀跑對應的融合 kernel，驗證 Round 7–9 的重疊比例外推限制。</p>
+    <p>CHIA kernel loop 已全部結束（smoke + round1–10，63 runs、248 iterations、$180.16、約 74 小時），2026-09-19 另外跑了一次手動、單一維度的硬體 outer-loop sweep（見上節），是 proposal 第四步的<b>部分達成</b>——不是完整 Pareto 前緣，沒有面積或功耗數據。下一步是把所有結果寫成論文（<code>out/paper-submission/</code>，deadline 2026-09-24 AoE）：(1) 把五次訂正歷史（16→8 B/cycle roofline、撤回的 6.26 tok/s 暖態頭條、撤回的 +15.2%/+14.9% 外推、0.611 重疊常數不可跨 kernel family 使用、以及這次「L2 MSHR 是瓶頸」被推翻）寫進論文第 5 節作為方法論貢獻；(2) <code>llama-layer-fused-n1</code> 仍是 ACTIVE 狀態（179,033 vs. 140,680 roofline），論文需明確標注它不是 loop 的最終數字；(3) 若之後要延伸系統層工作（非本 loop 範圍）：batched attention 實測、<code>lm_head_gemm</code> 的 prefill 量測、N=32 GEMV tile 實測、32 B/cycle mbus 點、中間 MSHR 掃描、真實 DRAM 時序模型、面積/功耗數據，都留給下一個提案。</p>
   </section>
 
 </div>

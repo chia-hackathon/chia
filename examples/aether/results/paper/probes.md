@@ -10,15 +10,17 @@ describe the same kind of measurement but were never captured in a `simlog`.
 grep -rn "PROBE" out/loop/*/simlog_*.txt
 ```
 
-This returned **149 `PROBE` lines**, spanning **20 (run_id, iter) file pairs**
-across **6 run_ids**: `20260911-065653-8115` (round5, `llama-q8-gemv-gemmini-n16`),
+This returned **181 `PROBE` lines**, spanning **24 (run_id, iter) file pairs**
+across **7 run_ids**: `20260911-065653-8115` (round5, `llama-q8-gemv-gemmini-n16`),
 `20260911-115840-5f95` (round6, same kernel, continuation),
 `20260912-191730-3a47` (round7, `llama-layer-fused-n1`),
 `20260912-191830-e713` (round7, `llama-q8-gemv-gemmini-n1`, dedicated
 in-flight-scan / warm-cold probe run), `20260915-060820-a93a` (round8,
-`llama-layer-fused-n1`, continuation of round7's search), and
+`llama-layer-fused-n1`, continuation of round7's search),
 `20260916-195958-36b4` (round9, `llama-layer-fused-n1`, continuation of
-round8's search). Run-to-kernel mapping is from `out/loop/rounds.json`.
+round8's search), and `20260917-155834-2887` (round10,
+`llama-lmhead-fused-n1`, new kernel testing overlap-ratio extrapolation to
+the LM head). Run-to-kernel mapping is from `out/loop/rounds.json`.
 
 **Caveat — pre-round5 era:** the harness only began saving `simlog_NN.txt`
 starting round5 (2026-09-11). Iterations before that (rounds 1-4, and the
@@ -35,6 +37,10 @@ capture)`. Two such run_ids were found: `20260909-200541-dae1` (round4,
 `out/loop/20260916-195958-36b4/` (round9, now finished) was read-only
 exploration; its 19 `PROBE` lines across iters 1-4 are folded into sections
 B and C below.
+
+`out/loop/20260917-155834-2887/` (round10, now finished) is the first run of
+the new kernel `llama-lmhead-fused-n1`; its 32 `PROBE` lines across iters 1-4
+are folded into sections B and C below.
 
 ---
 
@@ -99,6 +105,7 @@ reproduces the e713 PROBE values verbatim, matching exactly.
 | **round9** 20260916-195958-36b4 | 01 | llama-layer-fused-n1 | `sat_done` = cycle at which Saturn's own attention/elementwise compute finishes; `gemv_end` = cycle at which the whole kernel (incl. Gemmini GEMV weight streaming) finishes; `warm_cmds` = count of DMA-warming commands issued ahead of use (this iter's CHANGE, which regressed). Purpose: check whether warming Saturn's operands into L2 ahead of time hides more of Saturn's cost behind the GEMV stream. | `sat_done=106708`, `gemv_end=185332`, `warm_cmds=267` (sat_done/gemv_end = 57.6%) | out/loop/20260916-195958-36b4/simlog_01.txt:5-7 |
 | **round9** 20260916-195958-36b4 | 02 | llama-layer-fused-n1 | Same `sat_done`/`gemv_end` split, this iter halving the Saturn unit grain (finer-grained interleaving with the mvin stream) instead of DMA-warming. | `sat_done=99956`, `gemv_end=179890` (sat_done/gemv_end = 55.6%) | out/loop/20260916-195958-36b4/simlog_02.txt:5-6 |
 | **round9** 20260916-195958-36b4 | 03 | llama-layer-fused-n1 | Probe-only iteration on the unchanged iter-5/best kernel (no functional change): same `sat_done`/`gemv_end` split, plus new host-dispatch-cost probes — `unit_host_cycles`/`unit_calls` = total host wall time inside `lf_sat_unit` calls and the call count (rdcycle around every unit); `mvin_stall_sampled`/`mvin_samples` = sampled rdcycle-to-rdcycle span around every 8th `mvin2` issue and the sample count. Purpose: distinguish "host co-bottlenecked with DMA" (Model C) from "host has slack, DMA/vector traffic contends" (Model D). | `sat_done=104365`, `gemv_end=183228` (57.0%); `unit_host_cycles=48799`, `unit_calls=256` (~190.6 c/unit-call); `mvin_stall_sampled=2558`, `mvin_samples=512` (~5.0 c/sampled mvin) | out/loop/20260916-195958-36b4/simlog_03.txt:5-9 |
+| **round10** 20260917-155834-2887 | 01 | llama-lmhead-fused-n1 | Iteration 1 denominator-only probe on the UNCHANGED strictly-sequential baseline schedule (fenced GEMV, then rmsnorm/quantise/argmax back to back): `stream` = the 4 MiB LM-head weight stream alone, cold, Saturn phases serialised after it; `rms`/`quant`/`argmax` = cold cost of each Saturn phase, serialised. Purpose: establish the denominator for an lm_head exposure ratio, mirroring `llama-layer-fused-n1`'s round8 `PROBE stream=` methodology. | `stream=634821`, `rms=7296`, `quant=2496`, `argmax=2980`, `total=647593` (serialised Saturn = rms+quant+argmax = 12,772 cycles, 1.97% of total) | out/loop/20260917-155834-2887/simlog_01.txt (agent_01.txt) |
 
 **Round9 interpretation, CORRECTED** (all 4 iterations of run
 `20260916-195958-36b4`, seeded from round8's 179,585 best): `sat_done` sits
@@ -138,6 +145,18 @@ has not been shown to be near a floor either — four iterations of one
 technique (DMA-warming, grain-halving) not working is not the same as
 Saturn-side optimization being played out.
 
+**Round10 interpretation** (`llama-lmhead-fused-n1`, run
+`20260917-155834-2887`, testing whether `llama-layer-fused-n1`'s exposure
+ratio extrapolates to the LM head): iter1's phase split shows serialised
+Saturn work (`rms+quant+argmax = 12,772` cycles) is only **1.97%** of the
+iteration's printf-free total (`647,593`), versus `llama-layer-fused-n1`'s
+own Saturn share of its baseline, `28,372/206,304 = 13.8%`. lm_head's
+overlappable Saturn work is proportionally much smaller than layer-fused's
+to begin with — before any exposure/hiding is even considered, there is far
+less to hide. Combined with the negative result below (Section C), this
+supports the conclusion that lm_head's measured exposure ratio is
+effectively ~1.0 (no measurable overlap benefit), not layer-fused's 0.611.
+
 ---
 
 ## C. Host-issue-cost probes
@@ -146,6 +165,32 @@ Saturn-side optimization being played out.
 |---|---|---|---|---|---|
 | 20260912-191830-e713 | 02 | llama-q8-gemv-gemmini-n1 | Isolating host RoCC-issue overhead underneath `loop_ws`/`LoopMatmul`: `passthru_loop_issue_cycles` = cycles for the host to hand off one K-tile `loop_ws` command and regain control; `passthru_64mvin_accept_cycles` = cycles for 64 hand-issued 1-row mvins (to an unused scratchpad row) to be accepted while `loop_ws` executes underneath; `passthru_loop_plus_mvins_total_cycles` = the combined total. Result shows `LoopMatmul` blocks passthrough issue much more than expected (~15.1k, not "a few hundred"), so extra hand-issued commands cannot be freely interleaved under a running `loop_ws`. | `passthru_loop_issue_cycles=38`, `passthru_64mvin_accept_cycles=15126`, `passthru_loop_plus_mvins_total_cycles=15333` | out/loop/20260912-191830-e713/simlog_02.txt:5-7 (agent_02.txt) |
 | **pre-harness-fix** 20260909-200541-dae1 | 11 | llama-q8-gemv-gemmini-lmhead | Prose-only (no simlog): `lq8_probe_issue` — 16,384 hand-issued 1-row×16B mvin2 commands, all hitting L2, fence-bounded, timed with `rdcycle`; printed as `LQ8PROBE issue: ... per_cmd=%lu`. HYPOTHESIS: host-issue cost ≈20 cycles/command. This is an EXPECTED/hypothesis value, not a confirmed-measured one (no captured log). | source type: **agent_NN.txt prose (pre-harness-fix, no simlog capture)** — hypothesis ≈20 cycles/command; EXPECTED total ≈780k-975k depending on assumed per-command cost | out/loop/20260909-200541-dae1/agent_11.txt:16-18 |
+| **round10** 20260917-155834-2887 | 03 | llama-lmhead-fused-n1 | On top of iter2's interleaved 80-unit Saturn schedule (Saturn issued inside the weight stream, fence moved to the end): `rdcycle` taken before/after every unit call, accumulated per phase (`held_rms1`/`held_rms2`/`held_quant`/`held_amax1`/`held_amax2`) = wall-clock cycles each phase held/blocked the host at the interleaved call sites, i.e. host-side exposure/occupancy per stage — not the raw serialised Saturn duration from iter1. Purpose: determine whether the interleaved schedule's larger-than-serial exposure (651,726 vs 647,593) comes from inflated per-unit held time (cold misses under the concurrent weight stream) or from near-zero queued-DMA shadow. | `held_rms1=5984`, `held_rms2=8990`, `held_quant=6552`, `held_amax1=2093`, `held_amax2=3532` (sum=27,151), `total=653221` | out/loop/20260917-155834-2887/simlog_03.txt (agent_03.txt) |
+| **round10** 20260917-155834-2887 | 04 | llama-lmhead-fused-n1 | Reverted to the baseline SERIALISED schedule (Saturn after the fence, correctness-preserving); pure scalar `rdcycle` spin-wait inserted at each K-block hook of the steady-state weight stream, swept 0/80/250/600 cycles across 4 groups of 32 K-blocks, with per-group period accumulated (`spinN_period_sum`/`cnt`). Purpose: measure the "host departs for L cycles -> how much weight-stream exposure results" curve, to calibrate a per-departure hide/expose model for future interleaved schedules. | `spin0_period_sum=154598 cnt=32`, `spin80_period_sum=154376 cnt=32`, `spin250_period_sum=150380 cnt=32`, `spin600_period_sum=145647 cnt=31`, `total=663023` | out/loop/20260917-155834-2887/simlog_04.txt (agent_04.txt) |
+
+**Round10 interpretation** (host-exposure probes, `llama-lmhead-fused-n1`,
+run `20260917-155834-2887`): iter3's `held_*` sum (27,151) is markedly larger
+than iter1's serialised-baseline Saturn cost (12,772) for the *same* five
+phases, even though iter3 measures a schedule that was supposed to hide some
+of that cost inside the weight stream. The most likely explanation (see
+`kernel_04.h`'s own HYPOTHESIS and `agent_04.txt`, not independently
+re-derived here) is that the interleaved schedule spaces adjacent Saturn
+phases 16 K-blocks (530 KiB of weight stream) apart, which exceeds the
+512 KiB L2, so `X`/`xn`/`LG` are evicted and each phase's second visit
+(`rms2`, `amax2`) becomes a full cold re-fetch from DRAM rather than an L2
+hit — inflating held time well past the phases' original serial cost. This
+is stated as the most likely mechanism, not confirmed by an independent
+measurement; it is inference from `agent_04.txt`'s own reasoning, flagged
+here as such. iter4's spin-wait scan then shows `period_sum` decreasing
+monotonically as spin increases (154,598 -> 154,376 -> 150,380 -> 145,647
+for spin=0/80/250/600), i.e. a longer pure-scalar host departure before
+returning to the stream modestly *reduces* the sampled period sum — tighter,
+longer polling has a small favorable effect on synchronization
+latency/overhead — but this did not translate into iter4's overall total
+(698,428) beating the baseline (648,292): the effect is real but far too
+small to close the gap opened by iter2/iter3's interleaving attempts, and
+lm_head's fundamental exposure problem (Section B above) remains the
+dominant, unresolved cost.
 
 ---
 
@@ -168,8 +213,46 @@ Saturn-side optimization being played out.
 
 ---
 
+## F. Hardware sweep (outer loop, 2026-09-19) — not a kernel-loop probe
+
+Not from `loop/aether.db` — a separate, manually-driven design-point sweep
+over hardware config, run after round10 concluded. Full source:
+`out/hw-sweep/README.md`; raw logs `out/hw-sweep/simlog.*.txt`,
+`out/hw-sweep/elaborate.*.log`; tabulated `out/paper/hardware_sweep.csv`.
+
+| design point | mbus (B/c) | L2 MSHR | kernel | condition | cycles | B/cycle | speedup vs. control | source |
+|---|---:|---:|---|---|---:|---:|---:|---|
+| control (`GENV256D128GemminiShuttleConfig`) | 8 | 12 | llama-q8-gemv-gemmini-n1 | cold | 184,837 | 5.67 | 1.000x | `simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleConfig.txt` |
+| DeepMshr | 8 | 24 | llama-q8-gemv-gemmini-n1 | cold | 173,633 | 6.04 | 1.065x | `simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleDeepMshrConfig.txt` |
+| WideMbus | 16 | 12 | llama-q8-gemv-gemmini-n1 | cold | 117,526 | 8.92 | 1.573x | `simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleWideMbusConfig.txt` |
+| WideDeep | 16 | 24 | llama-q8-gemv-gemmini-n1 | cold | 115,865 | 9.05 | 1.595x | `simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleWideDeepConfig.txt` |
+| control | 8 | 12 | llama-q8-gemv-gemmini-lmhead | cold | 634,507 | 6.61 | 1.0000x | `simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleConfig.txt` |
+| DeepMshr | 8 | 24 | llama-q8-gemv-gemmini-lmhead | cold | 634,580 | 6.61 | 0.9999x | `simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleDeepMshrConfig.txt` |
+| WideMbus | 16 | 12 | llama-q8-gemv-gemmini-lmhead | cold | 472,616 | 8.87 | 1.343x | `simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleWideMbusConfig.txt` |
+| WideDeep | 16 | 24 | llama-q8-gemv-gemmini-lmhead | cold | 472,093 | 8.89 | 1.344x | `simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleWideDeepConfig.txt` |
+
+**Verification the knobs took effect** (elaborated artefacts, not source):
+`sifive,mshr-count` in the generated `.dts` = 12/12/24/24
+(`out/hw-sweep/elaborate.*.log`); `SimDRAM .DATA_BITS()` in the generated
+`TestHarness.sv` = 64/128/64/128.
+
+**Key derived numbers**: widening the mbus alone captures 98.6% of the
+combined gain on n1 cold (5.67→8.92 of 9.05 B/cycle); the control's warm
+rate (7.92 B/cycle) is 99.0% of the 8 B/cycle mbus roofline, which is why
+there was no MSHR-shaped headroom to recover. End-to-end decode projection
+(`loop/llama_project.py --scenario decode --S 512`): control 2.29 →
+WideDeep 3.47 tok/s @500 MHz (1.51x); @1 GHz 4.58 → 6.93.
+
+**This corrects the "L2 MSHR occupancy/bank conflicts" attribution** in
+§B above / `out/paper/methodology.md` §6(b) — that attribution was inferred,
+never measured directly, and this sweep shows it was wrong. See
+`out/paper/methodology.md` Correction 5 and `out/paper/timeline.md`
+incident 7.
+
+---
+
 ## Summary of coverage
 
-- 149 raw `PROBE` lines found via the grep above, across 20 (run_id, iter) simlog files and 6 run_ids (round5-round9).
+- 181 raw `PROBE` lines found via the grep above, across 24 (run_id, iter) simlog files and 7 run_ids (round5-round10).
 - 2 additional pre-round5 run_ids (`20260909-200541-dae1`, `20260909-200611-94c0`, both round4) contain prose-only `PROBE`/`LQ8PROBE` mentions with no simlog capture; these are flagged throughout as `agent_NN.txt prose (pre-harness-fix, no simlog capture)` and their numbers are EXPECTED/hypothesis values from the agent, not confirmed measurements.
 - Category D `flush_cycles` lines (7 instances) and the per-loop `loop_NN ...` lines within categories A/B are individually numerous (most of the 130 raw lines) but are grouped into single table rows per iteration/condition above rather than transcribed one-line-per-row, to keep the table readable; the exact per-loop breakdown is preserved in the cited simlog files.

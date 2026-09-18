@@ -29,6 +29,7 @@
 | round7 | 2026-09-12T19:17:31+00:00 | 2026-09-13T16:42:08.648605+00:00 | 21h24m | 28 | 35 | 35 | 0 | $7.5365 | claude-fable-5-1 |
 | round8 | 2026-09-15T06:08:21+00:00 | 2026-09-15T11:51:24+00:00 | 5h43m | 1 | 6 | 6 | 0 | $14.6592 | claude-fable-5-1 |
 | round9 | 2026-09-16T19:59:59+00:00 | 2026-09-17T01:14:23+00:00 | 5h14m | 1 | 6 | 6 | 0 | $6.4724 | claude-fable-5-1 |
+| round10 | 2026-09-17T15:58:35+00:00 | 2026-09-17T19:36:42+00:00 | 3h38m | 1 | 5 | 5 | 0 | $2.3956 | claude-fable-5-1 |
 
 ## b. Per-run detail
 ### smoke — smoke test of the inner loop before round1
@@ -137,18 +138,24 @@
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | llama-layer-fused-n1 | 20260916-195958-36b4 | 4/4 | 179,585 | 206,304 | 179,033 | 140,680 | 1.273x | $6.4724 | 5h14m | continuation of round8's run_id 20260915-060820-a93a, seeded from its best (1795 |
 
+### round10 — launched 2026-09-17 15:58 Taipei, ended ~2026-09-18 03:36 Taipei (overnight). This round tested the new kernel llama-lmhead-fused-n1, asking whether the 'overlap ratio can be extrapolated' hypothesis from the llama-layer-fused-n1 work (round7-9; Saturn compute increasingly hidden behind Gemmini weight-stream / host dispatch, ~61% overlap assumed by DEFAULT_OVERLAP_FACTOR) generalizes to lm_head. Single run: llama-lmhead-fused-n1, run_id 20260917-155834-2887, 4 iterations, baseline 648292, roofline 532232 -> iterations 676825 (iter1, regression), 651726 (iter2, regression, close to baseline), 689999 (iter3, probe-only, regression), 698428 (iter4, regression). Baseline 648292 was NEVER beaten in this round; speedup 1.000x (+0.0%), a clear negative result. iter1 probe decomposed the Saturn pipeline into phases: stream=634821 rms=7296 quant=2496 argmax=2980 (total 647593); excluding 'stream', the overlappable Saturn-side work is only rms+quant+argmax=12772 cycles, ~2.0% of the iteration total -- far smaller than layer-fused's overlap-relevant share. iter2 probe measured host-side exposure (held_*) per stage instead of raw stage duration: held_rms1=5984 held_rms2=8990 held_quant=6552 held_amax1=2093 held_amax2=3532 (sum 27151, total 653221) -- larger than iter1's 12772, likely reflecting host/sync-boundary wall-clock exposure (and possibly double-counting split sub-stages) rather than raw Saturn compute time; not fully reconciled. iter3 swept a busy-wait spin parameter (0/80/250/600) before checking the Saturn pipeline, sampling ~32 periods each: spin0 period_sum=154598 cnt=32, spin80=154376 cnt=32, spin250=150380 cnt=32, spin600=145647 cnt=31 (iteration total 663023) -- tighter polling (higher spin) modestly reduces sampled sync-wait period, but iter4 (698428, applying findings from the spin scan) still did not beat baseline, confirming lm_head's exposure problem is structural, not a scheduling-tuning issue. Conclusion: lm_head's overlappable Saturn work is proportionally too small (and/or too exposed at host sync points) for the layer-fused overlap findings to transfer; a single global overlap factor should not be assumed across kernel families.
+| kernel | run_id | iters (done/planned) | seed | baseline | best | roofline | best/roofline | cost | wall-clock | note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| llama-lmhead-fused-n1 | 20260917-155834-2887 | 4/4 | ? | 648,292 | 648,292 | 532,232 | 1.218x | $2.3956 | 3h38m | new kernel llama-lmhead-fused-n1, testing overlap-ratio extrapolation from layer |
+
 ## c. Per-kernel history (baseline -> round-by-round best)
-| kernel | baseline | roofline | smoke | round1 | round2 | round2b | round3 | round4 | round5 | round6 | round7 | round8 | round9 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| llama-attn-pv-int8 | 22,856 | 4,096 | - | 4,853 (cum $2.7655) | 4,853 (cum $2.7655) | 4,853 (cum $6.9224) | 4,814 (cum $11.6115) | - | - | - | - | - | - |
-| llama-attn-scores-int8 | 51,280 | 6,144 | - | 8,574 (cum $3.9013) | 8,574 (cum $3.9013) | 8,233 (cum $11.9327) | 8,233 (cum $16.6475) | - | - | - | - | - | - |
-| llama-layer-fused-n1 | 206,304 | 140,680 | - | - | - | - | - | - | - | - | 206,304 (cum $4.9934) | 179,585 (cum $19.6526) | 179,033 (cum $26.1251) |
-| llama-q8-gemm | 146,737 | 131,072 | - | - | - | - | 138,892 (cum $7.0106) | 137,246 (cum $12.2686) | - | - | - | - | - |
-| llama-q8-gemv-gemmini-lmhead | 740,101 | 524,288 | - | - | 691,515 (cum $1.4157) | 659,142 (cum $8.1097) | 635,908 (cum $15.9902) | 634,507 (cum $23.2817) | - | - | - | - | - |
-| llama-q8-gemv-gemmini-n1 | 150,339 | 131,072 | - | 132,653 (cum $8.7460) | 132,653 (cum $11.5313) | 132,424 (cum $18.1664) | 132,424 (cum $47.1673) | 132,424 (cum $48.9947) | - | - | 132,424 (cum $51.5378) | - | - |
-| llama-q8-gemv-gemmini-n16 | 168,367 | 131,072 | - | - | - | - | - | - | 142,458 (cum $7.9986) | 142,458 (cum $12.9170) | - | - | - |
-| llama-silu-mul | 361,260 | 30,720 | - | 66,811 (cum $2.3084) | 50,256 (cum $4.0554) | 35,774 (cum $7.6159) | 31,024 (cum $10.1468) | - | - | - | - | - | - |
-| llama-softmax | 21,906 | 1,472 | 4,312 (cum $0.6494) | 1,752 (cum $3.5881) | 1,630 (cum $5.0127) | 1,568 (cum $7.1822) | 1,555 (cum $13.2237) | - | - | - | - | - | - |
+| kernel | baseline | roofline | smoke | round1 | round2 | round2b | round3 | round4 | round5 | round6 | round7 | round8 | round9 | round10 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| llama-attn-pv-int8 | 22,856 | 4,096 | - | 4,853 (cum $2.7655) | 4,853 (cum $2.7655) | 4,853 (cum $6.9224) | 4,814 (cum $11.6115) | - | - | - | - | - | - | - |
+| llama-attn-scores-int8 | 51,280 | 6,144 | - | 8,574 (cum $3.9013) | 8,574 (cum $3.9013) | 8,233 (cum $11.9327) | 8,233 (cum $16.6475) | - | - | - | - | - | - | - |
+| llama-layer-fused-n1 | 206,304 | 140,680 | - | - | - | - | - | - | - | - | 206,304 (cum $4.9934) | 179,585 (cum $19.6526) | 179,033 (cum $26.1251) | - |
+| llama-lmhead-fused-n1 | 648,292 | 532,232 | - | - | - | - | - | - | - | - | - | - | - | 648,292 (cum $2.3956) |
+| llama-q8-gemm | 146,737 | 131,072 | - | - | - | - | 138,892 (cum $7.0106) | 137,246 (cum $12.2686) | - | - | - | - | - | - |
+| llama-q8-gemv-gemmini-lmhead | 740,101 | 524,288 | - | - | 691,515 (cum $1.4157) | 659,142 (cum $8.1097) | 635,908 (cum $15.9902) | 634,507 (cum $23.2817) | - | - | - | - | - | - |
+| llama-q8-gemv-gemmini-n1 | 150,339 | 131,072 | - | 132,653 (cum $8.7460) | 132,653 (cum $11.5313) | 132,424 (cum $18.1664) | 132,424 (cum $47.1673) | 132,424 (cum $48.9947) | - | - | 132,424 (cum $51.5378) | - | - | - |
+| llama-q8-gemv-gemmini-n16 | 168,367 | 131,072 | - | - | - | - | - | - | 142,458 (cum $7.9986) | 142,458 (cum $12.9170) | - | - | - | - |
+| llama-silu-mul | 361,260 | 30,720 | - | 66,811 (cum $2.3084) | 50,256 (cum $4.0554) | 35,774 (cum $7.6159) | 31,024 (cum $10.1468) | - | - | - | - | - | - | - |
+| llama-softmax | 21,906 | 1,472 | 4,312 (cum $0.6494) | 1,752 (cum $3.5881) | 1,630 (cum $5.0127) | 1,568 (cum $7.1822) | 1,555 (cum $13.2237) | - | - | - | - | - | - | - |
 
 ## d. Appendix — every iteration
 | run_id | iter | status | cycles | cost | duration | note |
@@ -398,3 +405,8 @@
 | 20260916-195958-36b4 | 2 | ok | 180,107 | $0.9998 | 1h01m | passed, cycles=180107, instret=None |
 | 20260916-195958-36b4 | 3 | ok | 183,430 | $2.1677 | 1h06m | passed, cycles=183430, instret=None |
 | 20260916-195958-36b4 | 4 | ok | 179,033 | $1.4750 | 1h04m | passed, cycles=179033, instret=None |
+| 20260917-155834-2887 | 0 | ok | 648,292 | $0.0000 | 0m04s | passed, cycles=648292, instret=None |
+| 20260917-155834-2887 | 1 | ok | 676,825 | $0.7500 | 1m22s | passed, cycles=676825, instret=None |
+| 20260917-155834-2887 | 2 | ok | 651,726 | $0.6624 | 54m15s | passed, cycles=651726, instret=None |
+| 20260917-155834-2887 | 3 | ok | 689,999 | $0.3922 | 53m43s | passed, cycles=689999, instret=None |
+| 20260917-155834-2887 | 4 | ok | 698,428 | $0.5909 | 54m28s | passed, cycles=698428, instret=None |

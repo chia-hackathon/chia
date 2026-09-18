@@ -61,6 +61,67 @@ class GENV256D128GemminiShuttleCosimConfig extends Config(
 """
 
 
+SWEEP_CONFIG_TEXT = """
+// ------------------------------------------------------------------
+// AETHER hw-sweep: memory-system design points around the baseline
+// ------------------------------------------------------------------
+// Widen the memory bus (L2 -> AXI4 mem port -> SimDRAM).
+// rocket-chip default is MemoryBusParams(beatBytes = 8) and the config chain
+// never overrode it (rocket-chip/src/main/scala/subsystem/Configs.scala:50).
+// ExtMem's MasterPortParams.beatBytes is `site(MemoryBusKey).beatBytes`
+// (Configs.scala:272), so the AXI4 mem port and testchipip's SimDRAM follow
+// automatically; nMemoryChannels stays 1.
+class WithAetherMemoryBusWidth(bits: Int) extends Config((site, here, up) => {
+  case freechips.rocketchip.subsystem.MemoryBusKey =>
+    up(freechips.rocketchip.subsystem.MemoryBusKey).copy(beatBytes = bits / 8)
+})
+
+// Deepen the SiFive InclusiveCache L2's MSHR file.  The count is *derived*:
+//   all_mshrs = 2 + max(2, ceil(memCycles / blockBeats))
+// (rocket-chip-inclusive-cache/.../src/Parameters.scala:295-302) with
+// blockBeats = blockBytes/sbus.beatBytes = 64/16 = 4 here.  memCycles=40 gives
+// 2 + 10 = 12 (matches `sifive,mshr-count = <12>` in the baseline .dts);
+// memCycles=88 gives 2 + 22 = 24.
+class WithAetherL2MemCycles(cycles: Int) extends Config((site, here, up) => {
+  case freechips.rocketchip.subsystem.InclusiveCacheKey =>
+    up(freechips.rocketchip.subsystem.InclusiveCacheKey).copy(memCycles = cycles)
+})
+
+// (a) wider memory bus only: 8 B/cycle -> 16 B/cycle
+class GENV256D128GemminiShuttleWideMbusConfig extends Config(
+  new chipyard.WithAetherMemoryBusWidth(128) ++
+  new saturn.shuttle.WithShuttleVectorUnit(256, 128, saturn.common.VectorParams.genParams) ++
+  new gemmini.DefaultGemminiConfig ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new shuttle.common.WithShuttleTileBeatBytes(16) ++
+  new shuttle.common.WithNShuttleCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+// (b) deeper L2 MSHR file only: 12 -> 24
+class GENV256D128GemminiShuttleDeepMshrConfig extends Config(
+  new chipyard.WithAetherL2MemCycles(88) ++
+  new saturn.shuttle.WithShuttleVectorUnit(256, 128, saturn.common.VectorParams.genParams) ++
+  new gemmini.DefaultGemminiConfig ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new shuttle.common.WithShuttleTileBeatBytes(16) ++
+  new shuttle.common.WithNShuttleCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+// (c) both
+class GENV256D128GemminiShuttleWideDeepConfig extends Config(
+  new chipyard.WithAetherMemoryBusWidth(128) ++
+  new chipyard.WithAetherL2MemCycles(88) ++
+  new saturn.shuttle.WithShuttleVectorUnit(256, 128, saturn.common.VectorParams.genParams) ++
+  new gemmini.DefaultGemminiConfig ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new shuttle.common.WithShuttleTileBeatBytes(16) ++
+  new shuttle.common.WithNShuttleCores(1) ++
+  new chipyard.config.AbstractConfig)
+"""
+
+SWEEP_MARK = "class GENV256D128GemminiShuttleWideMbusConfig"
+
+
 
 def append_config(path, text, mark):
     """Idempotently append `text` to `path`; refuse if `mark` is already there."""
@@ -80,5 +141,16 @@ def main(argv):
     print("PATCHED %s" % path)
 
 
+def main_sweep(argv):
+    """Append ONLY the hw-sweep memory-system design points (out/hw-sweep)."""
+    path = argv[1]
+    if not append_config(path, SWEEP_CONFIG_TEXT, SWEEP_MARK):
+        sys.exit("FATAL: %s already has the sweep configs" % path)
+    print("PATCHED(sweep) %s" % path)
+
+
 if __name__ == "__main__":
-    main(sys.argv)
+    if len(sys.argv) > 2 and sys.argv[2] == "--sweep":
+        main_sweep(sys.argv)
+    else:
+        main(sys.argv)

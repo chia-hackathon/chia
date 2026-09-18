@@ -389,6 +389,81 @@ RTL elaboration shows 500 MHz).
 
 ---
 
+## round10
+
+- **Date (UTC)**: launched 2026-09-17T15:58:35+00:00 (= 2026-09-17 15:58
+  Taipei local machine time per `out/loop/rounds.json`'s round10 entry;
+  `runs.started` in `out/loop/aether.db` confirms
+  `2026-09-17T15:58:35+00:00`). Ended `runs.finished` =
+  `2026-09-17T19:36:42+00:00` (≈2026-09-18 03:36 local machine time),
+  ~3h38m wall-clock (overnight). Round10 is now recorded in
+  `out/loop/rounds.json` and reflected in `out/loop/ledger.md` / `ledger.json`
+  and `out/loop/iterations.md` / `iterations.json` (regenerated via
+  `loop/ledger.py` and `loop/journal.py` against the finished run).
+- **Kernel / run**: **new kernel** `llama-lmhead-fused-n1`, run
+  `20260917-155834-2887`, `--iters 4`. This is the LM-head-shaped
+  counterpart to `llama-layer-fused-n1` (round7-9): one Gemmini LM-head GEMV
+  (1x2048x2048 int8, 4 MiB of weights) fused, in one timed region, with the
+  final RMSNorm, int8 quantisation of the next hidden state, and a running
+  argmax over the logits — no attention work anywhere in it. Only one
+  kernel/run was launched this round, all 4 planned iterations completed.
+- **Purpose**: test whether `llama-layer-fused-n1`'s measured Saturn/Gemmini
+  overlap exposure ratio (0.611, `DEFAULT_OVERLAP_FACTOR` in
+  `loop/llama_project.py`) extrapolates to the LM head, which is ~20.5% of
+  decode cycles and streams 4x the weight bytes of the layer-fused kernel's
+  GEMV with none of its attention companion work.
+- **Iterations**: 4 scored (4 ok / 0 fail), plus a baseline row (5 total per
+  `ledger.md`). **Cost**: $2.3956.
+- **Findings** (`rounds.json` round10 note, `ledger.md` §b,
+  `out/loop/20260917-155834-2887/summary.txt`):
+  - baseline 648,292, roofline 532,232 → iter1 **676,825** (denominator-only
+    probe, schedule untouched), iter2 **651,726** (the actual optimization
+    attempt: fence moved to after the last mvout, Saturn's five sub-phases
+    interleaved into an 80-unit state machine inside the weight stream —
+    regressed), iter3 **689,999** (probe-only, held-cycles instrumentation
+    on iter2's interleaved schedule), iter4 **698,428** (probe-only,
+    spin-wait scan, reverted to the baseline serialised schedule). **Best
+    cycles remain 648,292 (the baseline) — never beaten. Speedup 1.000x
+    (+0.0%), a clear negative result.**
+  - **New this round — phase-split probe (iter1).** `PROBE stream=634,821
+    rms=7,296 quant=2,496 argmax=2,980 total=647,593`. Serialised Saturn
+    work (`rms+quant+argmax`) = **12,772 cycles**, only **1.97%** of the
+    iteration total — versus `llama-layer-fused-n1`'s Saturn share of its
+    own baseline, `28,372/206,304 = 13.8%`. lm_head's overlappable Saturn
+    work is proportionally far smaller than layer-fused's to begin with.
+  - **New this round — held-cycles probe (iter3), on iter2's interleaved
+    schedule.** `held_rms1=5,984 held_rms2=8,990 held_quant=6,552
+    held_amax1=2,093 held_amax2=3,532` (sum **27,151**), `total=653,221`.
+    Exposure = 653,221 − 634,821 = 18,400, so the 80 host departures hid only
+    27,151 − 18,400 = 8,751 cycles net (~109 cycles/departure) — far below
+    the ~390-cycle queued-DMA shadow iter2's model assumed. Likely mechanism
+    (per `kernel_04.h`/`agent_04.txt`, not independently re-derived): the
+    interleaved phases are spaced 530 KiB of weight stream apart (> the
+    512 KiB L2), so cold data is evicted and re-fetched between visits —
+    stated as the most probable explanation, flagged as inference rather
+    than an independently confirmed mechanism.
+  - **New this round — spin-wait scan (iter4), on the reverted baseline
+    serialised schedule.** `spin0_period_sum=154,598 spin80=154,376
+    spin250=150,380 spin600=145,647` (cnt≈32 each), `total=663,023`.
+    `period_sum` decreases monotonically as the scalar spin length
+    increases — tighter/longer host busy-waiting modestly reduces
+    synchronization latency/overhead — but this did not translate into
+    iter4's overall total (698,428) beating the baseline: the effect exists
+    but is far too small relative to lm_head's fundamental exposure problem.
+  - **Conclusion**: lm_head's measured exposure ratio is effectively
+    **~1.0** (baseline never beaten; best/roofline unchanged at 1.218x).
+    `0.611` does **not** extrapolate to the LM head — exactly the outcome
+    `loop/kernels.py`'s own pre-round notes for this kernel predicted
+    ("exposure ratio ~1.0 ... this is the outcome the arithmetic
+    predicts"). See `out/llama-profile/projection_round10.md` for the full
+    interpretation and a recommendation that `loop/llama_project.py
+    --overlap` should not apply one global overlap constant across kernel
+    families.
+- **Incidents**: none — 4/4 iterations completed, no watchdog restarts or
+  rate-limit events logged for this round.
+
+---
+
 ## Cross-cutting incidents
 
 | # | Incident | Round(s) affected | Source |
@@ -398,26 +473,75 @@ RTL elaboration shows 500 MHz).
 | 3 | **Root disk full + migration to `/share1`.** Ray's temp/spill directory on local disk filled the root partition; migrated 2026-09-09. | pre-round4 (context for round4) | `out/loop/rounds.json` round4 note, `out/loop/migrate-ray-to-share1.sh`, `FINAL_REPORT.md` §4 row 3 |
 | 4 | **Roofline bandwidth correction: 16 → 8 B/cycle.** Gemmini's weight/activation traffic goes over rocket-chip's mbus (`MemoryBusParams(beatBytes = 8)`), physically 8 B/cycle, not the previously assumed 16. Fixed 2026-09-09, before round4 launched. Doubled all memory-bound roofline cycle counts (n1/n16 gemv 65,536→131,072; lmhead 262,144→524,288; q8-gemm unchanged, compute-bound). `llama_project.py --mem-bytes-per-cycle` still defaults to the stale 16.0 — any rerun must pass `--mem-bytes-per-cycle 8.0` explicitly. | round3 (discovered at round end) → round4 onward (first round analyzed under the fix) | `out/loop/README.md` "Roofline correction (2026-09-09)", `FINAL_REPORT.md` §3(1), `out/llama-profile/projection_round3.md` |
 | 5 | **Harness printf/simlog fix enabling reliable PROBE capture.** Landed before round5 (2026-09-11). Three changes: (1) `loop/loop.py` now saves each iteration's simulator log to `out/loop/<run_id>/simlog_NN.txt`; (2) `loop/llm.py`'s new `_benchmark_stdout_tail()` (line 212, called from line 284) attaches a stdout tail to *passing*-iteration feedback too (previously only failing iterations saw stdout); (3) added `loop/tests/test_llm_feedback.py` (4 passed). Before this fix, probe numbers printed via `printf` were lost once an iteration passed — several round4-and-earlier probes (e.g. `20260908-202413-e8e8` iter1, `20260909-200541-dae1` iters 2/7/8/11) have only narrative reconstructions in `agent_NN.txt`, not structured data. | pre-round5 (affects interpretability of round1-4 probe data retroactively) | `FINAL_REPORT.md` §3(8) and §4 row 4 |
-| 6 | **Warm-L2 illusion / 2026-09-12 audit correction.** The `llama-q8-gemv-gemmini-n1` "best" of 132,424 cycles (round2b onward) is not a purely cold measurement — it includes ~200 KiB of harness-left warm L2 residue from the benchmark's own DRAM fill; true cold-ascending measurement is **149,757 cycles = 7.00 B/cycle** (upper bound). Related corrections in the same audit: (a) lm_head's cold rate is 6.61 B/cycle (not a >8 B/cycle n1-basis extrapolation, which was physically impossible); (b) the simulator uses the no-timing `mm_magic_t` DRAM model, not DRAMSim2 (never passes `+dramsim`/`+dramsim_ini_dir` — see `loop/nodes.py:156-168`, `chia/chipyard/verilator_run_node.py:513-519`) — so the true bottleneck for cold weight streaming is L2 MSHR occupancy/bank conflicts, not "DRAMSim2 cold-stream" behavior as originally described; (c) the 1 GHz clock assumption was never validated — RTL elaboration shows sbus/pbus/fbus/mbus/cbus all running at 500 MHz (`out/coexist/elaborate.GENV256D128GemminiShuttleConfig.log:216-220`), yielding a revised cold-state N=1 decode projection of 5.345/5.014 tok/s @1GHz (upper/lower bound) or 2.673/2.507 tok/s @500MHz, versus the original warm-state 6.260 tok/s @1GHz. | round1-6 numbers reinterpreted; discovered 2026-09-12, after round6 and before round7 | `FINAL_REPORT.md` §7, `out/llama-profile/projection_final_v2.md` |
+| 6 | **Warm-L2 illusion / 2026-09-12 audit correction.** The `llama-q8-gemv-gemmini-n1` "best" of 132,424 cycles (round2b onward) is not a purely cold measurement — it includes ~200 KiB of harness-left warm L2 residue from the benchmark's own DRAM fill; true cold-ascending measurement is **149,757 cycles = 7.00 B/cycle** (upper bound). Related corrections in the same audit: (a) lm_head's cold rate is 6.61 B/cycle (not a >8 B/cycle n1-basis extrapolation, which was physically impossible); (b) the simulator uses the no-timing `mm_magic_t` DRAM model, not DRAMSim2 (never passes `+dramsim`/`+dramsim_ini_dir` — see `loop/nodes.py:156-168`, `chia/chipyard/verilator_run_node.py:513-519`) — so the true bottleneck for cold weight streaming is L2 MSHR occupancy/bank conflicts, not "DRAMSim2 cold-stream" behavior as originally described **[SUPERSEDED — see incident 7 below: the 2026-09-19 hardware sweep found the MSHR attribution was itself wrong; the real limit is memory-bus width]**; (c) the 1 GHz clock assumption was never validated — RTL elaboration shows sbus/pbus/fbus/mbus/cbus all running at 500 MHz (`out/coexist/elaborate.GENV256D128GemminiShuttleConfig.log:216-220`), yielding a revised cold-state N=1 decode projection of 5.345/5.014 tok/s @1GHz (upper/lower bound) or 2.673/2.507 tok/s @500MHz, versus the original warm-state 6.260 tok/s @1GHz. | round1-6 numbers reinterpreted; discovered 2026-09-12, after round6 and before round7 | `FINAL_REPORT.md` §7, `out/llama-profile/projection_final_v2.md` |
+| 7 | **Hardware sweep correction (2026-09-19): the L2-MSHR bottleneck claim (incident 6b) was itself wrong.** A four-point outer-loop design-point sweep (`GENV256D128GemminiShuttleConfig` control, plus WideMbus/DeepMshr/WideDeep variants overriding `MemoryBusKey.beatBytes` and `InclusiveCacheKey.memCycles`) isolated mbus width from L2 MSHR count directly. Result: widening the mbus alone (8→16 B/cycle) captures 98.6% of the achievable gain (n1 cold 5.67→8.92 of 9.05 B/cycle); doubling the L2 MSHR file alone (12→24) changes the 4 MiB lm-head cold stream by 0.01% and the 1 MiB n1 cold stream by 6.5%. The control's own warm rate (7.92 B/cycle against an 8 B/cycle bus, 99.0% of roofline) shows there was never MSHR-shaped headroom — the in-flight-request scan that originally motivated the MSHR hypothesis was measuring queueing congestion at a narrow bus, not an MSHR shortage. **Corrected conclusion: decode is bounded by memory-bus width; the L2 MSHR file is not the binding constraint at either width.** This is the project's 5th documented correction. | (retroactively) round1-9 memory-bound analysis; measured 2026-09-19, after the loop concluded (round10) | `out/hw-sweep/README.md`, `out/paper/hardware_sweep.csv` |
 
 ---
 
-## Roll-up (through round9, final)
+## 2026-09-19 — Hardware sweep (outer loop, single dimension)
 
-Computed by summing `ledger.md` §a's per-round rows (smoke through round9,
-now that round9 has finished and is recorded in `rounds.json`/`ledger.md`).
+A four-point design-point sweep testing proposal step 4 (the hardware outer
+loop), run manually rather than through `loop/` itself — see
+`out/paper/methodology.md` §7 for the full method, verification approach,
+and limitations, and `out/hw-sweep/README.md` for the complete write-up.
+
+- **What was swept**: memory-bus width (`beatBytes` 8→16, i.e. 8→16 B/cycle)
+  crossed with L2 MSHR count (12→24, via `InclusiveCacheKey.memCycles`
+  40→88), a 2x2 factorial: control, WideMbus, DeepMshr, WideDeep.
+- **Kernels**: `llama-q8-gemv-gemmini-n1` (cold, 1 MiB weight stream) and
+  `llama-q8-gemv-gemmini-lmhead` (cold, 4 MiB weight stream) — the same
+  kernel binaries used in round7/round9-10, unmodified, so results are
+  directly comparable to the loop's own recorded cycle counts (the control
+  point reproduces both exactly: n1 cold 184,837, lmhead 634,507).
+- **Measured cold cycles / B-per-cycle / speedup vs. control**:
+
+  | design point | mbus | L2 MSHR | n1 cycles | n1 B/c | n1 speedup | lmhead cycles | lmhead speedup |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | control | 8 | 12 | 184,837 | 5.67 | 1.000x | 634,507 | 1.000x |
+  | DeepMshr | 8 | 24 | 173,633 | 6.04 | 1.065x | 634,580 | 0.9999x |
+  | WideMbus | 16 | 12 | 117,526 | 8.92 | 1.573x | 472,616 | 1.343x |
+  | WideDeep | 16 | 24 | 115,865 | 9.05 | 1.595x | 472,093 | 1.344x |
+
+- **Finding — the standing MSHR hypothesis was inverted.** See incident 7
+  above and `out/hw-sweep/README.md` §4. Widening the mbus alone gets 98.6%
+  of the two-knob gain; deepening MSHRs alone gets 6.5% (n1) or ~0% (lmhead).
+- **End-to-end decode projection** (`loop/llama_project.py --scenario
+  decode --S 512`, cold): control 2.29 → WideDeep 3.47 tok/s @500 MHz
+  (**1.51x**); @1 GHz, 4.58 → 6.93 tok/s.
+- **Verification that the config fragments actually took effect**: the
+  generated device tree's `sifive,mshr-count` (12/12/24/24) and the
+  generated `TestHarness.sv`'s `SimDRAM .DATA_BITS()` (64/128/64/128)
+  were both checked against the elaborated artefacts, not the source — see
+  `out/hw-sweep/elaborate.*.log`.
+- **Status**: proposal step 4 (hardware outer loop) partially delivered —
+  one manually-driven dimension of a single design axis, not the automated
+  loop, and not a Pareto front (no area/power data). See `out/paper-
+  submission/README.md` §What is still missing, item 8 (updated).
+- **Incidents**: none — all four elaborate/build/run cycles completed
+  cleanly (`rc=0`, `PASSED`). A Ray raylet disk-space warning (5.4 GB free
+  of 876 GB) was logged throughout but caused no task failure.
+
+---
+
+## Roll-up (through round10, final)
+
+Computed by summing `ledger.md` §a's per-round rows (smoke through round10,
+now that round10 has finished and is recorded in `rounds.json`/`ledger.md`).
 
 | | value |
 |---|---:|
-| Rounds covered (incl. smoke) | 10 (smoke, round1, round2, round2b, round3, round4, round5, round6, round7, round8, round9 — 11 named entries, "9 optimization rounds" per the task's round1-round9 framing plus the pre-round1 smoke test) |
-| Runs | 62 (32 through round6 + 28 round7 + 1 round8 + 1 round9) |
-| Iterations | 243 (196 through round6 + 35 round7 + 6 round8 + 6 round9) |
-| Cost | **$177.7596** ($149.0915 through round6 + $7.5365 round7 + $14.6592 round8 + $6.4724 round9) |
-| Wall-clock | **~70h19m** (37.97h through round6 + 21h24m round7 + 5h43m round8 + 5h14m round9) |
-| Overall best (llama-layer-fused-n1) | **179,033 cycles** (round9 iter4), −13.2% vs. baseline 206,304, 1.273x roofline (140,680) |
+| Rounds covered (incl. smoke) | 11 (smoke, round1, round2, round2b, round3, round4, round5, round6, round7, round8, round9, round10 — 12 named entries, "10 optimization rounds" per the task's round1-round10 framing plus the pre-round1 smoke test) |
+| Runs | 63 (62 through round9 + 1 round10) |
+| Iterations | 248 (243 through round9 + 5 round10) |
+| Cost | **$180.1551** ($177.7596 through round9 + $2.3956 round10) |
+| Wall-clock | **~73h58m** (~70h19m through round9 + 3h38m round10) |
+| Overall best (llama-layer-fused-n1) | **179,033 cycles** (round9 iter4), −13.2% vs. baseline 206,304, 1.273x roofline (140,680) — unchanged by round10, which optimizes a different kernel |
+| llama-lmhead-fused-n1 (round10, new kernel) | **648,292 cycles = baseline, never beaten**; speedup 1.000x (+0.0%), a clear negative result. Roofline 532,232 (1.218x). Measured exposure ratio ≈1.0 — `llama-layer-fused-n1`'s 0.611 overlap factor does NOT extrapolate to the LM head. |
 
-Kernels touched across the whole loop (8 from round1-6, plus 1 new in round7):
+Kernels touched across the whole loop (8 from round1-6, plus 2 new in
+round7/round10):
 `llama-q8-gemv-gemmini-n1`, `llama-q8-gemv-gemmini-n16`,
 `llama-q8-gemv-gemmini-lmhead`, `llama-q8-gemm`, `llama-attn-scores-int8`,
-`llama-attn-pv-int8`, `llama-silu-mul`, `llama-softmax`, and
-`llama-layer-fused-n1` (introduced round7, continued round8-9).
+`llama-attn-pv-int8`, `llama-silu-mul`, `llama-softmax`,
+`llama-layer-fused-n1` (introduced round7, continued round8-9), and
+`llama-lmhead-fused-n1` (introduced round10, single-round negative result).

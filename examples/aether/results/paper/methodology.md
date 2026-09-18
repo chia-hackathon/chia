@@ -432,6 +432,25 @@ RTL microarchitecture and cache configuration, not a fundamental physical
 DRAM limit, so its 6.6-7.9 B/cycle ceilings should not be read as DRAM
 device bandwidth figures.
 
+> **Correction 5 (2026-09-19, supersedes the "L2 MSHR/bank contention"
+> attribution above).** The MSHR claim was itself never measured — it was
+> inferred from a rows-per-command in-flight-request scan (6/8/10/12/16 ->
+> 6.31/6.63/6.06/5.83/5.78 B/cyc) at the *fixed* 8 B/cycle memory bus. The
+> `out/hw-sweep/` design-point sweep (§7 below) isolated mbus width from L2
+> MSHR count directly and found the opposite: doubling the L2 MSHR file
+> (12 -> 24, `WithAetherL2MemCycles(88)`) changes the 4 MiB lm-head cold
+> stream by 0.01% (634,507 -> 634,580 cycles) and the 1 MiB n1 cold stream
+> by 6.5%, while doubling the memory bus alone (8 -> 16 B/cycle,
+> `WithAetherMemoryBusWidth(128)`) captures 98.6% of the combined gain
+> (5.67 -> 8.92 of 9.05 B/cycle on n1). The mechanism: the control's own warm
+> rate, 7.92 B/cycle against an 8 B/cycle bus, is already 99.0% of the mbus
+> roofline, so there was never MSHR-shaped headroom to recover; the in-flight
+> scan was measuring queueing at a narrow bus, not an MSHR shortage. **The
+> correct statement is: decode is bounded by memory-bus width, and the L2
+> MSHR file is not the binding constraint at either width.** See
+> `out/hw-sweep/README.md` for the full measurement and `out/paper/
+> hardware_sweep.csv` for the raw numbers.
+
 ### (c) 1 GHz clock assumption vs. 500 MHz RTL elaboration
 
 As detailed in §3 above, all reported tok/s and cycles-to-time conversions
@@ -551,6 +570,89 @@ The mvin-rate breakdown shows 61.1% of Saturn's own compute (17,346 of
 `out/llama-profile/projection_round9.md` for the corrected derivation.
 
 ---
+
+## 7. The 2026-09-19 hardware (outer-loop) sweep
+
+Proposal step 4 asks for an outer loop over hardware design points, not just
+kernel source. The loop itself (`loop/`) was never pointed at hardware
+parameters — see §6 caveat "the hardware outer loop was never run" — but a
+**single-dimension, manually-driven design-point sweep** was run on
+2026-09-19 to test one specific hypothesis left over from §6(b)'s MSHR
+attribution. This section documents the sweep's method and its limits; the
+full write-up is `out/hw-sweep/README.md`, the raw artefacts are in
+`out/hw-sweep/`, and `out/paper/hardware_sweep.csv` has the tabulated
+numbers.
+
+**Design points.** Four configs, one fixed kernel source per benchmark:
+control (`GENV256D128GemminiShuttleConfig`, 8 B/cycle mbus, L2 MSHR=12),
+`WideMbus` (16 B/cycle, MSHR=12), `DeepMshr` (8 B/cycle, MSHR=24), and
+`WideDeep` (16 B/cycle, MSHR=24) — a 2x2 factorial isolating the two knobs
+implicated by the (now-corrected) §6(b) hypothesis.
+
+**How the fragments were written.** Two new Chisel config fragments,
+appended to `generators/gemmini/chipyard/GemminiConfigs.scala`:
+`WithAetherMemoryBusWidth(bits)` overrides
+`freechips.rocketchip.subsystem.MemoryBusKey`'s `beatBytes`, and
+`WithAetherL2MemCycles(cycles)` overrides
+`freechips.rocketchip.subsystem.InclusiveCacheKey`'s `memCycles` (the L2's
+MSHR count is *derived* from `memCycles`, not set directly — see
+`out/hw-sweep/README.md` §2 for the exact `all_mshrs = 2 + max(...)`
+formula). Both fragments must sit left of `chipyard.config.AbstractConfig`
+in the `++` chain so they override, rather than get overridden by, the
+chain's own `WithInclusiveCache`/default `MemoryBusKey` entries. The literal
+fragment text is `out/hw-sweep/sweep_configs.scala.txt` (a copy of what
+`docker/add_coexist_config.py --sweep` injects).
+
+**Verifying the knobs actually took effect (not just "elaborated without
+error").** Trusting `rc=0` from Chisel elaboration is not sufficient — a
+mis-wired override can elaborate cleanly and silently do nothing (this is
+exactly the failure mode §6(b)'s own retracted "16 B/cycle roofline" bug
+came from). Two independent checks were made against the generated
+artefacts, not the source, for every one of the four points:
+1. The generated device tree's `sifive,mshr-count` property
+   (`out/hw-sweep/elaborate.*.log`): 12 / 12 / 24 / 24 for
+   control/WideMbus/DeepMshr/WideDeep — confirming `WithAetherL2MemCycles`
+   changed the derived MSHR count and nothing else did.
+2. The generated `TestHarness.sv`'s `SimDRAM` instantiation `.DATA_BITS()`
+   parameter: 64 / 128 / 64 / 128 bits — confirming the AXI4 memory port and
+   the DRAM model both followed `WithAetherMemoryBusWidth`, not just the
+   system bus (the same distinction Correction 1, §6 above, turned on).
+
+**Determinism and run count.** Each design point was measured **once**
+per kernel — the RTL simulation (Verilator + the untimed `mm_magic_t` DRAM
+model, §6(b)) is bit-exact and deterministic given a fixed kernel binary and
+config, so repeat runs would reproduce the same cycle count; this was
+spot-checked by the control point itself, which reproduces Round 7's
+already-recorded cold/warm numbers (184,837 / 132,435 cycles) exactly. All
+four runs self-checked `PASSED`.
+
+**Limitations, stated plainly:**
+- **Only two kernels** (`llama-q8-gemv-gemmini-n1`, cold 1 MiB weight
+  stream, and `llama-q8-gemv-gemmini-lmhead`, cold 4 MiB) — not a
+  representative sample of the full kernel registry, and neither is a
+  compute-bound kernel (so this sweep says nothing about `llama-q8-gemm`
+  or the Saturn-side kernels).
+- **No 32-bit (4 B/cycle) or 32+ B/cycle points** — only 8 and 16 B/cycle
+  were measured, so the curve's shape beyond 16 B/cycle (where §4 of
+  `out/hw-sweep/README.md` argues the bottleneck has already moved off the
+  bus, to Gemmini's StreamReader / L2 occupancy) is extrapolation, not data.
+- **No intermediate MSHR sweep** — only 12 and 24 were measured; the
+  previously-reported 6/8/10/12/16 in-flight scan (which motivated the
+  original MSHR hypothesis) was a different, indirect probe at fixed 8
+  B/cycle, not a direct MSHR-count sweep, and is superseded by this result,
+  not confirmed by it.
+- **`mm_magic_t` is a zero-additional-latency DRAM model** (§6(b) above) —
+  widening `beatBytes` here changes the *link width* between L2 and the
+  memory model, not a real DRAM's row/bank/refresh timing. This sweep should
+  be read as a **link-width experiment**, not a real-DRAM-timing experiment;
+  a real DDR/HBM controller's achievable bytes/cycle at 16 B nominal width
+  would be lower than this model implies.
+- **No area or power data** — the mbus/MSHR changes are unsynthesized RTL
+  parameter overrides; proposal promise 10 (Pareto front) remains
+  undelivered by this sweep.
+- **One sample per point** — deterministic simulation makes repeat runs
+  uninformative for variance, but it also means there is no way to detect a
+  nondeterministic bug in the harness itself from this data alone.
 
 ## Sources not independently re-verified in this review
 

@@ -89,6 +89,8 @@ decode 在 N=1 冷態下 GEMV/lm_head 已佔 ~95% 的 cycle，其餘 kernel 空�
 
 ## 4. 硬體突破表：只有「mbus 128-bit + MSHR 24」同時發生才有效
 
+**[2026-09-19 訂正：本節標題與下表的預測已被 `out/hw-sweep/` 的實測推翻——單獨加寬 mbus 就拿到 98.6% 的收益，MSHR 幾乎無關，見本節結尾的訂正框。]**
+
 單獨改動任何一項都不會有實質收益，理由列在下表：
 
 | 改動 | 單獨效果 | 為什麼要兩個一起改 |
@@ -105,6 +107,21 @@ DRAMSim2 的「冷流」）見 `out/loop/20260909-200541-dae1/agent_04.txt`
 預設 `mm_magic_t` 無時序 DRAM 模型，所以「DRAMSim2 冷流」這個說法本身不成立，
 真正的計時來源是 rocket-chip 的 L2/mbus 模型，見本檔 §5 對 `FINAL_REPORT.md`
 78–80 行的修正）。
+
+> **【2026-09-19 訂正，第 5 條修正 — 本節整節被推翻】** 上表「只有兩者同時改
+> 才有效」的預測是錯的，而且錯的方向具啟發性。`out/hw-sweep/` 對這四個設計點
+> 做了直接、獨立的 RTL 量測（不是曲線推論）：**單獨加寬 mbus（8→16 B/cycle）
+> 就拿到兩項合計增益的 98.6%**（n1 冷態 5.67→8.92，滿分 9.05 B/cycle；lmhead
+> 冷態 6.61→8.87，滿分 8.89 B/cycle）；**單獨加深 L2 MSHR（12→24）幾乎無效**
+> （n1 冷態僅 +6.5%，5.67→6.04 B/cycle；lmhead 冷態僅 +0.01%，634,507→634,580
+> cycles）。機制：control 本身暖態量測 7.92 B/cycle 對 8 B/cycle 的 mbus 已是
+> 99.0% roofline——mbus 早已飽和，根本沒有「MSHR 形狀」的餘裕可回收；本節據以
+> 立論的 in-flight 請求數掃描，量到的其實是窄匯流排上的排隊壅塞，不是 MSHR
+> 不足。**正確結論：decode 受限於 memory bus 寬度，L2 MSHR 在兩種寬度下都不是
+> 瓶頸。** 加寬後兩個 kernel 收斂到同一個新天花板（8.87–9.05 B/cycle，新匯流排
+> 的 56–57%），代表限制已經移到 Gemmini 的 StreamReader / L2 佔用而非匯流排
+> 本身。詳見 `out/hw-sweep/README.md`（含四點量測與驗證方法）、
+> `out/paper/hardware_sweep.csv`、`out/paper/methodology.md` Correction 5。
 
 ---
 

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-17T01:52:10+00:00",
+  "generated_at": "2026-09-17T19:43:09+00:00",
   "rounds_file": "out/loop/rounds.json",
   "rounds": [
     {
@@ -4773,6 +4773,111 @@
           ]
         }
       ]
+    },
+    {
+      "name": "round10",
+      "round_note": "launched 2026-09-17 15:58 Taipei, ended ~2026-09-18 03:36 Taipei (overnight). This round tested the new kernel llama-lmhead-fused-n1, asking whether the 'overlap ratio can be extrapolated' hypothesis from the llama-layer-fused-n1 work (round7-9; Saturn compute increasingly hidden behind Gemmini weight-stream / host dispatch, ~61% overlap assumed by DEFAULT_OVERLAP_FACTOR) generalizes to lm_head. Single run: llama-lmhead-fused-n1, run_id 20260917-155834-2887, 4 iterations, baseline 648292, roofline 532232 -> iterations 676825 (iter1, regression), 651726 (iter2, regression, close to baseline), 689999 (iter3, probe-only, regression), 698428 (iter4, regression). Baseline 648292 was NEVER beaten in this round; speedup 1.000x (+0.0%), a clear negative result. iter1 probe decomposed the Saturn pipeline into phases: stream=634821 rms=7296 quant=2496 argmax=2980 (total 647593); excluding 'stream', the overlappable Saturn-side work is only rms+quant+argmax=12772 cycles, ~2.0% of the iteration total -- far smaller than layer-fused's overlap-relevant share. iter2 probe measured host-side exposure (held_*) per stage instead of raw stage duration: held_rms1=5984 held_rms2=8990 held_quant=6552 held_amax1=2093 held_amax2=3532 (sum 27151, total 653221) -- larger than iter1's 12772, likely reflecting host/sync-boundary wall-clock exposure (and possibly double-counting split sub-stages) rather than raw Saturn compute time; not fully reconciled. iter3 swept a busy-wait spin parameter (0/80/250/600) before checking the Saturn pipeline, sampling ~32 periods each: spin0 period_sum=154598 cnt=32, spin80=154376 cnt=32, spin250=150380 cnt=32, spin600=145647 cnt=31 (iteration total 663023) -- tighter polling (higher spin) modestly reduces sampled sync-wait period, but iter4 (698428, applying findings from the spin scan) still did not beat baseline, confirming lm_head's exposure problem is structural, not a scheduling-tuning issue. Conclusion: lm_head's overlappable Saturn work is proportionally too small (and/or too exposed at host sync points) for the layer-fused overlap findings to transfer; a single global overlap factor should not be assumed across kernel families.",
+      "start": "2026-09-17T15:58:35+00:00",
+      "end": "2026-09-17T19:36:42+00:00",
+      "wall_clock_s": 13087.0,
+      "num_runs": 1,
+      "total_iters": 5,
+      "ok_iters": 5,
+      "fail_iters": 0,
+      "total_cost_usd": 2.395562,
+      "llm_models": [
+        "claude-fable-5-1"
+      ],
+      "runs": [
+        {
+          "run_id": "20260917-155834-2887",
+          "kernel": "llama-lmhead-fused-n1",
+          "planned_iters": 4,
+          "completed_iters": 4,
+          "seed_cycles": null,
+          "baseline_cycles": 648292,
+          "best_cycles": 648292,
+          "roofline_cycles": 532232,
+          "best_over_roofline": "1.218x",
+          "cost_usd": 2.395562,
+          "started": "2026-09-17T15:58:35+00:00",
+          "finished": "2026-09-17T19:36:42+00:00",
+          "ongoing_or_aborted": false,
+          "wall_clock_s": 13087.0,
+          "llm_model": "claude-fable-5-1",
+          "ok_iters": 5,
+          "fail_iters": 0,
+          "note": "new kernel llama-lmhead-fused-n1, testing overlap-ratio extrapolation from layer-fused; baseline 648292 never beaten, speedup 1.000x (negative result); best cycles remain 648292 (baseline)",
+          "in_db": true,
+          "iters": [
+            {
+              "run_id": "20260917-155834-2887",
+              "iter": 0,
+              "kind": "baseline",
+              "status": "ok",
+              "mcycle": 648292,
+              "cost_usd": 0.0,
+              "completed_at": "2026-09-17T15:58:38.892184+00:00",
+              "duration_s": 3.892184,
+              "duration_source": "kernel_file_mtime",
+              "kernel_path": "/home/max410011_l/aether/out/loop/20260917-155834-2887/kernel_baseline.h",
+              "note": "passed, cycles=648292, instret=None"
+            },
+            {
+              "run_id": "20260917-155834-2887",
+              "iter": 1,
+              "kind": "ok",
+              "status": "ok",
+              "mcycle": 676825,
+              "cost_usd": 0.749957,
+              "completed_at": "2026-09-17T16:00:00.444585+00:00",
+              "duration_s": 81.552401,
+              "duration_source": "kernel_file_mtime",
+              "kernel_path": "/home/max410011_l/aether/out/loop/20260917-155834-2887/kernel_01.h",
+              "note": "passed, cycles=676825, instret=None"
+            },
+            {
+              "run_id": "20260917-155834-2887",
+              "iter": 2,
+              "kind": "ok",
+              "status": "ok",
+              "mcycle": 651726,
+              "cost_usd": 0.662428,
+              "completed_at": "2026-09-17T16:54:15.555783+00:00",
+              "duration_s": 3255.111198,
+              "duration_source": "kernel_file_mtime",
+              "kernel_path": "/home/max410011_l/aether/out/loop/20260917-155834-2887/kernel_02.h",
+              "note": "passed, cycles=651726, instret=None"
+            },
+            {
+              "run_id": "20260917-155834-2887",
+              "iter": 3,
+              "kind": "ok",
+              "status": "ok",
+              "mcycle": 689999,
+              "cost_usd": 0.392242,
+              "completed_at": "2026-09-17T17:47:58.573144+00:00",
+              "duration_s": 3223.017361,
+              "duration_source": "kernel_file_mtime",
+              "kernel_path": "/home/max410011_l/aether/out/loop/20260917-155834-2887/kernel_03.h",
+              "note": "passed, cycles=689999, instret=None"
+            },
+            {
+              "run_id": "20260917-155834-2887",
+              "iter": 4,
+              "kind": "ok",
+              "status": "ok",
+              "mcycle": 698428,
+              "cost_usd": 0.590935,
+              "completed_at": "2026-09-17T18:42:26.968857+00:00",
+              "duration_s": 3268.395713,
+              "duration_source": "kernel_file_mtime",
+              "kernel_path": "/home/max410011_l/aether/out/loop/20260917-155834-2887/kernel_04.h",
+              "note": "passed, cycles=698428, instret=None"
+            }
+          ]
+        }
+      ]
     }
   ],
   "kernel_history": [
@@ -4979,6 +5084,18 @@
           "round": "round9",
           "best_cycles": 179033,
           "cumulative_cost_usd": 26.12505
+        }
+      ]
+    },
+    {
+      "kernel": "llama-lmhead-fused-n1",
+      "baseline_cycles": 648292,
+      "roofline_cycles": 532232,
+      "points": [
+        {
+          "round": "round10",
+          "best_cycles": 648292,
+          "cumulative_cost_usd": 2.395562
         }
       ]
     },

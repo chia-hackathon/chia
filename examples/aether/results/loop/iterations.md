@@ -329,8 +329,19 @@
 
 **round9 summary** — iterations: 6, pass rate: 6/6 (100.0%), total cost: $6.4724
 
+## round10 — launched 2026-09-17 15:58 Taipei, ended ~2026-09-18 03:36 Taipei (overnight). This round tested the new kernel llama-lmhead-fused-n1, asking whether the 'overlap ratio can be extrapolated' hypothesis from the llama-layer-fused-n1 work (round7-9; Saturn compute increasingly hidden behind Gemmini weight-stream / host dispatch, ~61% overlap assumed by DEFAULT_OVERLAP_FACTOR) generalizes to lm_head. Single run: llama-lmhead-fused-n1, run_id 20260917-155834-2887, 4 iterations, baseline 648292, roofline 532232 -> iterations 676825 (iter1, regression), 651726 (iter2, regression, close to baseline), 689999 (iter3, probe-only, regression), 698428 (iter4, regression). Baseline 648292 was NEVER beaten in this round; speedup 1.000x (+0.0%), a clear negative result. iter1 probe decomposed the Saturn pipeline into phases: stream=634821 rms=7296 quant=2496 argmax=2980 (total 647593); excluding 'stream', the overlappable Saturn-side work is only rms+quant+argmax=12772 cycles, ~2.0% of the iteration total -- far smaller than layer-fused's overlap-relevant share. iter2 probe measured host-side exposure (held_*) per stage instead of raw stage duration: held_rms1=5984 held_rms2=8990 held_quant=6552 held_amax1=2093 held_amax2=3532 (sum 27151, total 653221) -- larger than iter1's 12772, likely reflecting host/sync-boundary wall-clock exposure (and possibly double-counting split sub-stages) rather than raw Saturn compute time; not fully reconciled. iter3 swept a busy-wait spin parameter (0/80/250/600) before checking the Saturn pipeline, sampling ~32 periods each: spin0 period_sum=154598 cnt=32, spin80=154376 cnt=32, spin250=150380 cnt=32, spin600=145647 cnt=31 (iteration total 663023) -- tighter polling (higher spin) modestly reduces sampled sync-wait period, but iter4 (698428, applying findings from the spin scan) still did not beat baseline, confirming lm_head's exposure problem is structural, not a scheduling-tuning issue. Conclusion: lm_head's overlappable Saturn work is proportionally too small (and/or too exposed at host sync points) for the layer-fused overlap findings to transfer; a single global overlap factor should not be assumed across kernel families.
+| kernel | run_id | iter | status | cycles | vs baseline | vs roofline | new best? | cost | agent note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| llama-lmhead-fused-n1 | 20260917-155834-2887 | 0 | ok | 648,292 | 1.000x | 1.218x | ★ | $0.0000 |  |
+| llama-lmhead-fused-n1 | 20260917-155834-2887 | 1 | ok | 676,825 | 1.044x | 1.272x |  | $0.7500 | Now compile-check with the harness's flags.编译通过（`rc=0`，汇编中出现 7 处 `rdcycle`：我加的 5 处 + harness 的 2 处）。  **本轮总结：** 调度与四段内循环完全未动，仅在阶段边界插入 `rdcycle` 并在全部工作完成后输出 `PROBE stream= / rms= / quant= / argmax= /... |
+| llama-lmhead-fused-n1 | 20260917-155834-2887 | 2 | ok | 651,726 | 1.005x | 1.225x |  | $0.6624 | 迭代 1 的预测与实测对照：stream 预测 637,000 → 实测 **634,821**（冷态惩罚只有 ~300 cycles，而非我估计的 2.5k——4 MiB 流上 "warm tail" 信用几乎为零，descending K 在此已无意义）；rms 7,296 / quant 2,496 / argmax 2,980 与预测吻合（argmax 略高：LG... |
+| llama-lmhead-fused-n1 | 20260917-155834-2887 | 3 | ok | 689,999 | 1.064x | 1.296x |  | $0.3922 | 迭代 2 的预测 641,500 **DIED**：实测 651,726，比串行基线（printf-free 647,593）还**慢 4,100**。exposure = 651,726 − 634,821 = **16,905**，serialised Saturn = 12,772 → **exposure ratio = 1.32 > 1.0**。这说明我的机器模型错在：主机离开去跑一个... |
+| llama-lmhead-fused-n1 | 20260917-155834-2887 | 4 | ok | 698,428 | 1.077x | 1.312x |  | $0.5909 | 迭代 3 的预测 **SURVIVED**：`held_total` = 5,984+8,990+6,552+2,093+3,532 = **27,151**（预测 27,000）；exposure = 653,221 − 634,821 = 18,400，所以 80 次"主机离开"总共只隐藏了 27,151 − 18,400 = 8,751 cycles ≈ **每次离开净隐藏 ~109... |
+
+**round10 summary** — iterations: 5, pass rate: 5/5 (100.0%), total cost: $2.3956
+
 ## Overall summary
-- total iterations: 243
-- overall pass rate: 234/243 (96.3%)
-- total cost across all rounds: $177.7596
-- cross-check vs ledger.json's sum of per-round `total_cost_usd`: $177.7596 — MATCHES
+- total iterations: 248
+- overall pass rate: 239/248 (96.4%)
+- total cost across all rounds: $180.1551
+- cross-check vs ledger.json's sum of per-round `total_cost_usd`: $180.1551 — MATCHES

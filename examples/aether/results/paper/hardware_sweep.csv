@@ -1,0 +1,13 @@
+config,mbus_bytes_per_cycle,l2_mshr,kernel,cycles,bytes_per_cycle,speedup_vs_control,condition,source_log
+GENV256D128GemminiShuttleConfig,8,12,llama-q8-gemv-gemmini-n1,184837,5.67,1.000,cold,out/hw-sweep/simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleConfig.txt
+GENV256D128GemminiShuttleDeepMshrConfig,8,24,llama-q8-gemv-gemmini-n1,173633,6.04,1.065,cold,out/hw-sweep/simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleDeepMshrConfig.txt
+GENV256D128GemminiShuttleWideMbusConfig,16,12,llama-q8-gemv-gemmini-n1,117526,8.92,1.573,cold,out/hw-sweep/simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleWideMbusConfig.txt
+GENV256D128GemminiShuttleWideDeepConfig,16,24,llama-q8-gemv-gemmini-n1,115865,9.05,1.595,cold,out/hw-sweep/simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleWideDeepConfig.txt
+GENV256D128GemminiShuttleConfig,8,12,llama-q8-gemv-gemmini-n1,132435,7.92,1.000,warm,out/hw-sweep/simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleConfig.txt
+GENV256D128GemminiShuttleDeepMshrConfig,8,24,llama-q8-gemv-gemmini-n1,129845,8.08,1.020,warm,out/hw-sweep/simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleDeepMshrConfig.txt
+GENV256D128GemminiShuttleWideMbusConfig,16,12,llama-q8-gemv-gemmini-n1,99507,10.54,1.331,warm,out/hw-sweep/simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleWideMbusConfig.txt
+GENV256D128GemminiShuttleWideDeepConfig,16,24,llama-q8-gemv-gemmini-n1,99311,10.56,1.334,warm,out/hw-sweep/simlog.llama-q8-gemv-gemmini-n1.GENV256D128GemminiShuttleWideDeepConfig.txt
+GENV256D128GemminiShuttleConfig,8,12,llama-q8-gemv-gemmini-lmhead,634507,6.61,1.0000,cold,out/hw-sweep/simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleConfig.txt
+GENV256D128GemminiShuttleDeepMshrConfig,8,24,llama-q8-gemv-gemmini-lmhead,634580,6.61,0.9999,cold,out/hw-sweep/simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleDeepMshrConfig.txt
+GENV256D128GemminiShuttleWideMbusConfig,16,12,llama-q8-gemv-gemmini-lmhead,472616,8.87,1.343,cold,out/hw-sweep/simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleWideMbusConfig.txt
+GENV256D128GemminiShuttleWideDeepConfig,16,24,llama-q8-gemv-gemmini-lmhead,472093,8.89,1.344,cold,out/hw-sweep/simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleWideDeepConfig.txt
