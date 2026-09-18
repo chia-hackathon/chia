@@ -128,3 +128,12 @@ Do not spawn sub-agents.
 
 Everything the loop knows is written into `${AGENT_LOG_DIR}/<run>/`: the
 full simulator log of every program, one file each. Read them.
+
+An `ime_cl_` or `ime_clq_` failure means something specific: those programs load the
+C tile with `vmtl.v`, run one multiply-accumulate, and then read the C register group
+back with an ordinary `vse<SEW>.v` instead of `vmts.v`. They are therefore the only
+tests that observe the *register-side* C index directly. A failure there is a
+`mat_C_idx` bug -- the spec routes C(i,j) through `tile_reg_idx`, and a linear
+`i*N_max + j` gives its exact transpose whenever EMUL_C > 1. It is not a datapath,
+accumulator or tile-transfer fault, and the pair tests cannot see it because they
+write and read C through the same permutation.

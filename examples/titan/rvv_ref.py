@@ -105,6 +105,26 @@ class TileGeometry:
     w: int = 1        # widening factor: 1/2/4/8 = vmmacc/vw/vq/v8wmmacc.vv
     tload: str = "op"  # "op" = vmtl.v/vmts.v, "t" = vmttl.v/vmtts.v
     kind: str = "int"  # "int" = Zvvmm, "fp" = Zvvfmm (round four)
+    #: Which *check* the directed generator builds for this geometry.  Not a
+    #: property of the architecture: the tile shape is identical either way,
+    #: and nothing in this module's index arithmetic reads it.  It exists so
+    #: that one geometry sequence can carry two kinds of program.
+    #:
+    #:   "pair"     -- rounds one to four.  Compute the tile twice on the
+    #:                 DUT (IME path and RVV/scalar reference path), store
+    #:                 both to memory, compare the two memory images.
+    #:   "clayout"  -- round five.  Compute it once and read the C register
+    #:                 group back with an ordinary architectural
+    #:                 ``vse<SEW>.v``, then compare against the *register*
+    #:                 image the spec's ``mat_C_idx`` prescribes.
+    #:
+    #: The distinction is load-bearing because a "pair" program cannot see
+    #: the register-side C layout at all: it writes C with ``vmts.v`` and
+    #: reads it back with ``vmts.v``, so any C index permutation that the
+    #: implementation applies consistently to the transfer and to the
+    #: multiply-accumulate cancels out in the memory image.  See
+    #: :func:`clayout_capable` and titan_runs/round5_design.md.
+    check: str = "pair"
 
     @property
     def elems_per_reg(self) -> int:
@@ -232,6 +252,11 @@ class TileGeometry:
             raise ValueError(
                 f"kind={self.kind!r}: expected 'int' (Zvvmm) or 'fp' "
                 f"(Zvvfmm)")
+        if self.check not in ("pair", "clayout"):
+            raise ValueError(
+                f"check={self.check!r}: expected 'pair' (the differential "
+                f"programs of rounds one to four) or 'clayout' (round "
+                f"five's C-tile register-layout probe)")
         if self.kind == "fp":
             # Round four implements one floating-point instruction,
             # vfmmacc.vv, at the two accumulator widths whose input format
@@ -344,9 +369,13 @@ class TileGeometry:
         # fields, and an integer geometry must print byte-for-byte what
         # round three printed.
         fp = "" if self.kind == "int" else f" FP=binary{self.sew}"
+        # And the check clause last of all, for the same reason: a "pair"
+        # geometry -- every geometry rounds one to four generate -- must
+        # print byte-for-byte what round four printed.
+        chk = "" if self.check == "pair" else f" CHK={self.check}"
         return (f"VLEN={self.vlen} SEW={self.sew} LAMBDA={self.lam}{widen} "
                 f"LMUL={self.lmul} VL={self.vl} -> M={self.m} N={self.n} "
-                f"K_eff={self.k_eff} EMUL_C={self.emul_c}{trans}{fp}")
+                f"K_eff={self.k_eff} EMUL_C={self.emul_c}{trans}{fp}{chk}")
 
 
 def permissible_lambdas(vlen: int, sew: int, w: int = 1) -> List[int]:
@@ -407,7 +436,8 @@ def ime_legal_configs(vlen: int, sews: Sequence[int] = (8, 16, 32, 64),
                       full_vl_only: bool = False,
                       ws: Sequence[int] = (1,),
                       tloads: Sequence[str] = ("op",),
-                      kinds: Sequence[str] = ("int",)
+                      kinds: Sequence[str] = ("int",),
+                      checks: Sequence[str] = ("pair",)
                       ) -> Iterator[TileGeometry]:
     """Every IME-legal (SEW, LAMBDA, LMUL, VL) for this VLEN.
 
@@ -432,26 +462,33 @@ def ime_legal_configs(vlen: int, sews: Sequence[int] = (8, 16, 32, 64),
     that adding it appends rather than interleaves.  It defaults to
     ``("int",)``, so every pre-round-four caller sees exactly the geometries,
     in exactly the order, that it saw before.
+
+    ``checks`` selects the directed *program shape* (see
+    :attr:`TileGeometry.check`) and is now the outer-most loop, ahead of
+    ``kinds``, for exactly the same append-don't-interleave reason.  It
+    defaults to ``("pair",)``.
     """
-    for kind in kinds:
-        for tload in tloads:
-            for w in ws:
-                for sew in sews:
-                    for lam in permissible_lambdas(vlen, sew, w):
-                        for lmul in lmuls:
-                            probe = TileGeometry(vlen, sew, lam, lmul,
-                                                 lam * lmul, w, tload, kind)
-                            n_values = ([probe.n_max] if full_vl_only
-                                        else range(1, probe.n_max + 1))
-                            for n in n_values:
-                                geom = TileGeometry(vlen, sew, lam, lmul,
-                                                    n * lam * lmul, w,
-                                                    tload, kind)
-                                try:
-                                    geom.validate()
-                                except ValueError:
-                                    continue
-                                yield geom
+    for check in checks:
+        for kind in kinds:
+            for tload in tloads:
+                for w in ws:
+                    for sew in sews:
+                        for lam in permissible_lambdas(vlen, sew, w):
+                            for lmul in lmuls:
+                                probe = TileGeometry(vlen, sew, lam, lmul,
+                                                     lam * lmul, w, tload,
+                                                     kind, check)
+                                n_values = ([probe.n_max] if full_vl_only
+                                            else range(1, probe.n_max + 1))
+                                for n in n_values:
+                                    geom = TileGeometry(vlen, sew, lam, lmul,
+                                                        n * lam * lmul, w,
+                                                        tload, kind, check)
+                                    try:
+                                        geom.validate()
+                                    except ValueError:
+                                        continue
+                                    yield geom
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +902,137 @@ def random_case(geom: TileGeometry, rng: random.Random
     return (random_matrix(geom.m, geom.k_eff, geom.eew_ab, rng),
             random_matrix(geom.n_max, geom.k_eff, geom.eew_ab, rng),
             random_matrix(geom.m, geom.n_max, geom.sew, rng))
+
+
+# ---------------------------------------------------------------------------
+# round five: operands for the C-tile register-layout probe
+# ---------------------------------------------------------------------------
+#
+# The clayout tier reads the C register group back with an architectural
+# vse<SEW>.v and compares it against the register image the spec prescribes.
+# For that comparison to be *evidence* rather than a coincidence it needs two
+# properties from the data, and neither is something a random draw can be
+# trusted to supply:
+#
+#   (1) every element of the resulting C tile is distinct, so a value found
+#       in the wrong place identifies where it came from; and
+#   (2) the observed image under the "linear C index" hypothesis is the exact
+#       transpose of the expected one, so the failure has a name.
+#
+# (2) needs the pre-instruction C tile to be **symmetric**.  Write E(i,j) for
+# the spec's ``c_element_index`` and P(i,j) = i*N_max + j for the linear index
+# Titan's RTL uses.  At LAMBDA=1, E(i,j) = j*M + i = P(j,i), so an
+# implementation that indexes C linearly on both the vmtl.v transfer and the
+# multiply-accumulate leaves, in the slot the spec calls (a,b),
+#
+#     C_init[a][b] + D(b,a)          where D(i,j) = sum_k A[i][k]*B[j][k]
+#
+# while the spec puts C_init[a][b] + D(a,b) there.  That is C_ref^T -- i.e.
+# exactly the transpose -- precisely when C_init[a][b] == C_init[b][a].  With
+# an asymmetric C_init the same bug shows up as a scramble that no verdict
+# line can name.  So: symmetric C_init, asymmetric D, distinct C_ref.
+
+
+def clayout_capable(geom: TileGeometry) -> bool:
+    """Can this geometry carry an all-distinct C-layout probe?
+
+    The tier's claim is "every C element is distinct", and at SEW=8 with a
+    32x32 tile that is arithmetically impossible: 1024 elements cannot take
+    1024 distinct values in 8 bits.  Rather than weaken the claim for the
+    geometries where it does not fit, the tier declines them and says so.
+
+    The bound is strict, not >=, because the construction also has to keep
+    C_ref different from C_init in *every* element (otherwise a multiply-
+    accumulate that wrote nothing would pass somewhere).  Its values run
+    1 .. M*N_max, so a tile that exactly saturates the residue class -- SEW=8
+    with M = 16 -- would wrap its last element onto C_init's 0.  Those
+    geometries drop out; SEW=8 keeps its LAMBDA=4 (M=8, EMUL_C=2) half.
+
+    The other bounds are the same kind of statement: the probe is defined at
+    full VL only (a partial-N tile leaves N_max - N tail columns holding
+    their pre-instruction value, which are then not distinct -- and the C
+    tail policy already has exhaustive coverage in the pair tiers), it needs
+    M >= 2 for "transposed" to mean anything, and its A/B operands have to
+    fit the signed EEW_A range.
+    """
+    if geom.kind != "int" or geom.tload != "op":
+        return False
+    if geom.m < 2 or geom.n != geom.n_max or geom.emul_c == 16:
+        return False
+    # (2*)M*N_max distinct accumulator values must exist at SEW.  The K_eff=1
+    # construction below spans 2*M*N_max residues, the general one spans
+    # M*N_max.
+    span = geom.m * geom.n_max * (1 if geom.k_eff >= 2 else 2)
+    if span >= (1 << geom.sew):
+        return False
+    # The largest A/B operand either construction writes is M.
+    if geom.m > (1 << (geom.eew_ab - 1)) - 1:
+        return False
+    return True
+
+
+def clayout_case(geom: TileGeometry) -> Tuple[Matrix, Matrix, Matrix]:
+    """(A, B, C_init) for the C-layout probe: symmetric C, distinct C_ref.
+
+    Two constructions, chosen by K_eff, both giving a C_ref whose M*N_max
+    elements are pairwise distinct modulo 2**SEW:
+
+      K_eff >= 2:  A[i] = (1, i, 0...), B[j] = (j+1, M, 0...), C_init = 0.
+                   D(i,j) = 1*(j+1) + i*M = i*M + j + 1, so
+                   C_ref[i][j] = i*M + j + 1 -- the M*N_max distinct residues
+                   1 .. M*N_max, and C_init is trivially symmetric.
+
+      K_eff == 1:  only LAMBDA=LMUL=W=1 reaches here, so there is one k and
+                   D is forced to be rank one -- and a rank-one D cannot be
+                   injective on an MxM grid.  The distinctness comes from
+                   C_init instead: A[i] = (1,), B[j] = (j+1,),
+                   C_init[i][j] = (i+j)*M, giving
+                   C_ref[i][j] = (i+j)*M + j + 1.  That is injective (j+1 is
+                   recovered modulo M, then i), and C_init is symmetric in
+                   (i,j) as required.
+
+    The ``+1`` in B is not cosmetic: with B[j][0] = j the j=0 column would
+    get D = 0, and a multiply-accumulate that wrote nothing at all would
+    leave that column looking correct.  Offsetting by one makes every one of
+    the M*N_max elements change.
+
+    In both cases D(i,j) != D(j,i) for every i != j, which is what makes the
+    write coordinate observable at all: a D that were symmetric, or constant,
+    would let a read-modify-write at a consistently wrong index return the
+    same tile it started with.
+    """
+    m, nmax, k = geom.m, geom.n_max, geom.k_eff
+    a = [[0] * k for _ in range(m)]
+    b = [[0] * k for _ in range(nmax)]
+    c = [[0] * nmax for _ in range(m)]
+    if k >= 2:
+        for i in range(m):
+            a[i][0], a[i][1] = 1, i
+        for j in range(nmax):
+            b[j][0], b[j][1] = j + 1, m
+    else:
+        for i in range(m):
+            a[i][0] = 1
+        for j in range(nmax):
+            b[j][0] = j + 1
+        for i in range(m):
+            for j in range(nmax):
+                c[i][j] = _wrap((i + j) * m, geom.sew)
+    return a, b, c
+
+
+def clayout_reg_image(c: Matrix, geom: TileGeometry) -> List[int]:
+    """The MxN_max tile *c* laid out as a flat C register-group image.
+
+    ``out[c_element_index(i, j)] = c[i][j]``.  The group holds exactly
+    ``EMUL_C * epr_C = M * N_max`` elements and ``mat_C_idx`` is a bijection
+    onto them, so every position is written exactly once.
+    """
+    out = [0] * (geom.m * geom.n_max)
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            out[c_element_index(i, j, geom)] = c[i][j]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2248,6 +2416,82 @@ def check_checksum_sensitivity() -> None:
             assert differing == [i], (i, j, differing)
 
 
+def check_clayout_case() -> None:
+    """The C-layout probe's operands must do what the tier claims.
+
+    Four properties, each of which the tier's verdict rests on, checked over
+    every clayout-capable geometry at every VLEN this file enumerates:
+
+      * C_init is symmetric -- without which the linear-index hypothesis
+        does not produce an exact transpose and `TITAN CLAYOUT transposed`
+        could never fire;
+      * C_ref's M*N_max elements are pairwise distinct -- so a value in the
+        wrong place says where it came from;
+      * C_ref differs from C_init in every element -- so a multiply-
+        accumulate that wrote nothing at all cannot pass; and
+      * the linear-index image really is C_ref transposed, at LAMBDA=1.
+
+    The last one is computed here from the Sail index functions rather than
+    asserted from the RTL: it is a statement about ``tile_reg_idx``, which is
+    what the directed program compares against.
+    """
+    checked = 0
+    for vlen in VLENS:
+        for ws, sews in ((( 1,), (8, 16, 32, 64)),) + tuple(
+                ((w,), WIDENING_SEWS_BY_W[w]) for w in (2, 4, 8)):
+            for geom in ime_legal_configs(vlen, sews=sews, ws=ws,
+                                          full_vl_only=True,
+                                          checks=("clayout",)):
+                if not clayout_capable(geom):
+                    continue
+                a, b, c0 = clayout_case(geom)
+                assert all(abs(v) <= (1 << (geom.eew_ab - 1)) - 1
+                           for row in a + b for v in row), geom.describe()
+                for i in range(geom.m):
+                    for j in range(geom.n_max):
+                        assert c0[i][j] == c0[j][i], geom.describe()
+                ref = reference_gemm(a, b, c0, geom)
+                flat = [ref[i][j] for i in range(geom.m)
+                        for j in range(geom.n_max)]
+                assert len(set(flat)) == len(flat), (
+                    f"{geom.describe()}: C_ref is not all-distinct")
+                assert all(ref[i][j] != c0[i][j] for i in range(geom.m)
+                           for j in range(geom.n_max)), (
+                    f"{geom.describe()}: a no-op multiply-accumulate would "
+                    f"pass this case")
+                if geom.lam == 1:
+                    # The linear-index hypothesis: read and write C at
+                    # i*N_max + j instead of at tile_reg_idx(i*N_max + j).
+                    observed = [0] * (geom.m * geom.n_max)
+                    for i in range(geom.m):
+                        for j in range(geom.n_max):
+                            p = c_sequential_index(i, j, geom)
+                            observed[p] = _wrap(
+                                clayout_reg_image(c0, geom)[p]
+                                + sum(a[i][k] * b[j][k]
+                                      for k in range(geom.k_eff)), geom.sew)
+                    transposed = [[ref[j][i] for j in range(geom.n_max)]
+                                  for i in range(geom.m)]
+                    assert observed == clayout_reg_image(transposed, geom), (
+                        f"{geom.describe()}: the linear-index image is not "
+                        f"the transpose of the expected one")
+                checked += 1
+    assert checked > 20, checked
+
+
+def clayout_geometries(vlen: int, sews: Sequence[int] = (8, 16, 32, 64),
+                        lmuls: Sequence[int] = (1, 2, 4, 8)
+                        ) -> List[TileGeometry]:
+    """Every clayout-capable geometry, W=1 then W=4, in tier order."""
+    out = []
+    for ws, tier_sews in ((1, sews), (4, WIDENING_SEWS)):
+        out += [g for g in ime_legal_configs(
+            vlen, sews=[x for x in tier_sews if x in sews], lmuls=lmuls,
+            full_vl_only=True, ws=(ws,), checks=("clayout",))
+            if clayout_capable(g)]
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256,
@@ -2263,7 +2507,7 @@ def main() -> int:
                   check_signedness_is_immaterial, check_checksum_sensitivity,
                   check_fp_round, check_fp_matches_host,
                   check_fp_special_values, check_round_four_fp_gemm,
-                  check_round_four_geometry):
+                  check_round_four_geometry, check_clayout_case):
         check()
         print(f"  ok  {check.__name__}")
 
@@ -2299,6 +2543,11 @@ def main() -> int:
     print(f"\nVLEN={args.vlen}: {len(trans)} full-VL transposing "
           f"(vmttl.v / vmtts.v) geometries")
     for geom in trans:
+        print(f"  {geom.describe()}")
+    clayout = [g for g in clayout_geometries(args.vlen)]
+    print(f"\nVLEN={args.vlen}: {len(clayout)} full-VL C-layout probe "
+          f"geometries (round five)")
+    for geom in clayout:
         print(f"  {geom.describe()}")
     return 0
 

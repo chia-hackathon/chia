@@ -262,6 +262,29 @@ ROUND_FOUR_INSNS = ("vfmmacc.vv",)
 ALL_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
              + ROUND_FOUR_INSNS)
 
+#: Round five adds no instruction.  It adds a *check* over instructions that
+#: are already in ALL_INSNS, so it is named as a tier token rather than as a
+#: mnemonic -- and deliberately kept out of ALL_INSNS, which ime_stress's
+#: ``check_pool_covers_every_instruction`` reads as "every mnemonic a
+#: geometry can select" and helpers.instruction_scope reads as "what the
+#: model agent has to implement".
+#:
+#: ``clayout`` is the C-tile register-layout tier.  Every pre-round-five
+#: directed program writes the C tile with ``vmts.v`` and reads it back with
+#: ``vmts.v``, so a register-side C index that is wrong *in the same way* on
+#: the transfer and on the multiply-accumulate produces a correct memory
+#: image and passes.  That is not hypothetical: Titan's RTL indexes C with a
+#: linear ``i*M + j`` where the spec routes ``i*N_max + j`` through
+#: ``tile_reg_idx``, and at LAMBDA=1 those two differ by exactly a transpose.
+#: The clayout tier reads the C register group back with an ordinary
+#: architectural ``vse<SEW>.v`` instead, so the register-side layout is
+#: observed rather than cancelled.  See titan_runs/round5_design.md.
+ROUND_FIVE_TIERS = ("clayout",)
+
+#: The full selectable scope: every instruction, plus every check tier.
+#: ``TITAN_INSNS`` validates against this, not against ALL_INSNS.
+ALL_SCOPE = ALL_INSNS + ROUND_FIVE_TIERS
+
 #: What a seeded tree already implements, and what this round adds.
 #: ``helpers.instruction_scope`` reads these two names first and only falls
 #: back to (ROUND_ONE_INSNS, ROUND_TWO_INSNS) when they are absent -- the
@@ -276,10 +299,17 @@ def _scope_insns() -> tuple:
     """Which instructions this run's directed suite and prompts cover.
 
     ``TITAN_INSNS`` selects the scope.  It accepts a round name -- ``one``,
-    ``two``, ``three``, ``four``, ``all`` -- or an explicit comma-separated
-    mnemonic list, and defaults to ``all`` (rounds one to four).  Unknown
-    mnemonics raise here rather than silently generating an empty suite six
-    minutes into a loop iteration.
+    ``two``, ``three``, ``four``, ``five``, ``all`` -- or an explicit
+    comma-separated list of mnemonics and/or check tiers, and defaults to
+    ``all`` (rounds one to five).  Unknown names raise here rather than
+    silently generating an empty suite six minutes into a loop iteration.
+
+    Round five's token is not a mnemonic: ``clayout`` names a *tier* over
+    instructions that earlier rounds already cover (see
+    :data:`ROUND_FIVE_TIERS`).  It is selected and excluded exactly like the
+    others -- ``TITAN_INSNS=five`` runs the C-layout tier alone,
+    ``TITAN_INSNS=one`` excludes it -- which is the whole reason it goes
+    through this knob rather than through a second environment variable.
 
     This is the single knob the rest of the loop reads: ime_tests'
     ``directed_suite`` derives its tiers from :data:`INSNS`, and
@@ -297,16 +327,17 @@ def _scope_insns() -> tuple:
              "two": ROUND_TWO_INSNS, "2": ROUND_TWO_INSNS,
              "three": ROUND_THREE_INSNS, "3": ROUND_THREE_INSNS,
              "four": ROUND_FOUR_INSNS, "4": ROUND_FOUR_INSNS,
-             "all": ALL_INSNS, "": ALL_INSNS}
+             "five": ROUND_FIVE_TIERS, "5": ROUND_FIVE_TIERS,
+             "all": ALL_SCOPE, "": ALL_SCOPE}
     if raw.lower() in named:
         return named[raw.lower()]
     chosen = tuple(tok.strip() for tok in raw.split(",") if tok.strip())
-    unknown = [name for name in chosen if name not in ALL_INSNS]
+    unknown = [name for name in chosen if name not in ALL_SCOPE]
     if unknown:
         raise ValueError(
             f"TITAN_INSNS={raw!r}: unknown mnemonic(s) {unknown}; "
-            f"expected a round name (one/two/three/four/all) or a subset of "
-            f"{ALL_INSNS}")
+            f"expected a round name (one/two/three/four/five/all) or a "
+            f"subset of {ALL_SCOPE}")
     return chosen
 
 

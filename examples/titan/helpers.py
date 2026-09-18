@@ -65,7 +65,7 @@ _GEOM_RE = re.compile(r"VLEN=(?P<vlen>\d+) SEW=(?P<sew>\d+) "
 
 #: The evidence a failing program prints ahead of its verdict.
 _DIFF_RE = re.compile(r"^TITAN DIFF .*$", re.M)
-_CDUMP_RE = re.compile(r"^TITAN (?:CDUMP|CREF) .*$", re.M)
+_CDUMP_RE = re.compile(r"^TITAN (?:CDUMP|CREF|CLAYOUT) .*$", re.M)
 
 
 def _permissible(vlen: Optional[int], sew: Optional[int]) -> Optional[list]:

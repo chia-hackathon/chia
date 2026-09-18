@@ -230,7 +230,8 @@ def _configure(geom: TileGeometry, *, lmul: int, vl: int,
     ]
 
 
-def _ime_path(geom: TileGeometry, alloc: VectorAlloc) -> List[str]:
+def _ime_path(geom: TileGeometry, alloc: VectorAlloc, *,
+              emit_store: bool = True) -> List[str]:
     """vsetvl -> load C -> load A, B -> multiply-accumulate -> store C.
 
     The widening (W=4) case reuses this sequence unchanged apart from the
@@ -255,6 +256,14 @@ def _ime_path(geom: TileGeometry, alloc: VectorAlloc) -> List[str]:
     the program does not change at all.  LD becomes M for A, B *and* C (the
     column stride of an M x K_eff or M x M tile), which is also the rs2 = x0
     default the spec gives the transposing pair.
+
+    ``emit_store=False`` stops after the multiply-accumulate, leaving the
+    result in the C register group instead of writing it out with the tile
+    store.  That is what round five's C-layout probe wants: the whole point
+    of that tier is to look at the register group with an *architectural*
+    access, and a vmts.v that mis-indexes C in the same way the
+    multiply-accumulate does would hide exactly the bug being hunted.  The
+    default is True, so every round-one-to-four program is unchanged.
     """
     lam_imm = 0  # 0 as an instruction immediate means "use vtype.lambda"
     out: List[str] = ["", "    # ---- IME path ----"]
@@ -302,6 +311,9 @@ def _ime_path(geom: TileGeometry, alloc: VectorAlloc) -> List[str]:
         f"    {ime.insn(geom.mnemonic, vd=alloc.c, vs1=alloc.a, vs2=alloc.b)}"
         f"    # {geom.mnemonic} v{alloc.c}, v{alloc.a}, v{alloc.b}",
     ]
+
+    if not emit_store:
+        return out
 
     out += _configure(geom, lmul=geom.lmul_c, vl=geom.vl_c_full,
                       comment="back to the C tile config to store")
@@ -914,6 +926,364 @@ def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
     return "\n".join(head + body + data) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# round five: the C-tile register-layout probe
+# ---------------------------------------------------------------------------
+
+def _clayout_readback(geom: TileGeometry, alloc: VectorAlloc) -> List[str]:
+    """Copy the whole C register group out with an ordinary vse<SEW>.v.
+
+    This is the entire point of the tier.  Every pre-round-five program
+    writes the C tile with ``vmts.v`` and reads it back with ``vmts.v``, so
+    a register-side C index that is wrong in the same way on the transfer
+    and on the multiply-accumulate produces a *correct memory image* and
+    passes.  An architectural unit-stride store has no tile semantics at
+    all -- element p of the group goes to byte p*SEW/8, by definition -- so
+    what lands in ``c_raw`` is the register group itself.
+
+    The configuration is LMUL = EMUL_C at VL = EMUL_C * (VLEN/SEW), i.e.
+    VLMAX, which is exactly M * N_max elements: ``mat_C_idx`` is a bijection
+    onto the group, so the tile and the group are the same set of elements.
+    Note this is a plain ``vsetvli`` -- no LAMBDA, nothing IME about it.
+    """
+    total = geom.m * geom.n_max
+    assert total == geom.emul_c * geom.elems_per_reg
+    return [
+        "",
+        "    # ---- architectural read-back of the C register group ----",
+        f"    # LMUL=EMUL_C={geom.emul_c}, VL=VLMAX={total}: v{alloc.c}"
+        f"..v{alloc.c + geom.emul_c - 1} verbatim, no tile indexing",
+        f"    li    t0, {total}",
+        f"    vsetvli t1, t0, e{geom.sew}, m{geom.emul_c}, ta, ma",
+        "    la    a2, c_raw",
+        f"    vse{geom.sew}.v v{alloc.c}, (a2)",
+    ]
+
+
+def _clayout_compare(geom: TileGeometry) -> List[str]:
+    """Element-wise compare of the read-back group against the spec image.
+
+    Unrolled, and walked in (i, j) order rather than in flat order, so that
+    the first mismatch reports the C tile coordinate the agent reasons in --
+    and so that, exactly as in :func:`_compare`, the judge has no induction
+    variable to get wrong.  ``c_element_index`` is the Sail ``mat_C_idx``:
+    it is the thing under test, and it appears here only as an address.
+    """
+    sfx = _SEW_SUFFIX[geom.sew]
+    esz = geom.sew // 8
+    out: List[str] = ["", "    # ---- compare against the spec's C register "
+                          "image (rvv_ref.c_element_index) ----",
+                      "    la    a4, c_raw",
+                      "    la    a5, c_exp"]
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            off = rvv_ref.c_element_index(i, j, geom) * esz
+            out += [
+                f"    li    t0, {off}          # C[{i},{j}] -> group element "
+                f"{off // esz}",
+                "    add   t2, a4, t0",
+                "    add   t3, a5, t0",
+                f"    l{sfx}    t4, 0(t2)",
+                f"    l{sfx}    t5, 0(t3)",
+                "    beq   t4, t5, 1f",
+                f"    li    a1, {i}",
+                f"    li    a2, {j}",
+                f"    li    s1, {EXIT_MISMATCH_BASE + i}",
+                "    j     .Lfail",
+                "1:",
+            ]
+    return out
+
+
+def _clayout_dump_diffs(geom: TileGeometry) -> List[str]:
+    """Print the first MAX_DIFF_LINES differing elements, in the usual form.
+
+    Same ``TITAN DIFF r= c= exp= got=`` line the pair tiers print, so
+    helpers.format_directed_failure quotes this tier's evidence back to the
+    agent with no change at all.  The walk is over the flat register group,
+    which is the order the failure actually has structure in (a whole bad
+    register shows up as a run), and the (i, j) the line reports is looked up
+    from the ``c_idx_r`` / ``c_idx_c`` tables rather than computed -- the
+    inverse of ``mat_C_idx`` is not something to derive in assembly.
+    """
+    loadu = _SEW_LOADU[geom.sew]
+    esz = geom.sew // 8
+    exp_dst = ("a3", "a4") if geom.sew == 64 else ("a3",)
+    got_dst = ("a5", "a6") if geom.sew == 64 else ("a4",)
+    return [
+        "",
+        "    # ---- evidence: first differing elements ----",
+        "    li    s4, 0              # flat C register-group element index",
+        "    li    s6, 0              # differences printed so far",
+        "    li    s7, 0              # byte offset into the group",
+        ".Ldump_diff:",
+        f"    li    t0, {geom.m * geom.n_max}",
+        "    bge   s4, t0, .Ldump_diff_done",
+        "    la    t1, c_raw",
+        "    add   t1, t1, s7",
+        "    la    t2, c_exp",
+        "    add   t2, t2, s7",
+        f"    {loadu}  t3, 0(t1)          # got: the C register group",
+        f"    {loadu}  t4, 0(t2)          # exp: the spec's mat_C_idx image",
+        "    beq   t3, t4, .Ldump_diff_next",
+        f"    li    t0, {MAX_DIFF_LINES}",
+        "    bge   s6, t0, .Ldump_diff_done",
+        "    la    t1, c_idx_r",
+        "    add   t1, t1, s4",
+        "    lbu   a1, 0(t1)",
+        "    la    t1, c_idx_c",
+        "    add   t1, t1, s4",
+        "    lbu   a2, 0(t1)",
+    ] + _hex_args(geom.sew, "t4", exp_dst) + _hex_args(geom.sew, "t3", got_dst) + [
+        "    la    a0, .Lfmt_diff",
+        "    call  printf",
+        "    addi  s6, s6, 1",
+        ".Ldump_diff_next:",
+        "    addi  s4, s4, 1",
+        f"    addi  s7, s7, {esz}",
+        "    j     .Ldump_diff",
+        ".Ldump_diff_done:",
+    ]
+
+
+def _clayout_verdict(geom: TileGeometry) -> List[str]:
+    """Name the wrong layout when the whole group is the expected transpose.
+
+    56 scattered `TITAN DIFF` lines say "the C tile is wrong somewhere".
+    One line saying `TITAN CLAYOUT transposed` says which bug it is, and the
+    difference matters because the two are debugged in completely different
+    places: a transposed group is a register-index bug in the sequencer's
+    ``mat_C_idx``, not a datapath, accumulator or tile-transfer fault.
+
+    ``c_xpose`` is the register image of C_ref transposed.  The scan is
+    exhaustive -- *every* element must match, not merely the ones that
+    differed -- because "is a transpose" is a claim about the whole tile and
+    a partial match would be a worse diagnosis than none.  When the scan
+    fails the tier still says something useful: the layout is wrong but is
+    not the known transpose, so the agent knows not to go looking for it.
+    """
+    loadu = _SEW_LOADU[geom.sew]
+    esz = geom.sew // 8
+    return [
+        "",
+        "    # ---- evidence: is the group exactly the expected transpose? ----",
+        "    li    s4, 0",
+        "    li    s7, 0",
+        "    li    s6, 1              # assume transposed until proven not",
+        ".Lclayout_scan:",
+        f"    li    t0, {geom.m * geom.n_max}",
+        "    bge   s4, t0, .Lclayout_done",
+        "    la    t1, c_raw",
+        "    add   t1, t1, s7",
+        "    la    t2, c_xpose",
+        "    add   t2, t2, s7",
+        f"    {loadu}  t3, 0(t1)",
+        f"    {loadu}  t4, 0(t2)",
+        "    beq   t3, t4, .Lclayout_next",
+        "    li    s6, 0",
+        "    j     .Lclayout_done",
+        ".Lclayout_next:",
+        "    addi  s4, s4, 1",
+        f"    addi  s7, s7, {esz}",
+        "    j     .Lclayout_scan",
+        ".Lclayout_done:",
+        "    beqz  s6, 1f",
+        "    la    a0, .Lfmt_clayout_t",
+        "    call  printf",
+        "    j     2f",
+        "1:",
+        "    la    a0, .Lfmt_clayout_o",
+        "    call  printf",
+        "2:",
+    ]
+
+
+def _clayout_epilogue(geom: TileGeometry) -> List[str]:
+    """The same verdict contract as :func:`_epilogue`, plus the CLAYOUT line."""
+    out = [
+        "",
+        "    # ---- verdict ----",
+        "    la    a0, .Lfmt_pass",
+        "    call  printf",
+        f"    li    s1, {EXIT_PASS}",
+        "    j     .Lret",
+        "",
+        ".Lskip:",
+        "    mv    a2, a1             # raw vtype.lambda[2:0] field",
+        "    li    a1, 0              # decoded: 0 means no selected lambda",
+        "    beqz  a2, 1f",
+        "    addi  t0, a2, -1",
+        "    li    t1, 1",
+        "    sll   a1, t1, t0         # lambda = 1 << (imm - 1)",
+        "1:",
+        "    la    a0, .Lfmt_skip",
+        "    call  printf",
+        f"    li    s1, {EXIT_UNSUPPORTED_GEOMETRY}",
+        "    j     .Lret",
+        "",
+        ".Lfail:",
+        "    mv    s2, a1             # first differing row",
+        "    mv    s3, a2             # first differing column",
+    ]
+    out += _clayout_dump_diffs(geom)
+    out += _dump_tile(geom, "c_raw", ".Lfmt_cdump", "cdump")
+    out += _dump_tile(geom, "c_exp", ".Lfmt_cref", "cref")
+    out += _clayout_verdict(geom)
+    out += [
+        "",
+        "    # ---- verdict, last so a log tail keeps it ----",
+        "    la    a0, .Lfmt_fail",
+        "    mv    a1, s2",
+        "    mv    a2, s3",
+        "    call  printf",
+        "",
+        ".Lret:",
+        "    mv    a0, s1",
+        "    ld    s7, 0(sp)",
+        "    ld    s6, 8(sp)",
+        "    ld    s5, 16(sp)",
+        "    ld    s4, 24(sp)",
+        "    ld    s3, 32(sp)",
+        "    ld    s2, 40(sp)",
+        "    ld    s1, 48(sp)",
+        "    ld    ra, 56(sp)",
+        "    addi  sp, sp, 64",
+        "    ret",
+    ]
+    return out
+
+
+def emit_clayout_test(geom: TileGeometry, name: str = "ime_clayout") -> str:
+    """One C-tile register-layout probe program for *geom*.
+
+    Structurally this is :func:`emit_test` with the last two stages replaced.
+    A, B and the initial C tile still arrive through ``vmtl.v`` exactly as
+    they do in the pair tiers -- deliberately, because the A/B tile path is
+    already covered and reusing it keeps the implementation's own A/B element
+    placement consistent with what its multiply-accumulate then reads, so the
+    only thing left under test is where the C elements *land*.  What changes
+    is the exit: instead of a ``vmts.v`` back to memory and a comparison
+    against a second on-DUT computation, the C register group is copied out
+    with an architectural ``vse<SEW>.v`` and compared against the register
+    image the spec's ``mat_C_idx`` prescribes.
+
+    That makes this program non-differential: its expected values are
+    precomputed by rvv_ref rather than recomputed on the DUT.  That is not a
+    regression in rigour, it is the only way to see the register layout at
+    all -- a differential pair cancels any C permutation that the
+    implementation applies to both halves, which is precisely how a
+    transposed C tile survived four rounds of green.  The operands are
+    correspondingly not random: :func:`rvv_ref.clayout_case` picks them so
+    that every one of the M*N_max results is distinct and the linear-index
+    hypothesis lands on an exact transpose.
+    """
+    geom.validate()
+    if not rvv_ref.clayout_capable(geom):
+        raise ValueError(
+            f"{geom.describe()}: not a C-layout-probe geometry "
+            f"(see rvv_ref.clayout_capable)")
+    alloc = VectorAlloc.allocate(geom)
+    a, b, c_init = rvv_ref.clayout_case(geom)
+    c_ref = rvv_ref.reference_gemm(a, b, c_init, geom)
+    transposed = [[c_ref[j][i] for j in range(geom.n_max)]
+                  for i in range(geom.m)]
+    exp = rvv_ref.clayout_reg_image(c_ref, geom)
+    xpose = rvv_ref.clayout_reg_image(transposed, geom)
+    assert exp != xpose, geom.describe()   # clayout_capable guarantees M >= 2
+    assert geom.m <= 256, "the c_idx_* tables are .byte"
+
+    head = [
+        f"# {name}: {geom.describe()}",
+        "#",
+        "# Generated by ime_tests.py from rvv_ref.py -- do not edit by hand,",
+        "# and do not edit rvv_ref.py: it is the judge, not the defendant.",
+        "#",
+        "# Round five: the C tile is read back with an architectural",
+        f"# vse{geom.sew}.v of the whole EMUL_C={geom.emul_c} register group,"
+        f" not with",
+        f"# {geom.store_mnemonic}, so the register-side layout "
+        f"(Sail mat_C_idx) is observed",
+        "# rather than cancelled by a matching permutation on both sides.",
+        "#",
+        f"# IME instructions are emitted as .insn (encodings from Zvvm "
+        f"v{ime.SPEC_VERSION}):",
+    ]
+    for mnemonic in (geom.load_mnemonic, geom.mnemonic):
+        head.append(f"#   {mnemonic}")
+    head += [
+        "",
+        "    .text",
+        "    .balign 4",
+        "    .globl main",
+        "main:",
+        "    addi  sp, sp, -64",
+        "    sd    ra, 56(sp)",
+        "    sd    s1, 48(sp)         # carries the exit status past printf",
+        "    sd    s2, 40(sp)",
+        "    sd    s3, 32(sp)",
+        "    sd    s4, 24(sp)",
+        "    sd    s5, 16(sp)",
+        "    sd    s6, 8(sp)",
+        "    sd    s7, 0(sp)",
+        f"    li    t0, {MSTATUS_VS_INITIAL}",
+        "    csrs  mstatus, t0        # enable vector state",
+    ]
+
+    body = (_ime_path(geom, alloc, emit_store=False)
+            + _clayout_readback(geom, alloc)
+            + _clayout_compare(geom)
+            + _clayout_epilogue(geom))
+
+    data = [
+        "", "    .data", "    .balign 8",
+        f'.Lfmt_pass:  .asciz "TITAN PASS {geom.describe()}\\n"',
+        f'.Lfmt_skip:  .asciz "TITAN SKIP lambda=%d (requested {geom.lam}) '
+        f'imm=%d {geom.describe()}\\n"',
+        f'.Lfmt_fail:  .asciz "TITAN FAIL row=%d col=%d {geom.describe()}\\n"',
+        f'.Lfmt_diff:  .asciz "TITAN DIFF r=%d c=%d '
+        f'exp={_hex_fmt(geom.sew)} got={_hex_fmt(geom.sew)}\\n"',
+        # A "line" of this dump is M consecutive *flat register-group*
+        # elements, not a C row -- which is the whole point, so the label is
+        # neither "r" nor "c".
+        f'.Lfmt_cdump: .asciz "TITAN CDUMP f=%d:"',
+        f'.Lfmt_cref:  .asciz "TITAN CREF f=%d:"',
+        f'.Lfmt_clayout_t: .asciz "TITAN CLAYOUT transposed '
+        f'{geom.describe()}\\n"',
+        f'.Lfmt_clayout_o: .asciz "TITAN CLAYOUT other '
+        f'{geom.describe()}\\n"',
+        f'.Lfmt_elem:  .asciz " {_hex_fmt(geom.sew)}"',
+        '.Lfmt_nl:    .asciz "\\n"',
+        "    .balign 8",
+    ]
+    data += _matrix_data("c_init", c_init, geom.sew)
+    for label, mat in (("mat_a_tile", a), ("mat_b_tile", b)):
+        width = geom.ab_linesize
+        buf = rvv_ref.tile_layout_buffer(mat, width, geom)
+        chunked = [buf[i:i + width] for i in range(0, len(buf), width)]
+        data += ["    .balign 8"] + _matrix_data(label, chunked, geom.eew_ab)
+    # The two register images, chunked M elements to a line so that a diff of
+    # the generated assembly is readable: line n of c_exp is exactly what
+    # `TITAN CREF f=n:` prints.
+    for label, image in (("c_exp", exp), ("c_xpose", xpose)):
+        rows = [image[i:i + geom.m] for i in range(0, len(image), geom.m)]
+        data += ["    .balign 8"] + _matrix_data(label, rows, geom.sew)
+    # flat register-group element index -> the (row, column) of the C tile
+    # element the spec puts there.  The inverse of mat_C_idx, tabulated.
+    inv_r = [0] * (geom.m * geom.n_max)
+    inv_c = [0] * (geom.m * geom.n_max)
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            flat = rvv_ref.c_element_index(i, j, geom)
+            inv_r[flat], inv_c[flat] = i, j
+    for label, table in (("c_idx_r", inv_r), ("c_idx_c", inv_c)):
+        rows = [table[i:i + geom.m] for i in range(0, len(table), geom.m)]
+        data += ["    .balign 8"] + _matrix_data(label, rows, 8)
+    data += ["    .balign 8", "c_raw:",
+             f"    .zero {geom.m * geom.n_max * geom.sew // 8}"]
+
+    return "\n".join(head + body + data) + "\n"
+
+
 def directed_suite(vlen: int, seed: int = 0,
                    sews: Sequence[int] = (8, 16, 32, 64),
                    lmuls: Sequence[int] = (1, 2, 4, 8),
@@ -966,6 +1336,14 @@ def directed_suite(vlen: int, seed: int = 0,
     RVV one -- see :func:`_fp_ref_path` for why, and for the implementation
     disclosure the exact comparison rests on.
 
+    Round five appends two more, last of all, selected by the ``clayout``
+    tier token rather than by a mnemonic:
+
+      ``ime_cl_``   vmmacc.vv,  W=1, every SEW -- C read back with vse<SEW>.v
+      ``ime_clq_``  vqmmacc.vv, W=4, SEW 32
+
+    These do not use ``vmts.v`` at all.  See :func:`emit_clayout_test`.
+
     The transposing tier reuses vmmacc.vv for the arithmetic: what is under
     test is vmttl.v / vmtts.v, and pairing them with a multiply-accumulate
     that is already green isolates a tile-layout failure from an arithmetic
@@ -1014,13 +1392,29 @@ def directed_suite(vlen: int, seed: int = 0,
                       [x for x in sews if x in rvv_ref.FP_FORMATS],
                       (1,), ("op",), ("fp",)))
 
+    # Round five.  Appended after every tier above, for the same
+    # byte-identity reason each earlier round was appended after its
+    # predecessors -- and note it is keyed on a *tier* token, not a
+    # mnemonic: it re-tests instructions rounds one and two already cover,
+    # with a program shape that can see what those programs cannot.  Always
+    # at full VL: see rvv_ref.clayout_capable for why a partial-N tile has
+    # no all-distinct construction, and note the consequence -- the gate and
+    # the per-iteration suite carry the *same* clayout programs.
+    if "clayout" in insns:
+        tiers.append(("ime_cl_", sews, (1,), ("op",), ("int",)))
+        tiers.append(("ime_clq_", [w for w in widening_sews if w in sews],
+                      (4,), ("op",), ("int",)))
+
     for prefix, tier_sews, ws, tloads, kinds in tiers:
-        for geom in rvv_ref.ime_legal_configs(vlen, sews=tier_sews,
-                                              lmuls=lmuls,
-                                              full_vl_only=full_vl_only,
-                                              ws=ws, tloads=tloads,
-                                              kinds=kinds):
+        clayout = prefix.startswith("ime_cl")
+        for geom in rvv_ref.ime_legal_configs(
+                vlen, sews=tier_sews, lmuls=lmuls,
+                full_vl_only=True if clayout else full_vl_only,
+                ws=ws, tloads=tloads, kinds=kinds,
+                checks=("clayout",) if clayout else ("pair",)):
             if geom.emul_c == 16:
+                continue
+            if clayout and not rvv_ref.clayout_capable(geom):
                 continue
             try:
                 VectorAlloc.allocate(geom)
@@ -1028,8 +1422,9 @@ def directed_suite(vlen: int, seed: int = 0,
                 continue
             name = (f"{prefix}sew{geom.sew}_lam{geom.lam}_lmul{geom.lmul}"
                     f"_n{geom.n}")
-            out.append((name, emit_test(geom, rvv_ref.random_case(geom, rng),
-                                        name), geom))
+            asm = (emit_clayout_test(geom, name) if clayout
+                   else emit_test(geom, rvv_ref.random_case(geom, rng), name))
+            out.append((name, asm, geom))
     return out
 
 
@@ -1468,6 +1863,139 @@ def check_round_four_emission() -> None:
                 1, rvv_ref.Fraction(geom.k_eff), geom.sew), hex(value)
 
 
+def check_clayout_emission() -> None:
+    """Round five's programs must actually do what the tier claims.
+
+    Five things, each of which the tier would be worthless without:
+
+      * no tile *store* anywhere in the program -- the read-back is an
+        architectural vse<SEW>.v of the whole C group.  A clayout program
+        that still contained a vmts.v would be a pair program with extra
+        steps;
+      * the read-back is configured at LMUL = EMUL_C and VL = VLMAX, so it
+        copies out the entire group and not the first register of it;
+      * the expected image in .data is rvv_ref's, element for element, and
+        the compare walks it at the spec's mat_C_idx offsets;
+      * the transposed image really is the transpose, and really differs
+        from the expected one (otherwise `TITAN CLAYOUT transposed` could
+        fire on a correct tile); and
+      * the tier spans EMUL_C and W rather than one corner of the space --
+        at VLEN=256 it must reach EMUL_C 2 and 8, and both vmmacc.vv and
+        vqmmacc.vv.
+    """
+    seen_emul, seen_w = set(), set()
+    for geom in rvv_ref.clayout_geometries(256):
+        if not _allocatable_here(geom):
+            continue
+        seen_emul.add(geom.emul_c)
+        seen_w.add(geom.w)
+        alloc = VectorAlloc.allocate(geom)
+        asm = emit_clayout_test(geom)
+
+        # The tile store appears exactly once, in the header prose that says
+        # it is *not* used; never as an instruction.
+        body_lines = [ln for ln in asm.splitlines()
+                      if ln.strip() and not ln.lstrip().startswith("#")]
+        assert not any(geom.store_mnemonic in ln for ln in body_lines), \
+            geom.describe()
+        assert ime.insn(geom.store_mnemonic, vs3=alloc.c, rs1=RS1_ADDR,
+                        rs2=RS2_LD, vm=1,
+                        **{"lambda": 0}).split(", ")[1] not in asm, \
+            geom.describe()
+        assert f"# {geom.load_mnemonic} v{alloc.c}, (a0), a1" in asm, \
+            geom.describe()
+        assert f"# {geom.mnemonic} v{alloc.c}" in asm, geom.describe()
+
+        total = geom.m * geom.n_max
+        assert (f"    li    t0, {total}\n"
+                f"    vsetvli t1, t0, e{geom.sew}, m{geom.emul_c}, ta, ma\n"
+                f"    la    a2, c_raw\n"
+                f"    vse{geom.sew}.v v{alloc.c}, (a2)") in asm, \
+            geom.describe()
+
+        a, b, c0 = rvv_ref.clayout_case(geom)
+        ref = rvv_ref.reference_gemm(a, b, c0, geom)
+        exp = rvv_ref.clayout_reg_image(ref, geom)
+        xpose = rvv_ref.clayout_reg_image(
+            [[ref[j][i] for j in range(geom.n_max)] for i in range(geom.m)],
+            geom)
+        assert exp != xpose, geom.describe()
+        mask = (1 << geom.sew) - 1
+        for label, image in (("c_exp", exp), ("c_xpose", xpose)):
+            body = asm.split(f"{label}:\n", 1)[1]
+            body = body.split("    .balign", 1)[0]
+            values = [int(tok, 0) for line in body.splitlines()
+                      for tok in line.split(None, 1)[1].split(",")]
+            assert values == [v & mask for v in image], (label,
+                                                         geom.describe())
+        # ... and the transpose really is the transpose of the tile, not of
+        # the flat image, which is a different permutation whenever
+        # EMUL_C > 1.
+        for i in range(geom.m):
+            for j in range(geom.n_max):
+                flat = rvv_ref.c_element_index(i, j, geom)
+                assert exp[flat] == ref[i][j]
+                assert xpose[flat] == ref[j][i]
+                esz = geom.sew // 8
+                assert (f"    li    t0, {flat * esz}          "
+                        f"# C[{i},{j}] -> group element {flat}") in asm, (
+                    geom.describe(), i, j)
+
+        fmts = dict(re.findall(r'^\.Lfmt_(\w+):\s+\.asciz "(.*)"$', asm,
+                               re.M))
+        assert set(fmts) == {"pass", "skip", "fail", "diff", "cdump", "cref",
+                             "clayout_t", "clayout_o", "elem",
+                             "nl"}, sorted(fmts)
+        assert fmts["clayout_t"].startswith("TITAN CLAYOUT transposed ")
+        assert fmts["clayout_o"].startswith("TITAN CLAYOUT other ")
+        assert "%" not in fmts["clayout_t"] + fmts["clayout_o"]
+
+    assert {2, 8} <= seen_emul, sorted(seen_emul)
+    assert seen_w == {1, 4}, sorted(seen_w)
+
+
+def check_clayout_verdict_contract() -> None:
+    """helpers.classify_run must read a clayout program's verdicts too.
+
+    The tier prints the *same* markers as the pair tiers -- that is the
+    point, so the loop's feedback machinery needs no change to quote its
+    evidence back.  The one new line, `TITAN CLAYOUT`, is deliberately not
+    a verdict: it is evidence, and it is asserted here to be inert to the
+    classifier so that adding it cannot reclassify a run.
+    """
+    import helpers
+
+    class _Run:
+        def __init__(self, log):
+            self.log, self.success, self.returncode = log, True, 0
+
+    geom = TileGeometry(256, 32, 1, 8, 64, 1, "op", "int", "clayout")
+    asm = emit_clayout_test(geom)
+    fmts = dict(re.findall(r'^\.Lfmt_(\w+):\s+\.asciz "(.*)"$', asm, re.M))
+
+    def expand(kind, *args):
+        text = fmts[kind].replace("\\n", "\n")
+        for value in args:
+            text = re.sub(r"%d", str(value), text, count=1)
+        return text
+
+    assert helpers.classify_run(_Run(expand("pass"))).kind == "pass"
+    failed = helpers.classify_run(_Run(expand("fail", 3, 2)))
+    assert failed.kind == "mismatch" and failed.failed, failed
+    assert (failed.row, failed.col) == (3, 2), failed
+    assert failed.vlen == 256 and failed.sew == 32, failed
+
+    # The evidence lines the loop quotes back verbatim.
+    diff = expand("diff", 3, 2).replace("0x%x", "0x2a", 1) \
+                               .replace("0x%x", "0x2b", 1)
+    out = helpers.classify_run(_Run(diff + expand("fail", 3, 2)))
+    assert out.diffs and out.diffs[0].startswith("TITAN DIFF r=3 c=2"), out
+
+    # `TITAN CLAYOUT` must not read as a verdict on its own.
+    alone = helpers.classify_run(_Run(expand("clayout_t")))
+    assert alone.failed and alone.kind != "pass", alone
+
+
 def check_verdict_contract() -> None:
     """helpers.classify_run must read what these programs actually print.
 
@@ -1532,8 +2060,9 @@ def check_verdict_contract() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256)
-    parser.add_argument("--emit", metavar="SEW,LAMBDA,LMUL,N[,W][,op|t]",
-                        help="print one program instead of running self-tests")
+    parser.add_argument(
+        "--emit", metavar="SEW,LAMBDA,LMUL,N[,W][,op|t][,pair|clayout]",
+        help="print one program instead of running self-tests")
     args = parser.parse_args()
 
     if args.emit:
@@ -1541,10 +2070,16 @@ def main() -> int:
         tload = "op"
         if toks[-1] in ("op", "t"):
             tload = toks.pop()
+        check = "pair"
+        if toks[-1] in ("pair", "clayout"):
+            check = toks.pop()
         sew, lam, lmul, n, *rest = (int(x) for x in toks)
         geom = TileGeometry(args.vlen, sew, lam, lmul, n * lam * lmul,
-                            rest[0] if rest else 1, tload)
-        print(emit_test(geom, rvv_ref.random_case(geom, random.Random(0))))
+                            rest[0] if rest else 1, tload, "int", check)
+        if check == "clayout":
+            print(emit_clayout_test(geom))
+        else:
+            print(emit_test(geom, rvv_ref.random_case(geom, random.Random(0))))
         return 0
 
     for check in (check_vtype_fields, check_allocation_disjoint,
@@ -1552,7 +2087,9 @@ def main() -> int:
                   check_widening_emission, check_transposing_emission,
                   check_widening_verdict_geometry,
                   check_round_four_emission,
-                  check_verdict_contract):
+                  check_clayout_emission,
+                  check_verdict_contract,
+                  check_clayout_verdict_contract):
         check()
         print(f"  ok  {check.__name__}")
 
@@ -1561,10 +2098,10 @@ def main() -> int:
         lines = sum(a.count("\n") for _, a, _ in suite)
         tally = {}
         for _, _, g in suite:
-            key = (g.kind, g.w, g.tload)
+            key = (g.check, g.kind, g.w, g.tload)
             tally[key] = tally.get(key, 0) + 1
-        breakdown = " + ".join(f"{n} {kind} W={w}/{tl}"
-                               for (kind, w, tl), n in sorted(tally.items()))
+        breakdown = " + ".join(f"{n} {chk}/{kind} W={w}/{tl}"
+                               for (chk, kind, w, tl), n in sorted(tally.items()))
         print(f"\nVLEN={args.vlen} {label}: {len(suite)} programs "
               f"({breakdown}), {lines:,} lines of assembly")
     return 0

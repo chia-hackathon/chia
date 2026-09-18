@@ -381,6 +381,8 @@ def run(program: Program, machine: Machine, limit: int = 20_000_000) -> int:
             _vsetvli(machine, ops)
         elif mnemonic.startswith("vle"):
             _vle(machine, mnemonic, ops)
+        elif mnemonic.startswith("vse"):
+            _vse(machine, mnemonic, ops)
         elif mnemonic == "vmul.vv":
             _vmul(machine, ops)
         elif mnemonic == "vmv.s.x":
@@ -517,6 +519,26 @@ def _vle(machine: Machine, mnemonic: str, ops: List[str]) -> None:
                      machine.load(addr + i * width, width, signed=False))
 
 
+def _vse(machine: Machine, mnemonic: str, ops: List[str]) -> None:
+    """Architectural unit-stride vector store of a whole register group.
+
+    The round-five C-layout probe's read-back path, and the reason it can
+    see what the pair tiers cannot: element p of the group goes to byte
+    p*EEW/8, with no tile indexing anywhere.  This is the plain RVV 1.0
+    definition -- ``vse<EEW>.v vs3, (rs1)`` -- and it spans the LMUL-sized
+    group exactly as :meth:`Machine.vget` walks it.
+    """
+    eew = int(re.fullmatch(r"vse(\d+)\.v", mnemonic).group(1))
+    m = re.fullmatch(r"\((\w+)\)", ops[1])
+    if not m:
+        raise SimError(f"bad vector store operand: {ops[1]!r}")
+    addr = machine.x[_reg(m.group(1))]
+    width = eew // 8
+    for i in range(machine.vl):
+        machine.store(addr + i * width, width,
+                      machine.vget(_vreg(ops[0]), i, eew))
+
+
 def _vmul(machine: Machine, ops: List[str]) -> None:
     sew = machine.sew
     vd, vs1, vs2 = (_vreg(o) for o in ops)
@@ -555,6 +577,42 @@ _TILE_LS = {"vmtl.v": False, "vmts.v": False,
 #: raise SimError instead of quietly scoring itself against a model nobody
 #: derived.  See titan_runs/round4_design.md.
 _FP_MACC_W = {"vfmmacc.vv": 1}
+
+
+#: The three Sail index functions the model uses, held as rebindable module
+#: globals rather than called through ``rvv_ref.`` directly.  They are the
+#: *implementation's* choice of layout, and the negative controls replace
+#: them to build a deliberately wrong DUT -- which must stay a property of
+#: the model, never of rvv_ref: rvv_ref is what the generated programs are
+#: judged against, and sabotaging it would move the reference and the
+#: defendant together, which is exactly the failure mode round five exists
+#: to close.
+_C_INDEX = rvv_ref.c_element_index
+_AB_INDEX = rvv_ref.ab_element_index
+_TILE_REG_IDX = rvv_ref.tile_reg_idx
+
+
+def _linear_c_index(i: int, j: int, geom: TileGeometry) -> int:
+    """C indexed as a plain ``i*N_max + j``, the way Titan's RTL does it.
+
+    ``backend/ExecuteSequencer.scala`` computes ``mat_c_flat = i*M + j``
+    (M = N_max for a square tile) where the spec routes ``i*N_max + j``
+    through ``tile_reg_idx`` (spec 4810-4812 calling 4777-4786).  At
+    LAMBDA=1 the spec's ``mat_C_idx`` evaluates to ``j*M + i``, so the two
+    differ by exactly a transpose.
+    """
+    return rvv_ref.c_sequential_index(i, j, geom)
+
+
+def _linear_ab_index(r: int, k: int, geom: TileGeometry) -> int:
+    """A/B indexed sequentially, i.e. ``tile_reg_idx`` replaced by identity."""
+    return rvv_ref.ab_sequential_index(r, k, geom)
+
+
+def _identity_tile_reg_idx(i: int, group_regs: int, row_elems_per_reg: int,
+                           elems_per_reg: int) -> int:
+    """``tile_reg_idx`` replaced by the identity, for the gap control."""
+    return i
 
 
 def _geometry(machine: Machine, w: int = 1,
@@ -638,8 +696,8 @@ def _ime(machine: Machine, word: int) -> None:
             mem_off = ((i % linesize) * ld + (i // linesize) if transposing
                        else (i // linesize) * ld + (i % linesize))
             addr = base + width * mem_off
-            flat_idx = rvv_ref.tile_reg_idx(i, geom.lmul, geom.lam,
-                                            geom.elems_per_reg)
+            flat_idx = _TILE_REG_IDX(i, geom.lmul, geom.lam,
+                                     geom.elems_per_reg)
             if name in ("vmtl.v", "vmttl.v"):
                 machine.vset(reg, flat_idx, sew,
                              machine.load(addr, width, signed=False))
@@ -669,15 +727,11 @@ def _ime(machine: Machine, word: int) -> None:
         vd, vs1, vs2 = fields["vd"], fields["vs1"], fields["vs2"]
         for i in range(geom.m):
             for j in range(geom.n):
-                c_flat = rvv_ref.c_element_index(i, j, geom)
+                c_flat = _C_INDEX(i, j, geom)
                 acc = machine.vget(vd, c_flat, sew)
                 for k in range(geom.k_eff):
-                    a = machine.vget(vs1,
-                                     rvv_ref.ab_element_index(i, k, geom),
-                                     sew)
-                    b = machine.vget(vs2,
-                                     rvv_ref.ab_element_index(j, k, geom),
-                                     sew)
+                    a = machine.vget(vs1, _AB_INDEX(i, k, geom), sew)
+                    b = machine.vget(vs2, _AB_INDEX(j, k, geom), sew)
                     acc = _fp_step(acc, a, b, sew)
                 machine.vset(vd, c_flat, sew, acc)
         return
@@ -705,13 +759,11 @@ def _ime(machine: Machine, word: int) -> None:
     vd, vs1, vs2 = fields["vd"], fields["vs1"], fields["vs2"]
     for i in range(geom.m):
         for j in range(geom.n):
-            c_flat = rvv_ref.c_element_index(i, j, geom)
+            c_flat = _C_INDEX(i, j, geom)
             acc = _sext(machine.vget(vd, c_flat, sew), sew)
             for k in range(geom.k_eff):
-                a = machine.vget(vs1, rvv_ref.ab_element_index(i, k, geom),
-                                 eew_ab)
-                b = machine.vget(vs2, rvv_ref.ab_element_index(j, k, geom),
-                                 eew_ab)
+                a = machine.vget(vs1, _AB_INDEX(i, k, geom), eew_ab)
+                b = machine.vget(vs2, _AB_INDEX(j, k, geom), eew_ab)
                 acc += _sext(a, eew_ab) * _sext(b, eew_ab)
             machine.vset(vd, c_flat, sew, acc)
 
@@ -721,8 +773,18 @@ def _ime(machine: Machine, word: int) -> None:
 # ---------------------------------------------------------------------------
 
 def simulate(geom: TileGeometry, seed: int = 0) -> Tuple[int, str]:
-    case = rvv_ref.random_case(geom, random.Random(seed))
-    program = assemble(ime_tests.emit_test(geom, case))
+    """Assemble and run one directed program, whichever shape it is.
+
+    ``geom.check`` selects the generator: "pair" is the differential
+    program of rounds one to four, "clayout" is round five's C-tile
+    register-layout probe, whose operands are fixed by construction and so
+    ignore *seed*.
+    """
+    if geom.check == "clayout":
+        program = assemble(ime_tests.emit_clayout_test(geom))
+    else:
+        case = rvv_ref.random_case(geom, random.Random(seed))
+        program = assemble(ime_tests.emit_test(geom, case))
     machine = Machine(vlen=geom.vlen)
     code = run(program, machine)
     return code, "".join(machine.stdout)
@@ -826,25 +888,142 @@ def check_fp_rounding_is_load_bearing(vlen: int = 256) -> None:
         _fp_step = original
 
 
+def check_clayout_catches_transposed_c(vlen: int = 256) -> None:
+    """A model that writes C transposed must fail every clayout program.
+
+    The tier exists to catch exactly this, so this is the control that makes
+    the tier mean anything: without it, a green clayout run would be
+    consistent with the read-back never being compared.
+
+    The sabotage is applied to the *model's* index function, never to
+    rvv_ref: the generated program's expected image comes from rvv_ref, and
+    moving reference and defendant together is precisely the failure mode
+    that let a transposed accumulator survive four rounds of green.
+
+    Every geometry must fail, and every geometry must additionally print
+    `TITAN CLAYOUT transposed` -- the named verdict, not just 56 scattered
+    diffs.  A geometry that could not produce the named verdict would be
+    dead weight in the tier and should be found now.
+    """
+    global _C_INDEX
+    original = _C_INDEX
+    _C_INDEX = lambda i, j, geom: original(j, i, geom)   # noqa: E731
+    try:
+        checked = 0
+        for geom in _clayout_geometries(vlen):
+            code, output = simulate(geom)
+            assert code != ime_tests.EXIT_PASS and "TITAN FAIL" in output, (
+                f"{geom.describe()}: a transposed C tile went undetected")
+            assert "TITAN CLAYOUT transposed" in output, (
+                f"{geom.describe()}: the C tile is transposed but the tier "
+                f"did not name it:\n{output}")
+            assert "TITAN DIFF " in output, geom.describe()
+            checked += 1
+        assert checked, "no clayout geometry was checked"
+    finally:
+        _C_INDEX = original
+
+
+def check_linear_c_index_is_the_gap(vlen: int = 256) -> None:
+    """The round-five gap itself, stated as an executable claim.
+
+    Titan's RTL indexes the tile register groups linearly -- Sail's
+    ``tile_reg_idx`` replaced by the identity, and ``mat_C_idx`` by a plain
+    ``i*N_max + j`` (backend/ExecuteSequencer.scala around 437 and 445-446
+    against spec 4810-4812 and 4777-4786).  Model that, and two things must
+    hold at once:
+
+      * **every** pre-round-five directed program still passes.  It writes
+        the C tile with vmts.v and reads it back with vmts.v, and the
+        permutation cancels; the memory image is correct and the comparison
+        is satisfied.  That is the gap, and it is a positive claim, not an
+        absence of evidence.
+      * **every** clayout program whose geometry the bug can reach fails,
+        and at LAMBDA=1 -- where the spec's mat_C_idx evaluates to
+        ``j*M + i``, the exact transpose of the linear index -- names the
+        layout.  At EMUL_C=1 ``tile_reg_idx`` *is* the identity, so the
+        linear index is the spec index and there is nothing to catch: those
+        geometries must still pass, which is the tier's no-false-positive
+        half and is asserted here rather than assumed.
+
+    If the first assertion ever starts failing, the gap has been closed by
+    something else and this control should be re-derived rather than
+    deleted; if the second starts failing, the tier has stopped being able
+    to see the bug it was built for.
+    """
+    global _C_INDEX, _AB_INDEX, _TILE_REG_IDX
+    saved = (_C_INDEX, _AB_INDEX, _TILE_REG_IDX)
+    _C_INDEX, _AB_INDEX, _TILE_REG_IDX = (_linear_c_index, _linear_ab_index,
+                                          _identity_tile_reg_idx)
+    try:
+        blind = 0
+        for geom in _every_geometry(vlen):
+            if geom.check == "clayout" or geom.emul_c == 16 \
+                    or not _allocatable(geom) or geom.n != geom.n_max:
+                continue
+            code, output = simulate(geom, seed=0)
+            assert code == ime_tests.EXIT_PASS and "TITAN PASS" in output, (
+                f"{geom.describe()}: a linear C index was caught by a pair "
+                f"program -- the round-five premise no longer holds:\n"
+                f"{output}")
+            blind += 1
+        named = caught = unaffected = 0
+        for geom in _clayout_geometries(vlen):
+            code, output = simulate(geom)
+            same = all(rvv_ref.c_element_index(i, j, geom)
+                       == rvv_ref.c_sequential_index(i, j, geom)
+                       for i in range(geom.m) for j in range(geom.n_max))
+            if same:
+                # EMUL_C=1: mat_C_idx collapses to i*N_max + j, so the RTL's
+                # linear index is the architectural one.  Nothing to catch,
+                # and a tier that "caught" it here would be lying.
+                assert geom.emul_c == 1, geom.describe()
+                assert code == ime_tests.EXIT_PASS, (
+                    f"{geom.describe()}: false positive -- the linear index "
+                    f"is the spec index at EMUL_C=1:\n{output}")
+                unaffected += 1
+                continue
+            assert code != ime_tests.EXIT_PASS and "TITAN FAIL" in output, (
+                f"{geom.describe()}: the clayout tier did not catch the "
+                f"linear C index:\n{output}")
+            caught += 1
+            if geom.lam == 1:
+                assert "TITAN CLAYOUT transposed" in output, (
+                    f"{geom.describe()}: LAMBDA=1, so the linear index is "
+                    f"exactly a transpose, but the tier did not name it:"
+                    f"\n{output}")
+                named += 1
+            else:
+                assert "TITAN CLAYOUT other" in output, geom.describe()
+        assert blind and caught and named and unaffected, (
+            blind, caught, named, unaffected)
+    finally:
+        _C_INDEX, _AB_INDEX, _TILE_REG_IDX = saved
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256)
-    parser.add_argument("--emit", metavar="SEW,LAMBDA,LMUL,N[,W][,op|t][,int|fp]",
-                        help="run one geometry and print its output")
+    parser.add_argument(
+        "--emit",
+        metavar="SEW,LAMBDA,LMUL,N[,W][,op|t][,int|fp][,pair|clayout]",
+        help="run one geometry and print its output")
     parser.add_argument("--seeds", type=int, default=3,
                         help="random cases per geometry")
     args = parser.parse_args()
 
     if args.emit:
         toks = args.emit.split(",")
-        tload, kind = "op", "int"
+        tload, kind, check = "op", "int", "pair"
+        if toks[-1] in ("pair", "clayout"):
+            check = toks.pop()
         if toks[-1] in ("int", "fp"):
             kind = toks.pop()
         if toks[-1] in ("op", "t"):
             tload = toks.pop()
         sew, lam, lmul, n, *rest = (int(t) for t in toks)
         geom = TileGeometry(args.vlen, sew, lam, lmul, n * lam * lmul,
-                            rest[0] if rest else 1, tload, kind)
+                            rest[0] if rest else 1, tload, kind, check)
         code, output = simulate(geom)
         print(f"{geom.describe()}\nexit={code}\n{output}")
         return 0 if code == ime_tests.EXIT_PASS else 1
@@ -853,7 +1032,9 @@ def main() -> int:
                   if g.emul_c != 16 and _allocatable(g)]
     failures, ran = [], 0
     for geom in geometries:
-        for seed in range(args.seeds):
+        # The clayout probe's operands are fixed by construction, so extra
+        # seeds would be the same program run again.
+        for seed in range(1 if geom.check == "clayout" else args.seeds):
             code, output = simulate(geom, seed)
             ran += 1
             if code != ime_tests.EXIT_PASS or "TITAN PASS" not in output:
@@ -891,6 +1072,11 @@ def main() -> int:
         controls += [g for g in rvv_ref.ime_legal_configs(
             args.vlen, sews=(sew,), full_vl_only=True, kinds=("fp",))
             if g.emul_c != 16 and _allocatable(g) and g.m > 1][:1]
+    # ... and one round-five C-layout probe, for the same reason again: its
+    # compare is a different compare (a register image against a precomputed
+    # one, not two on-DUT computations against each other) and has to be
+    # shown to be able to fail.
+    controls += [g for g in _clayout_geometries(args.vlen) if g.m > 1][:1]
     for control in controls:
         check_negative_control(control)
         print(f"  ok  check_negative_control  {control.describe()}")
@@ -898,13 +1084,17 @@ def main() -> int:
     print("  ok  check_transposing_is_load_bearing")
     check_fp_rounding_is_load_bearing(args.vlen)
     print("  ok  check_fp_rounding_is_load_bearing")
+    check_clayout_catches_transposed_c(args.vlen)
+    print("  ok  check_clayout_catches_transposed_c")
+    check_linear_c_index_is_the_gap(args.vlen)
+    print("  ok  check_linear_c_index_is_the_gap")
 
     tally = {}
     for g in geometries:
-        key = (g.kind, g.w, g.tload)
+        key = (g.check, g.kind, g.w, g.tload)
         tally[key] = tally.get(key, 0) + 1
-    breakdown = " + ".join(f"{n} {kind} W={w}/{tl}"
-                           for (kind, w, tl), n in sorted(tally.items()))
+    breakdown = " + ".join(f"{n} {chk}/{kind} W={w}/{tl}"
+                           for (chk, kind, w, tl), n in sorted(tally.items()))
     print(f"\nVLEN={args.vlen}: {ran} program executions across "
           f"{len(geometries)} geometries ({breakdown}), "
           f"{len(failures)} failed")
@@ -927,6 +1117,15 @@ def _every_geometry(vlen: int):
             vlen, sews=rvv_ref.WIDENING_SEWS_BY_W[w], ws=(w,))
     yield from rvv_ref.ime_legal_configs(vlen, tloads=("t",))
     yield from rvv_ref.ime_legal_configs(vlen, kinds=("fp",))
+    # Round five, last: the C-layout probe, full VL only (see
+    # rvv_ref.clayout_capable) and in the same W=1-then-W=4 tier order
+    # ime_tests.directed_suite emits it in.
+    yield from _clayout_geometries(vlen)
+
+
+def _clayout_geometries(vlen: int):
+    """rvv_ref's clayout tier, minus anything this harness cannot allocate."""
+    return [g for g in rvv_ref.clayout_geometries(vlen) if _allocatable(g)]
 
 
 def _allocatable(geom: TileGeometry) -> bool:
