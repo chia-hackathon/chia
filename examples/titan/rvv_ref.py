@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import random
+import struct
+from fractions import Fraction
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Sequence, Tuple
 
@@ -102,6 +104,7 @@ class TileGeometry:
     vl: int
     w: int = 1        # widening factor: 1/2/4/8 = vmmacc/vw/vq/v8wmmacc.vv
     tload: str = "op"  # "op" = vmtl.v/vmts.v, "t" = vmttl.v/vmtts.v
+    kind: str = "int"  # "int" = Zvvmm, "fp" = Zvvfmm (round four)
 
     @property
     def elems_per_reg(self) -> int:
@@ -141,12 +144,25 @@ class TileGeometry:
 
     @property
     def mnemonic(self) -> str:
-        """The multiply-accumulate this geometry's W selects."""
+        """The multiply-accumulate this geometry's :attr:`kind` and W select.
+
+        The two families are the same table at two funct6 runs: Zvvmm at
+        OPIVV 0x38/0x39/0x3a/0x3b and Zvvfmm at OPFVV 0x14/0x15/0x16/0x17,
+        both indexed by W in {1,2,4,8} (spec 1249-1253 and 1336-1339).  Round
+        four implements only the W=1 floating-point entry; the others are
+        listed so that a geometry built with an unimplemented W fails in
+        :meth:`validate` with the reason, not here with a KeyError.
+        """
+        table = {"int": {1: "vmmacc.vv", 2: "vwmmacc.vv",
+                         4: "vqmmacc.vv", 8: "v8wmmacc.vv"},
+                 "fp": {1: "vfmmacc.vv", 2: "vfwmmacc.vv",
+                        4: "vfqmmacc.vv", 8: "vf8wmmacc.vv"}}
         try:
-            return {1: "vmmacc.vv", 2: "vwmmacc.vv",
-                4: "vqmmacc.vv", 8: "v8wmmacc.vv"}[self.w]
+            return table[self.kind][self.w]
         except KeyError:
-            raise ValueError(f"no mnemonic modelled for W={self.w}") from None
+            raise ValueError(
+                f"no mnemonic modelled for kind={self.kind!r} W={self.w}"
+            ) from None
 
     @property
     def load_mnemonic(self) -> str:
@@ -212,6 +228,42 @@ class TileGeometry:
             raise ValueError(
                 f"tload={self.tload!r}: expected 'op' (vmtl.v / vmts.v) or "
                 f"'t' (vmttl.v / vmtts.v)")
+        if self.kind not in ("int", "fp"):
+            raise ValueError(
+                f"kind={self.kind!r}: expected 'int' (Zvvmm) or 'fp' "
+                f"(Zvvfmm)")
+        if self.kind == "fp":
+            # Round four implements one floating-point instruction,
+            # vfmmacc.vv, at the two accumulator widths whose input format
+            # needs no vtype.altfmt_A / altfmt_B decode.  Spec 1490-1493:
+            # "For IEEE binary32 and IEEE binary64 inputs, `altfmt_A` and
+            # `altfmt_B` are ignored (there is only one format per width)";
+            # spec 1092-1106 likewise reserves altfmt=1 for the C format at
+            # SEW 32 and 64, so the whole (SEW, W, altfmt_A, altfmt_B,
+            # altfmt) encoding-map row collapses to a single legal cell.
+            # Everything else in the family -- SEW 8/16 inputs, and every
+            # W>1 form -- needs either a sub-word format decode or an exact
+            # multi-product partial sum.  See titan_runs/round4_design.md.
+            if self.w != 1:
+                raise ValueError(
+                    f"kind='fp' with W={self.w}: round four implements "
+                    f"vfmmacc.vv (W=1) only; the widening floating-point "
+                    f"forms need an exact W-product partial sum, which no "
+                    f"baseline rv64imafd sequence can recompute in one "
+                    f"rounding -- see round4_design.md")
+            if self.tload != "op":
+                raise ValueError(
+                    f"kind='fp' with tload={self.tload!r}: the transposing "
+                    f"tile pair is tested at kind='int' (round three); "
+                    f"pairing it with a new arithmetic instruction would "
+                    f"stop isolating a layout failure from an arithmetic "
+                    f"one")
+            if self.sew not in FP_FORMATS:
+                raise ValueError(
+                    f"kind='fp' with SEW={self.sew}: round four models the "
+                    f"IEEE binary{{32,64}} accumulator widths only "
+                    f"(binary16 / bfloat16 / OFP8 / OFP4 need the "
+                    f"vtype.altfmt_A / altfmt_B format decode)")
         if self.tload == "t" and self.w != 1:
             # Zvvmttls: "The transposing instructions vmttl.v and vmtts.v
             # transpose SEW-bit storage elements.  They do not unpack,
@@ -286,9 +338,15 @@ class TileGeometry:
         # `VLEN=(\d+) SEW=(\d+) LAMBDA=(\d+)` as three adjacent fields, and
         # an "op" geometry must print byte-for-byte what round two printed.
         trans = "" if self.tload == "op" else f" TL={self.tload}"
+        # The floating-point clause goes last, for the same reason the W and
+        # TL clauses do not sit between SEW and LAMBDA: helpers._GEOM_RE
+        # scrapes `VLEN=(\d+) SEW=(\d+) LAMBDA=(\d+)` as three adjacent
+        # fields, and an integer geometry must print byte-for-byte what
+        # round three printed.
+        fp = "" if self.kind == "int" else f" FP=binary{self.sew}"
         return (f"VLEN={self.vlen} SEW={self.sew} LAMBDA={self.lam}{widen} "
                 f"LMUL={self.lmul} VL={self.vl} -> M={self.m} N={self.n} "
-                f"K_eff={self.k_eff} EMUL_C={self.emul_c}{trans}")
+                f"K_eff={self.k_eff} EMUL_C={self.emul_c}{trans}{fp}")
 
 
 def permissible_lambdas(vlen: int, sew: int, w: int = 1) -> List[int]:
@@ -348,7 +406,8 @@ def ime_legal_configs(vlen: int, sews: Sequence[int] = (8, 16, 32, 64),
                       lmuls: Sequence[int] = (1, 2, 4, 8),
                       full_vl_only: bool = False,
                       ws: Sequence[int] = (1,),
-                      tloads: Sequence[str] = ("op",)
+                      tloads: Sequence[str] = ("op",),
+                      kinds: Sequence[str] = ("int",)
                       ) -> Iterator[TileGeometry]:
     """Every IME-legal (SEW, LAMBDA, LMUL, VL) for this VLEN.
 
@@ -367,24 +426,32 @@ def ime_legal_configs(vlen: int, sews: Sequence[int] = (8, 16, 32, 64),
     order-preserving vmtl.v / vmts.v pair, ``"t"`` for the transposing
     vmttl.v / vmtts.v pair of round three -- and is outside ``ws`` for the
     same reason.  It defaults to ``("op",)``.
+
+    ``kinds`` selects the arithmetic family -- ``"int"`` for Zvvmm, ``"fp"``
+    for round four's Zvvfmm -- and is the outer-most loop of all, again so
+    that adding it appends rather than interleaves.  It defaults to
+    ``("int",)``, so every pre-round-four caller sees exactly the geometries,
+    in exactly the order, that it saw before.
     """
-    for tload in tloads:
-        for w in ws:
-            for sew in sews:
-                for lam in permissible_lambdas(vlen, sew, w):
-                    for lmul in lmuls:
-                        probe = TileGeometry(vlen, sew, lam, lmul,
-                                             lam * lmul, w, tload)
-                        n_values = ([probe.n_max] if full_vl_only
-                                    else range(1, probe.n_max + 1))
-                        for n in n_values:
-                            geom = TileGeometry(vlen, sew, lam, lmul,
-                                                n * lam * lmul, w, tload)
-                            try:
-                                geom.validate()
-                            except ValueError:
-                                continue
-                            yield geom
+    for kind in kinds:
+        for tload in tloads:
+            for w in ws:
+                for sew in sews:
+                    for lam in permissible_lambdas(vlen, sew, w):
+                        for lmul in lmuls:
+                            probe = TileGeometry(vlen, sew, lam, lmul,
+                                                 lam * lmul, w, tload, kind)
+                            n_values = ([probe.n_max] if full_vl_only
+                                        else range(1, probe.n_max + 1))
+                            for n in n_values:
+                                geom = TileGeometry(vlen, sew, lam, lmul,
+                                                    n * lam * lmul, w,
+                                                    tload, kind)
+                                try:
+                                    geom.validate()
+                                except ValueError:
+                                    continue
+                                yield geom
 
 
 # ---------------------------------------------------------------------------
@@ -786,10 +853,426 @@ def random_case(geom: TileGeometry, rng: random.Random
     A and B are drawn at EEW_A = SEW/W (the logical input width) and C at
     SEW (the accumulator width).  At W = 1 the two coincide, so round one's
     data is unchanged.
+
+    A floating-point geometry draws from :func:`random_fp_case` instead: the
+    shapes are identical, but a uniformly random SEW-wide bit pattern is
+    almost always a NaN-free huge normal whose products overflow, which
+    tests nothing.  The dispatch is here rather than at the call sites so
+    that ime_tests, ime_stress and sim_check all get it from one place.
     """
+    if geom.kind == "fp":
+        return random_fp_case(geom, rng)
     return (random_matrix(geom.m, geom.k_eff, geom.eew_ab, rng),
             random_matrix(geom.n_max, geom.k_eff, geom.eew_ab, rng),
             random_matrix(geom.m, geom.n_max, geom.sew, rng))
+
+
+# ---------------------------------------------------------------------------
+# round four: IEEE-754 floating point (Zvvfmm)
+# ---------------------------------------------------------------------------
+#
+# Round four adds one instruction, vfmmacc.vv (W=1), at SEW in {32, 64} --
+# binary32 x binary32 -> binary32 and binary64 x binary64 -> binary64.  See
+# titan_runs/round4_design.md for the survey and the batch decision.  What
+# this section has to supply is an *exact* IEEE-754 model, because the whole
+# harness compares raw bit patterns and a reference that is merely close is
+# no reference at all.
+#
+# Everything here is built on :class:`fractions.Fraction`, so a product or a
+# sum is formed exactly as a rational and rounded exactly once, by
+# :func:`fp_round`.  There is no reliance on the host's float type for the
+# authoritative path; :func:`check_fp_matches_host` cross-checks the Fraction
+# model against Python's binary64 arithmetic, which is a genuinely
+# independent implementation of the same rounding rule.
+
+#: (exponent bits, significand bits including the hidden bit) per width.
+#: Round four models only the two widths whose format needs no altfmt
+#: decode -- spec 1490-1493, "For IEEE binary32 and IEEE binary64 inputs,
+#: `altfmt_A` and `altfmt_B` are ignored (there is only one format per
+#: width)".  binary16/bfloat16/OFP8/OFP4 are deliberately absent: see the
+#: design note.
+FP_FORMATS = {32: (8, 24), 64: (11, 53)}
+
+#: The Titan implementation disclosure required by spec 1652-1656, as a
+#: mapping from (SEW, W, LAMBDA) to (G, psm, rnd).  Round four discloses one
+#: tuple for every geometry it implements:
+#:
+#:     G = 1, psm = 0, rnd = frm
+#:
+#: which spec 1771 names as the choice that makes a Zvvm implementation
+#: match the analogous Zvtm instruction "For input element widths of 32 bits
+#: or greater ... so that each group contains a single product and the
+#: partial sum `S` is that product rounded according to `frm`."
+#:
+#: It is also the only tuple whose result the *test program* can recompute
+#: on the DUT with baseline rv64imafd instructions: with G=1 and W=1 a group
+#: is one sub-dot-product is one product, so Sail fp_gemm collapses to
+#:
+#:     acc = fp_add(acc, fp_round_to_frm(fp_mul_exact(a, b)))
+#:
+#: which is a scalar fmul followed by a scalar fadd -- two roundings, not a
+#: fused multiply-add.  Using rnd=xct instead would be one FMA per k and
+#: equally reproducible, but rnd=frm is the tuple the spec itself names for
+#: >=32-bit inputs, so it is the one disclosed here.
+FP_DISCLOSURE = {"G": 1, "psm": 0, "rnd": "frm"}
+
+#: The only rounding mode round four generates.  Spec 1495 and Sail 5695:
+#: the accumulation rounding mode is the dynamic `frm`, with no matrix-
+#: specific rounding CSR anywhere in the extension.  The test programs set
+#: frm explicitly with `fsrmi 0` rather than trusting the reset value.
+FP_FRM = 0        # RNE, round to nearest, ties to even
+
+
+def fp_fields(width: int):
+    """(exponent bits, significand bits, bias, max biased exponent)."""
+    try:
+        ebits, prec = FP_FORMATS[width]
+    except KeyError:
+        raise ValueError(
+            f"no IEEE format modelled at {width} bits; round four models "
+            f"{sorted(FP_FORMATS)} only (binary16/bfloat16/OFP8/OFP4 need "
+            f"the vtype.altfmt_A / altfmt_B decode -- see round4_design.md)"
+        ) from None
+    return ebits, prec, (1 << (ebits - 1)) - 1, (1 << ebits) - 1
+
+
+def fp_is_nan(bits: int, width: int) -> bool:
+    ebits, prec, _bias, emax = fp_fields(width)
+    return (bits >> (prec - 1)) & emax == emax and bits & ((1 << (prec - 1)) - 1)
+
+
+def fp_is_inf(bits: int, width: int) -> bool:
+    ebits, prec, _bias, emax = fp_fields(width)
+    return ((bits >> (prec - 1)) & emax == emax
+            and not bits & ((1 << (prec - 1)) - 1))
+
+
+def fp_default_nan(width: int) -> int:
+    """Sail ``fp_defaultNaN``: the canonical quiet NaN for *width*.
+
+    Spec 1880-1886: "NaN payloads are not architecturally significant for IME
+    floating-point operations ... whenever a shared floating-point helper
+    materializes a NaN result in a concrete floating-point format, it shall
+    return the default canonical NaN for that format".  So a NaN result is a
+    single fixed bit pattern and compares bit-for-bit like any other value --
+    which is why the harness needs no NaN-aware comparison.
+    """
+    ebits, prec, _bias, emax = fp_fields(width)
+    return (emax << (prec - 1)) | (1 << (prec - 2))
+
+
+def fp_unpack(bits: int, width: int):
+    """(kind, sign, value) with *value* an exact :class:`Fraction`.
+
+    ``kind`` is ``"nan"``, ``"inf"`` or ``"num"``; ``sign`` is 0 or 1; for
+    ``"num"`` the magnitude is exact and zero is representable (sign carries
+    the -0.0 / +0.0 distinction, which the bitwise compare cares about).
+    """
+    ebits, prec, bias, emax = fp_fields(width)
+    sign = (bits >> (width - 1)) & 1
+    exp = (bits >> (prec - 1)) & emax
+    frac = bits & ((1 << (prec - 1)) - 1)
+    if exp == emax:
+        return ("nan" if frac else "inf"), sign, Fraction(0)
+    if exp == 0:                       # zero or subnormal, no hidden bit
+        return "num", sign, Fraction(frac, 1 << (bias - 1 + prec - 1))
+    sig = frac | (1 << (prec - 1))
+    return "num", sign, Fraction(sig, 1 << (prec - 1)) * _pow2(exp - bias)
+
+
+def _pow2(e: int) -> Fraction:
+    return Fraction(1 << e) if e >= 0 else Fraction(1, 1 << -e)
+
+
+def fp_round(sign: int, value: Fraction, width: int) -> int:
+    """Round an exact nonnegative rational to *width* bits, RNE.
+
+    This is Sail ``fp_round_to_frm`` at ``frm = RNE``.  It implements the
+    single rounding point: overflow goes to infinity (RNE overflows away
+    from zero), underflow rounds into the subnormal range with the same
+    ties-to-even rule, and the sign is carried through unchanged so that a
+    rounded-to-zero negative result is -0.0.
+
+    *value* must be the exact magnitude; the caller supplies the sign.
+    """
+    assert value >= 0, value
+    ebits, prec, bias, emax = fp_fields(width)
+    sbit = sign << (width - 1)
+    if value == 0:
+        return sbit
+    # Choose the unbiased exponent e with 2**e <= value < 2**(e+1), then
+    # clamp at the subnormal floor so both ranges use one code path.
+    e = _floor_log2(value)
+    e = max(e, 1 - bias)
+    # Scale so the target significand is an integer in [2**(prec-1), 2**prec)
+    # for normals, and in [0, 2**(prec-1)) for subnormals.
+    scaled = value / _pow2(e - (prec - 1))
+    q, r = divmod(scaled.numerator, scaled.denominator)
+    if 2 * r > scaled.denominator or (2 * r == scaled.denominator and q & 1):
+        q += 1
+    if q >> prec:                      # carry out of the top: bump exponent
+        q >>= 1
+        e += 1
+    biased = 0 if q >> (prec - 1) == 0 else e + bias
+    if biased >= emax:                 # overflow: RNE gives infinity
+        return sbit | (emax << (prec - 1))
+    return sbit | (biased << (prec - 1)) | (q & ((1 << (prec - 1)) - 1))
+
+
+def _floor_log2(value: Fraction) -> int:
+    n, d = value.numerator, value.denominator
+    e = n.bit_length() - d.bit_length()
+    # bit_length is off by at most one; correct exactly, no floats involved.
+    while _pow2(e) > value:
+        e -= 1
+    while _pow2(e + 1) <= value:
+        e += 1
+    return e
+
+
+def fp_mul(a: int, b: int, width: int) -> int:
+    """Sail ``fp_mul``: exact product, one rounding to *width* under frm.
+
+    Special values follow IEEE-754 and spec 1841-1848: an sNaN or qNaN
+    operand, or 0 x inf, produces the *canonical* NaN -- never a propagated
+    payload.
+    """
+    ka, sa, va = fp_unpack(a, width)
+    kb, sb, vb = fp_unpack(b, width)
+    sign = sa ^ sb
+    if ka == "nan" or kb == "nan":
+        return fp_default_nan(width)
+    if ka == "inf" or kb == "inf":
+        if (ka == "num" and va == 0) or (kb == "num" and vb == 0):
+            return fp_default_nan(width)      # 0 x inf: invalid
+        _, prec, _, emax = fp_fields(width)
+        return (sign << (width - 1)) | (emax << (prec - 1))
+    return fp_round(sign, va * vb, width)
+
+
+def fp_add(a: int, b: int, width: int) -> int:
+    """Sail ``fp_add``: exact sum, one rounding to *width* under frm.
+
+    inf + (-inf) is invalid and yields the canonical NaN (spec 1850-1856).
+    The sign of an exact zero result is IEEE's: -0.0 only when both addends
+    were -0.0 (RNE never produces -0.0 from a cancelling sum).
+    """
+    ka, sa, va = fp_unpack(a, width)
+    kb, sb, vb = fp_unpack(b, width)
+    if ka == "nan" or kb == "nan":
+        return fp_default_nan(width)
+    _, prec, _, emax = fp_fields(width)
+    if ka == "inf" or kb == "inf":
+        if ka == "inf" and kb == "inf" and sa != sb:
+            return fp_default_nan(width)
+        sign = sa if ka == "inf" else sb
+        return (sign << (width - 1)) | (emax << (prec - 1))
+    total = (-va if sa else va) + (-vb if sb else vb)
+    if total == 0:
+        # IEEE 754-2019 6.3: x + y with a zero exact sum is +0 in every
+        # rounding mode except roundTowardNegative, *unless* both operands
+        # were zeros of the same sign, in which case that sign is kept.
+        if va == 0 and vb == 0 and sa == sb:
+            return sa << (width - 1)
+        return 0
+    return fp_round(1 if total < 0 else 0, abs(total), width)
+
+
+def fp_gemm_reference(a: Matrix, b: Matrix, c: Matrix,
+                      geom: "TileGeometry", rnd: str = "frm") -> Matrix:
+    """The Sail ``fp_gemm`` result, at the Titan disclosure (G=1, psm=0, rnd=frm).
+
+    Sail 5243-5268, with G = get_fp_grouping(...) = 1::
+
+        foreach (j from 0 to (g.N - 1)) {
+          foreach (i from 0 to (g.M - 1)) {
+            var acc = read_single_element(g.EEW_C, c_flat, vd);
+            foreach (step from 0 to (g.LMUL - 1)) {
+              foreach (g0 from 0 to (g.lambda - 1) by G) {
+                let S = fp_group_sum(i, j, step, g0, G, ...);
+                match round_group_sum(S, rnd, ...) {
+                  Some(S_bits) => acc = fp_add(acc, S_bits, ...),
+                  None()      => acc = fp_add_internal(acc, S, ...)
+                }
+              }
+            };
+            write_single_element(g.EEW_C, c_flat, vd, acc)
+          }
+        }
+
+    With W = 1 and G = 1, ``fp_group_sum`` (Sail 5005-5022) has
+    ``k_lo = k_hi = step * lambda + g0``, so the two nested loops enumerate
+    k = 0, 1, ... K_eff-1 in strictly increasing order and S is the single
+    exact product A[i,k] x B[j,k].  ``rnd = frm`` then rounds S to the
+    accumulator format before ``fp_add`` rounds the accumulation -- two
+    rounding points per k, which is exactly a scalar ``fmul`` followed by a
+    scalar ``fadd``.  That equivalence is what lets the emitted test program
+    carry its own reference (see ime_tests._fp_ref_path).
+
+    Columns j >= N are not computed and keep their prior value: vta = 0 in
+    these tests, so the C tile tail is undisturbed (spec 1824-1826 also
+    excludes them from fflags).
+
+    ``rnd`` selects the disclosed partial-sum rounding.  ``"frm"`` is what
+    Titan discloses and what the emitted programs are judged against;
+    ``"xct"`` is the other legal choice at G=1 (Sail 5262-5263,
+    ``None() => acc = fp_add_internal(acc, S, ...)``) and is a fused
+    multiply-add.  The second form exists only so that
+    :func:`fp_case_is_rounding_witness` can require every generated case to
+    tell them apart -- if it could not, "exact bitwise compare" would be
+    decoration and a DUT that fused its multiply-add would be green.
+    """
+    if rnd not in ("frm", "xct"):
+        raise ValueError(
+            f"rnd={rnd!r}: at G=1 the disclosed choices this models are "
+            f"'frm' (round the product, then round the accumulation) and "
+            f"'xct' (one rounding, i.e. a fused multiply-add).  'rto' "
+            f"needs a round-to-odd mode rvv_ref does not implement.")
+    if geom.kind != "fp":
+        raise ValueError(f"{geom.describe()}: not a floating-point geometry")
+    if geom.w != 1:
+        raise ValueError(
+            f"W={geom.w}: round four models the floating-point family at "
+            f"W=1 only (vfmmacc.vv); the widening forms need an exact "
+            f"multi-product partial sum -- see round4_design.md")
+    width = geom.sew
+    out = [row[:] for row in c]
+    for i in range(geom.m):
+        for j in range(geom.n):
+            acc = c[i][j]
+            for k in range(geom.k_eff):
+                if rnd == "frm":
+                    acc = fp_add(acc, fp_mul(a[i][k], b[j][k], width), width)
+                else:
+                    acc = fp_fused_step(acc, a[i][k], b[j][k], width)
+            out[i][j] = acc
+    return out
+
+
+def fp_fused_step(acc: int, a: int, b: int, width: int) -> int:
+    """``round_frm(acc + exact(a*b))`` -- the rnd=xct step, one rounding.
+
+    Sail ``fp_add_internal`` (5262-5263, helper described at 1866-1868):
+    the exact internal product is added to the accumulator and only the
+    final result is rounded.  Not the Titan disclosure; used to prove the
+    disclosure is observable.
+    """
+    ka, sa, va = fp_unpack(a, width)
+    kb, sb, vb = fp_unpack(b, width)
+    kc, sc, vc = fp_unpack(acc, width)
+    if "num" not in (ka, kb, kc) or not (ka == kb == kc == "num"):
+        # A NaN or an infinity anywhere makes the two forms agree, because
+        # neither rounding step is reached; fall back to the ordinary path
+        # so the special-value rules stay in one place.
+        return fp_add(acc, fp_mul(a, b, width), width)
+    total = ((-vc if sc else vc)
+             + (-va if sa else va) * (-vb if sb else vb))
+    if total == 0:
+        return 0
+    return fp_round(1 if total < 0 else 0, abs(total), width)
+
+
+def fp_case_is_rounding_witness(a: Matrix, b: Matrix, c: Matrix,
+                                geom: "TileGeometry") -> bool:
+    """Does this case distinguish rnd=frm from rnd=xct?
+
+    A floating-point dot product tells the two apart only when some term's
+    discarded product tail crosses a rounding boundary of the accumulation
+    -- which is a property of the *data*, not of the geometry.  The small
+    geometries (M = N = 2 with K_eff = 2 is eight terms in total) draw data
+    that fails to often enough that leaving it to chance would mean a few of
+    the directed programs silently could not catch a fused multiply-add.
+    So :func:`random_fp_case` redraws until this holds, and every emitted
+    floating-point program is a witness by construction.
+    """
+    return (fp_gemm_reference(a, b, c, geom, rnd="frm")
+            != fp_gemm_reference(a, b, c, geom, rnd="xct"))
+
+
+#: Finite, well-scaled bit patterns the directed FP tier draws from.
+#: Deliberately no infinities and no NaNs among the *inputs*: once a NaN or
+#: an infinity enters an accumulator it absorbs every later term, so the rest
+#: of that dot product stops testing anything.  The values that do appear are
+#: the ones that exercise the rounding path and are still order-sensitive:
+#: +-0.0, the smallest subnormal, a value just under 1 whose square is
+#: inexact, and normals several binades apart so that a mis-ordered or
+#: mis-rounded accumulation shows up in the low significand bits.
+#: NaN, infinity and overflow behaviour is pinned by
+#: :func:`check_fp_special_values` in the reference instead, where a NaN
+#: cannot mask the rest of the test.
+def _fp_pool(width: int) -> List[int]:
+    ebits, prec, bias, emax = fp_fields(width)
+    pool = [
+        0,                                   # +0.0
+        1 << (width - 1),                    # -0.0
+        1,                                   # smallest positive subnormal
+        (1 << (width - 1)) | 1,              # smallest negative subnormal
+        (1 << (prec - 1)) - 1,               # largest subnormal
+        (bias - 1) << (prec - 1),            # +0.5
+        bias << (prec - 1),                  # +1.0
+        (1 << (width - 1)) | (bias << (prec - 1)),           # -1.0
+        (bias << (prec - 1)) | 1,            # 1.0 + 1ulp: squares inexact
+        (bias << (prec - 1)) | ((1 << (prec - 1)) - 1),      # just under 2.0
+    ]
+    # A spread of normals a few binades apart.  The significands fill the
+    # *whole* fraction field, which is the property that matters: a
+    # significand with trailing zeros gives an exactly-representable
+    # product, and a tier built from those cannot tell rnd=frm from rnd=xct
+    # (sim_check.check_fp_rounding_is_load_bearing is the test that says
+    # so).  Three fixed patterns rather than random bits, so a program's
+    # data is reproducible from its geometry and seed alone.
+    mask = (1 << (prec - 1)) - 1
+    patterns = (0xAAAAAAAAAAAAAAAA & mask,
+                0x5555555555555555 & mask,
+                0x9E3779B97F4A7C15 & mask)
+    for shift in (-6, -3, -1, 0, 2, 5, 9):
+        for sign in (0, 1):
+            biased = bias + shift
+            for pattern in patterns:
+                pool.append((sign << (width - 1)) | (biased << (prec - 1))
+                            | pattern)
+    return pool
+
+
+def random_fp_matrix(rows: int, cols: int, width: int,
+                     rng: random.Random) -> Matrix:
+    """A matrix of FP bit patterns drawn from :func:`_fp_pool`."""
+    pool = _fp_pool(width)
+    return [[rng.choice(pool) for _ in range(cols)] for _ in range(rows)]
+
+
+#: How many times :func:`random_fp_case` may redraw before giving up.  Not
+#: a tuning knob: every geometry round four generates is a witness within a
+#: handful of draws, and a limit that were ever reached would mean a
+#: geometry whose programs cannot observe the disclosed rounding, which is a
+#: fact worth raising on rather than papering over.
+FP_WITNESS_ATTEMPTS = 64
+
+
+def random_fp_case(geom: "TileGeometry", rng: random.Random):
+    """(A, B, C) of bit patterns for one directed floating-point test.
+
+    Same shapes as :func:`random_case`; at W = 1, EEW_A == SEW, so A, B and
+    C are all drawn at the accumulator width.
+
+    The draw is rejected and repeated until the case is a rounding witness
+    (:func:`fp_case_is_rounding_witness`), so every emitted floating-point
+    program provably distinguishes the disclosed rnd=frm from a fused
+    multiply-add.  The rejection consumes the caller's rng, so the sequence
+    is still reproducible from (geometry, seed) alone; it is applied only to
+    floating-point geometries, so no integer program's draw moves.
+    """
+    for _ in range(FP_WITNESS_ATTEMPTS):
+        case = (random_fp_matrix(geom.m, geom.k_eff, geom.sew, rng),
+                random_fp_matrix(geom.n_max, geom.k_eff, geom.sew, rng),
+                random_fp_matrix(geom.m, geom.n_max, geom.sew, rng))
+        if fp_case_is_rounding_witness(*case, geom):
+            return case
+    raise ValueError(
+        f"{geom.describe()}: no rounding witness in "
+        f"{FP_WITNESS_ATTEMPTS} draws -- this geometry's programs cannot "
+        f"observe the disclosed (G=1, psm=0, rnd=frm), so it does not "
+        f"belong in the floating-point tier")
 
 
 # ---------------------------------------------------------------------------
@@ -1389,6 +1872,366 @@ def check_signedness_is_immaterial() -> None:
         reference_gemm(unsigned(a), unsigned(b), c, geom)
 
 
+def check_fp_round() -> None:
+    """Hand-derived IEEE-754 rounding cases for :func:`fp_round`.
+
+    Every constant below is worked out from the format parameters, not read
+    back from the host, so this is an independent statement of what the
+    rounding is supposed to do.  binary32: 8 exponent bits, bias 127,
+    24-bit significand.  binary64: 11 / 1023 / 53.
+    """
+    # 1.0 = sign 0, biased exponent 127, zero fraction.
+    assert fp_round(0, Fraction(1), 32) == 127 << 23
+    assert fp_round(1, Fraction(1), 32) == (1 << 31) | (127 << 23)
+    assert fp_round(0, Fraction(1), 64) == 1023 << 52
+    # Exact zero keeps its sign: -0.0 is a distinct bit pattern and the
+    # harness compares bits, so this matters.
+    assert fp_round(0, Fraction(0), 32) == 0
+    assert fp_round(1, Fraction(0), 32) == 1 << 31
+
+    # Ties to even, at the ulp boundary of 1.0 in binary32 (ulp = 2**-23).
+    ulp = Fraction(1, 1 << 23)
+    one = 127 << 23
+    #   1 + ulp/2 is an exact tie between 1.0 and 1.0+ulp; 1.0 has an even
+    #   significand, so it wins.
+    assert fp_round(0, 1 + ulp / 2, 32) == one
+    #   1 + 3*ulp/2 ties between 1+ulp (odd) and 1+2*ulp (even): 1+2*ulp.
+    assert fp_round(0, 1 + 3 * ulp / 2, 32) == one + 2
+    #   Just over half an ulp rounds up regardless of parity.
+    assert fp_round(0, 1 + ulp * Fraction(2, 3), 32) == one + 1
+
+    # Carry out of the top of the significand bumps the exponent: the value
+    # just below 2.0 plus most of an ulp becomes exactly 2.0.
+    just_under_two = 2 - ulp
+    assert fp_round(0, just_under_two + ulp * Fraction(3, 4), 32) == 128 << 23
+
+    # Subnormals.  The smallest positive binary32 subnormal is 2**-149 and
+    # the smallest normal is 2**-126; halfway between 0 and 2**-149 is a tie
+    # that must round to even, i.e. to zero.
+    tiny = Fraction(1, 1 << 149)
+    assert fp_round(0, tiny, 32) == 1
+    assert fp_round(0, tiny / 2, 32) == 0                 # tie -> even (zero)
+    assert fp_round(1, tiny / 2, 32) == 1 << 31           # ... keeping -0.0
+    assert fp_round(0, tiny * Fraction(3, 4), 32) == 1    # over half -> up
+    assert fp_round(0, tiny * Fraction(3, 2), 32) == 2    # tie -> even (2)
+    #   The largest subnormal plus one more tiny is the smallest normal.
+    largest_sub = Fraction((1 << 23) - 1, 1 << 149)
+    assert fp_round(0, largest_sub, 32) == (1 << 23) - 1  # exp field 0
+    assert fp_round(0, largest_sub + tiny, 32) == 1 << 23  # exp field 1
+
+    # Overflow: RNE rounds away from zero past the largest finite value, so
+    # the result is infinity, and the sign is preserved.
+    #   largest binary32 finite = (2 - 2**-23) * 2**127
+    huge = (2 - ulp) * Fraction(1 << 127)
+    assert fp_round(0, huge, 32) == 0x7F7FFFFF
+    assert fp_round(0, huge * 2, 32) == 0x7F800000        # +inf
+    assert fp_round(1, huge * 2, 32) == 0xFF800000        # -inf
+    #   The rounding boundary itself: anything at or above
+    #   (2 - 2**-24) * 2**127 rounds to infinity.
+    boundary = (2 - ulp / 2) * Fraction(1 << 127)
+    assert fp_round(0, boundary, 32) == 0x7F800000
+    assert fp_round(0, boundary - tiny, 32) == 0x7F7FFFFF
+
+    # fp_unpack is the exact inverse of fp_round on representable values.
+    for width in sorted(FP_FORMATS):
+        for bits in _fp_pool(width):
+            kind, sign, value = fp_unpack(bits, width)
+            assert kind == "num", (width, hex(bits))
+            assert fp_round(sign, value, width) == bits, (width, hex(bits))
+
+
+def check_fp_matches_host() -> None:
+    """The Fraction model must agree with the host's binary64 arithmetic.
+
+    An independent implementation of the same rounding rule: CPython's
+    ``float`` is IEEE binary64 with round-to-nearest-even, so at SEW=64 the
+    comparison is direct.  At SEW=32 the host computes in binary64 and the
+    result is then rounded to binary32, which is a *double* rounding -- it
+    is innocuous here by Figueroa's theorem (an intermediate format with at
+    least 2p+2 bits is enough, and 53 >= 2*24+2 = 50), and this test is the
+    empirical half of that argument.
+
+    Random bit patterns rather than the directed pool, so the subnormal and
+    overflow boundaries get hit by accident as well as on purpose.
+    """
+    rng = random.Random(0x4D4D4143)
+    for width in sorted(FP_FORMATS):
+        pack, unpack = ("<Q", "<d") if width == 64 else ("<I", "<f")
+        def to_host(bits: int) -> float:
+            return struct.unpack(unpack, struct.pack(pack, bits))[0]
+        def from_host(value: float) -> int:
+            return struct.unpack(pack, struct.pack(unpack, value))[0]
+        for _ in range(20000):
+            a = rng.getrandbits(width)
+            b = rng.getrandbits(width)
+            if fp_is_nan(a, width) or fp_is_nan(b, width):
+                continue        # host NaN payloads are not canonicalised
+            for op, host in ((fp_mul, lambda x, y: x * y),
+                             (fp_add, lambda x, y: x + y)):
+                got = op(a, b, width)
+                try:
+                    want = from_host(host(to_host(a), to_host(b)))
+                except (OverflowError, ValueError):   # pragma: no cover
+                    continue
+                if fp_is_nan(got, width):
+                    # The host does not canonicalise; the spec does
+                    # (1880-1886), so only agree that it *is* a NaN.
+                    assert fp_is_nan(want, width), (width, hex(a), hex(b))
+                    assert got == fp_default_nan(width)
+                    continue
+                assert got == want, (
+                    f"{op.__name__} binary{width} {a:#x} {b:#x}: "
+                    f"model {got:#x}, host {want:#x}")
+
+
+def check_fp_special_values() -> None:
+    """NaN, infinity, signed zero and subnormal behaviour, pinned explicitly.
+
+    The directed programs draw only finite inputs -- a NaN or an infinity
+    entering an accumulator absorbs every later term, so the rest of that
+    dot product would stop testing anything.  The behaviour still has to be
+    specified, and this is where it is: every case below is a statement
+    about what the *reference* does, so a DUT that disagrees is caught by
+    sim_check rather than by an unreproducible directed failure.
+    """
+    for width in sorted(FP_FORMATS):
+        _ebits, prec, _bias, emax = fp_fields(width)
+        inf = emax << (prec - 1)
+        ninf = (1 << (width - 1)) | inf
+        nan = fp_default_nan(width)
+        one = ((1 << (_ebits - 1)) - 1) << (prec - 1)
+        zero, nzero = 0, 1 << (width - 1)
+
+        # Spec 1880-1891: every materialised NaN is the canonical one, both
+        # for propagated NaNs and for invalid operations.  A non-canonical
+        # NaN input therefore cannot survive into the result.
+        noisy = nan | 0x5                       # a different payload
+        assert fp_is_nan(noisy, width)
+        assert fp_mul(noisy, one, width) == nan
+        assert fp_add(noisy, one, width) == nan
+        assert fp_mul(one, noisy, width) == nan
+
+        # Invalid operations (spec 1841-1856).
+        assert fp_mul(zero, inf, width) == nan          # 0 x inf
+        assert fp_mul(nzero, inf, width) == nan
+        assert fp_add(inf, ninf, width) == nan          # inf + (-inf)
+
+        # Ordinary infinity arithmetic.
+        assert fp_mul(inf, one, width) == inf
+        assert fp_mul(ninf, one, width) == ninf
+        assert fp_mul(inf, inf, width) == inf
+        assert fp_mul(inf, ninf, width) == ninf
+        assert fp_add(inf, one, width) == inf
+        assert fp_add(inf, inf, width) == inf
+
+        # Signed zero, IEEE 754-2019 6.3: an exact zero sum is +0 under RNE
+        # unless both addends are the same-signed zero.
+        assert fp_add(zero, zero, width) == zero
+        assert fp_add(nzero, nzero, width) == nzero
+        assert fp_add(zero, nzero, width) == zero
+        assert fp_add(one, one | (1 << (width - 1)), width) == zero
+        # ... and a product's zero sign is the xor of the operand signs.
+        assert fp_mul(zero, one, width) == zero
+        assert fp_mul(nzero, one, width) == nzero
+        assert fp_mul(nzero, one | (1 << (width - 1)), width) == zero
+
+        # Subnormals are never flushed: there is no FTZ/DAZ control anywhere
+        # in the extension, and fp_mul_exact is defined over "finite
+        # operands, including subnormal operands and signed zeros"
+        # (spec 1841-1843).
+        tiny = 1                                       # smallest subnormal
+        assert fp_add(tiny, tiny, width) == 2
+        assert fp_mul(tiny, one, width) == tiny
+        #   A product that underflows below half the smallest subnormal is a
+        #   correctly-signed zero, not an error.
+        half = ((1 << (_ebits - 1)) - 2) << (prec - 1)  # 0.5
+        assert fp_mul(tiny, half, width) == 0
+        assert fp_mul(tiny, half | (1 << (width - 1)), width) == nzero
+
+        # Overflow to infinity, and the largest finite value just below it.
+        maxfinite = ((emax - 1) << (prec - 1)) | ((1 << (prec - 1)) - 1)
+        assert fp_add(maxfinite, maxfinite, width) == inf
+        assert fp_mul(maxfinite, maxfinite, width) == inf
+
+
+def check_round_four_fp_gemm() -> None:
+    """The Sail fp_gemm result at the Titan disclosure, hand-derived.
+
+    Two claims, both of which a plausible implementation gets wrong:
+
+    1.  ``rnd = frm`` means the product is rounded to the accumulator format
+        *before* it is accumulated -- two rounding points per k, not the one
+        of a fused multiply-add.  The witness below is a dot product whose
+        FMA answer and whose mul-then-add answer differ in the last bit.
+    2.  The accumulation is in strictly increasing k and is *not*
+        reassociable: at G=1 there is one product per group and the
+        accumulator is rounded after every one of them.  The witness is a
+        three-term sum whose value depends on the order.
+    """
+    width = 32
+    one = 127 << 23                       # 1.0
+    ulp = 1                               # 1.0 + 1ulp is `one + 1`
+
+    #   (1 + 2**-23) * (1 + 2**-23) = 1 + 2**-22 + 2**-46.  Rounded to
+    #   binary32 that is 1 + 2**-22 (the 2**-46 tail is far below half an
+    #   ulp), i.e. `one + 2`.
+    prod = fp_mul(one + ulp, one + ulp, width)
+    assert prod == one + 2, hex(prod)
+    #   Accumulating that rounded product into -1.0 gives exactly 2**-22.
+    neg_one = (1 << 31) | one
+    assert fp_add(neg_one, prod, width) == (127 - 22) << 23
+    #   rnd=frm and rnd=xct are distinguishable, so the disclosure is
+    #   load-bearing rather than a formality.  Accumulate the same product
+    #   into -(1 + 2**-22): the rounded product cancels it exactly and the
+    #   answer is +0.0, while a fused multiply-add keeps the 2**-46 tail and
+    #   answers 2**-46.  A DUT that used an FMA here would fail every
+    #   directed program that happened to hit this pattern.
+    minus_prod = (1 << 31) | (one + 2)          # -(1 + 2**-22)
+    assert fp_add(minus_prod, prod, width) == 0         # rnd=frm
+    exact_fma = fp_round(0, Fraction(1, 1 << 46), width)
+    assert exact_fma == (127 - 46) << 23                # rnd=xct
+    assert exact_fma != fp_add(minus_prod, prod, width)
+    assert FP_DISCLOSURE == {"G": 1, "psm": 0, "rnd": "frm"}
+
+    #   Order sensitivity: 1.0 + 2**-24 + 2**-24.  Left to right, the first
+    #   addition ties to even and drops the bit, so the second one does too
+    #   and the answer is 1.0.  Summed exactly first it is 1 + 2**-23.
+    small = (127 - 24) << 23
+    acc = fp_add(fp_add(one, small, width), small, width)
+    assert acc == one, hex(acc)
+    assert fp_round(0, Fraction(1) + Fraction(2, 1 << 24), width) == one + 1
+
+    #   Now the same two facts through fp_gemm_reference, on a 1x1 tile of
+    #   the smallest legal binary32 geometry.
+    geom = TileGeometry(256, 32, 2, 1, 2 * 1 * 4, 1, "op", "fp")
+    geom.validate()
+    assert geom.mnemonic == "vfmmacc.vv"
+    assert geom.k_eff == 2 and geom.m == 4 and geom.eew_ab == 32
+    a = [[one + ulp, one] for _ in range(geom.m)]
+    b = [[one + ulp, 0] for _ in range(geom.n_max)]
+    c = [[minus_prod] * geom.n_max for _ in range(geom.m)]
+    out = fp_gemm_reference(a, b, c, geom)
+    #   k=0: S = round_frm((1+2**-23)^2) = 1 + 2**-22, which cancels the
+    #        accumulator exactly:  acc = round_frm(-(1+2**-22) + S) = +0.0
+    #   k=1: S = round_frm(1 * 0) = +0.0, and +0.0 + +0.0 = +0.0
+    want = 0
+    for i in range(geom.m):
+        for j in range(geom.n):
+            assert out[i][j] == want, (i, j, hex(out[i][j]), hex(want))
+
+    #   rnd='xct' is the same geometry with one rounding instead of two,
+    #   and on this case it answers differently -- which is what makes the
+    #   case a witness.
+    #   Under rnd=xct the 2**-46 tail of the k=0 product survives the
+    #   cancellation and the k=1 term of +0.0 cannot wash it out, so the
+    #   same case answers 2**-46 instead of +0.0.
+    fused = fp_gemm_reference(a, b, c, geom, rnd="xct")
+    assert fused != out
+    for i in range(geom.m):
+        for j in range(geom.n):
+            assert fused[i][j] == (127 - 46) << 23, hex(fused[i][j])
+    assert fp_case_is_rounding_witness(a, b, c, geom)
+    #   ... and every case the generator hands out is one, by construction.
+    rng = random.Random(0x515B)
+    for probe in ime_legal_configs(256, full_vl_only=True, kinds=("fp",)):
+        for _ in range(4):
+            case = random_fp_case(probe, rng)
+            assert fp_case_is_rounding_witness(*case, probe), probe.describe()
+            #   The drawn values must all be finite: a NaN or an infinity in
+            #   an input would absorb the rest of that dot product.
+            for mat in case:
+                for row in mat:
+                    for value in row:
+                        assert not fp_is_nan(value, probe.sew)
+                        assert not fp_is_inf(value, probe.sew)
+            #   ... and so must the results, or the tier would be testing
+            #   an absorbing state rather than an accumulation.
+            for row in fp_gemm_reference(*case, probe):
+                for value in row:
+                    assert not fp_is_nan(value, probe.sew)
+                    assert not fp_is_inf(value, probe.sew)
+
+    #   Tail columns keep their pre-instruction value (vta=0).
+    assert neg_one == (1 << 31) | one and small == (127 - 24) << 23
+    partial = TileGeometry(256, 32, 2, 1, 2 * 1 * 2, 1, "op", "fp")
+    partial.validate()
+    assert partial.n == 2 < partial.n_max
+    out = fp_gemm_reference(a, b, c, partial)
+    for i in range(partial.m):
+        for j in range(partial.n, partial.n_max):
+            assert out[i][j] == c[i][j]
+
+
+def check_round_four_geometry() -> None:
+    """A floating-point geometry is the integer geometry at the same vtype.
+
+    Spec 1500: "The K-dimension, tile-dimension formulas, EMUL_C, and
+    instruction-to-widening-factor mapping are the same as for the integer
+    family"; Sail calls the very same ``decode_gemm_geometry(W)``
+    (4884-4912) from ``vfmmacc.vv``'s body at W=1.  So nothing about M,
+    N_max, K_eff, EMUL_C or the permissible LAMBDA set may move -- only the
+    mnemonic and the arithmetic.
+    """
+    for vlen in VLENS:
+        for sew in sorted(FP_FORMATS):
+            for lam in permissible_lambdas(vlen, sew):
+                for lmul in (1, 2, 4, 8):
+                    vl = lam * lmul
+                    i = TileGeometry(vlen, sew, lam, lmul, vl, 1, "op", "int")
+                    f = TileGeometry(vlen, sew, lam, lmul, vl, 1, "op", "fp")
+                    legal_i = legal_f = True
+                    try:
+                        i.validate()
+                    except ValueError:
+                        legal_i = False
+                    try:
+                        f.validate()
+                    except ValueError:
+                        legal_f = False
+                    assert legal_i == legal_f, (vlen, sew, lam, lmul)
+                    if not legal_i:
+                        continue
+                    for attr in ("m", "n_max", "n", "k_eff", "emul_c",
+                                 "linesize", "elems_per_reg", "eew_ab",
+                                 "vl_c_full", "lmul_c", "epr_ab",
+                                 "ab_linesize", "ab_row_elems_per_reg"):
+                        assert getattr(i, attr) == getattr(f, attr), attr
+                    assert f.mnemonic == "vfmmacc.vv"
+                    assert f.load_mnemonic == "vmtl.v"
+                    assert f.store_mnemonic == "vmts.v"
+                    # The verdict line must keep the three adjacent fields
+                    # helpers._GEOM_RE scrapes, and must differ from the
+                    # integer line only by the trailing FP= clause.
+                    assert f.describe() == i.describe() + f" FP=binary{sew}"
+                    assert (f"VLEN={vlen} SEW={sew} LAMBDA={lam}"
+                            in f.describe())
+
+    # The deferred half of the family must refuse to be constructed rather
+    # than silently produce a geometry no reference models.
+    for bad, why in (
+        (TileGeometry(256, 32, 2, 1, 2, 2, "op", "fp"), "W=2"),
+        (TileGeometry(256, 16, 4, 1, 4, 1, "op", "fp"), "SEW=16"),
+        (TileGeometry(256, 8, 4, 1, 4, 1, "op", "fp"), "SEW=8"),
+        (TileGeometry(256, 32, 2, 1, 2, 1, "t", "fp"), "transposing"),
+    ):
+        try:
+            bad.validate()
+        except ValueError:
+            continue
+        raise AssertionError(f"round four accepted a {why} FP geometry")
+
+    # ime_legal_configs must append, never interleave: the integer sequence
+    # has to be an exact prefix of the int+fp sequence.
+    for vlen in (128, 256, 512):
+        ints = list(ime_legal_configs(vlen))
+        both = list(ime_legal_configs(vlen, kinds=("int", "fp")))
+        assert both[:len(ints)] == ints, vlen
+        fps = both[len(ints):]
+        assert fps == list(ime_legal_configs(vlen, kinds=("fp",)))
+        assert all(g.kind == "fp" and g.mnemonic == "vfmmacc.vv"
+                   for g in fps)
+
+
 def check_checksum_sensitivity() -> None:
     """A single-element error must move exactly one row checksum."""
     rng = random.Random(11)
@@ -1417,7 +2260,10 @@ def main() -> int:
                   check_transposing_layout, check_widening_arithmetic,
                   check_tile_layout_buffer,
                   check_c_transfer_geometry, check_golden_model,
-                  check_signedness_is_immaterial, check_checksum_sensitivity):
+                  check_signedness_is_immaterial, check_checksum_sensitivity,
+                  check_fp_round, check_fp_matches_host,
+                  check_fp_special_values, check_round_four_fp_gemm,
+                  check_round_four_geometry):
         check()
         print(f"  ok  {check.__name__}")
 
@@ -1438,6 +2284,15 @@ def main() -> int:
               f"({mnemonic}) geometries")
         for geom in widening:
             print(f"  {geom.describe()}")
+
+    fp = list(ime_legal_configs(args.vlen, full_vl_only=True,
+                                kinds=("fp",)))
+    print(f"\nVLEN={args.vlen}: {len(fp)} full-VL floating-point "
+          f"(vfmmacc.vv) geometries, disclosure "
+          f"G={FP_DISCLOSURE['G']} psm={FP_DISCLOSURE['psm']} "
+          f"rnd={FP_DISCLOSURE['rnd']}")
+    for geom in fp:
+        print(f"  {geom.describe()}")
 
     trans = list(ime_legal_configs(args.vlen, full_vl_only=True,
                                    tloads=("t",)))

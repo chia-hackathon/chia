@@ -92,6 +92,24 @@ _VSEW_FIELD = {8: 0, 16: 1, 32: 2, 64: 3}
 _VLMUL_FIELD = {1: 0, 2: 1, 4: 2, 8: 3}
 _DATA_DIRECTIVE = {8: ".byte", 16: ".half", 32: ".word", 64: ".dword"}
 
+#: mstatus.FS = Initial.  A floating-point program has to turn the F/D unit
+#: on for the same reason every program turns the vector unit on: the harness
+#: starts in M-mode with both extension state fields Off, and an flw or an
+#: fmul.s would take an illegal-instruction trap.  FS is mstatus[14:13], one
+#: field below VS at mstatus[10:9].
+MSTATUS_FS_INITIAL = 0x2000
+
+#: Scalar floating-point load / store / multiply / add suffix per SEW.  Round
+#: four's two accumulator widths are exactly the two the baseline -march
+#: supplies scalar arithmetic for: constants.MARCH_IME is
+#: rv64imafdv_zicsr_zifencei, so `f` gives binary32 and `d` gives binary64
+#: and neither needs an extension the build harness does not already ask
+#: for.  There is no `h`, which is the mechanical reason round four stops at
+#: SEW >= 32 (see rvv_ref.FP_FORMATS and round4_design.md).
+_FP_SUFFIX = {32: "s", 64: "d"}
+_FP_LOAD = {32: "flw", 64: "fld"}
+_FP_STORE = {32: "fsw", 64: "fsd"}
+
 #: Scalar registers the emitted IME instructions name.  The `.insn` words bake
 #: register numbers in, so these are not free choices -- the assembly must use
 #: exactly these ABI names.
@@ -307,6 +325,8 @@ def _rvv_path(geom: TileGeometry) -> List[str]:
     exactly modulo-2**SEW arithmetic -- the accumulation rule the spec states
     for the integer multiply-accumulate.
     """
+    if geom.kind == "fp":
+        return _fp_ref_path(geom)
     if geom.w != 1:
         return _rvv_path_widening(geom)
     sfx = _SEW_SUFFIX[geom.sew]
@@ -429,6 +449,108 @@ def _rvv_path_widening(geom: TileGeometry) -> List[str]:
                 "    add   t4, t4, t6",
                 f"    s{sfx}    t4, 0(t3)",
             ]
+    return out
+
+
+def _fp_ref_path(geom: TileGeometry) -> List[str]:
+    """The same GEMM in scalar rv64f / rv64d, fully unrolled.
+
+    Round four's reference is *not* an RVV reference, and that is the point.
+    A floating-point matrix multiply-accumulate is not bit-determined by the
+    instruction alone: spec 1536-1600 lets an implementation choose a
+    grouping factor G, a partial-sum mode psm and a partial-sum rounding rnd,
+    and requires it to disclose the (SEW, W, LAMBDA) -> (G, psm, rnd) table
+    (1652-1656).  Titan discloses::
+
+        G = 1, psm = 0, rnd = frm       for every (SEW, W=1, LAMBDA)
+
+    which spec 1771 names as the tuple that makes a Zvvm implementation
+    match the analogous Zvtm instruction "For input element widths of 32
+    bits or greater ... so that each group contains a single product and the
+    partial sum `S` is that product rounded according to `frm`."
+
+    Under that disclosure the Sail (5243-5268, with G=1 and W=1) collapses to
+
+        acc = fp_add(acc, fp_round_to_frm(fp_mul_exact(A[i,k], B[j,k])))
+
+    for k = 0, 1, ... K_eff-1 in strictly increasing order -- two rounding
+    points per k, which is a scalar ``fmul`` followed by a scalar ``fadd``.
+    So the reference is three instructions per term and the comparison stays
+    what it has been since round one: an *exact* bitwise compare of the two
+    C images, with no tolerance and no FP-aware printf.  A fused
+    multiply-add would be the rnd=xct disclosure and is a different answer;
+    rvv_ref.check_round_four_fp_gemm carries a witness that distinguishes
+    them, so this is not a distinction without a difference.
+
+    Why not the vector unit: RVV 1.0 has no reduction with the ordering and
+    rounding this needs (vfredosum.vs rounds once per element with no
+    intermediate product rounding, which is the rnd=xct answer), and a
+    per-element vfmul.vv + vfadd chain would be the same instruction count
+    with a second vtype to get wrong.  The scalar F/D unit is also a more
+    independent witness: it is not the pipeline under test.
+
+    Rounding mode: frm is set to RNE once, in the prologue, rather than
+    trusted from reset -- it is the only rounding-mode source the extension
+    has (Sail 5695 calls the ordinary ``get_fp_rounding_mode()``; there is no
+    matrix rounding CSR), so it governs both paths and both must see the
+    same value.
+
+    fflags are deliberately not compared.  Both paths accrue into the same
+    architectural register, so a difference between them is unobservable
+    from inside one program, and the reference path raises inexact on almost
+    every term.  Spec 1806-1822 makes the *temporal* order of flag raises
+    implementation-defined anyway; what it pins is the final bitwise OR,
+    which needs a program that runs one path at a time.  Out of scope for
+    round four, and named as such in round4_design.md.
+    """
+    sfx = _SEW_SUFFIX[geom.sew]
+    fsfx = _FP_SUFFIX[geom.sew]
+    fl, fs = _FP_LOAD[geom.sew], _FP_STORE[geom.sew]
+    esz = geom.sew // 8
+    out: List[str] = [
+        "", f"    # ---- scalar rv64{fsfx} reference path "
+            f"(G=1, psm=0, rnd=frm) ----",
+        "    csrwi frm, 0             # RNE, for both paths",
+        "    la    a2, mat_a",
+        "    la    a3, mat_b",
+        "    la    a4, c_init",
+        "    la    a5, c_rvv"]
+
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            c_off = _c_off(geom, i, j) * esz
+            if j >= geom.n:
+                # C tile tail column: vta=0 leaves it undisturbed on the IME
+                # side, so copy the bits across.  An integer copy, not an
+                # FP one: a floating-point load/store pair would canonicalise
+                # a signalling NaN on some implementations, and the compare
+                # is over raw bits.
+                out += [
+                    f"    li    t0, {c_off}",
+                    "    add   t2, a4, t0",
+                    "    add   t3, a5, t0",
+                    f"    l{sfx}    t4, 0(t2)",
+                    f"    s{sfx}    t4, 0(t3)",
+                ]
+                continue
+            out += [
+                f"    li    t0, {c_off}",
+                "    add   t2, a4, t0",
+                "    add   t3, a5, t0",
+                f"    {fl}   ft0, 0(t2)        # acc = C[{i},{j}]",
+            ]
+            for k in range(geom.k_eff):
+                out += [
+                    f"    li    t0, {(i * geom.k_eff + k) * esz}",
+                    "    add   t4, a2, t0",
+                    f"    {fl}   ft1, 0(t4)",
+                    f"    li    t0, {(j * geom.k_eff + k) * esz}",
+                    "    add   t4, a3, t0",
+                    f"    {fl}   ft2, 0(t4)",
+                    f"    fmul.{fsfx} ft1, ft1, ft2   # S = round_frm(A*B)",
+                    f"    fadd.{fsfx} ft0, ft0, ft1   # acc = round_frm(acc+S)",
+                ]
+            out += [f"    {fs}   ft0, 0(t3)"]
     return out
 
 
@@ -688,7 +810,7 @@ def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
         f"# IME instructions are emitted as .insn (encodings from Zvvm "
         f"v{ime.SPEC_VERSION}):",
     ]
-    if geom.w == 1 and geom.tload == "op":
+    if geom.kind == "int" and geom.w == 1 and geom.tload == "op":
         used = ime.ROUND_ONE          # round one's exact three, in its order
     else:
         used = (geom.load_mnemonic, geom.mnemonic, geom.store_mnemonic)
@@ -714,6 +836,14 @@ def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
         f"    li    t0, {MSTATUS_VS_INITIAL}",
         "    csrs  mstatus, t0        # enable vector state",
     ]
+    if geom.kind == "fp":
+        # The reference path runs on the scalar F/D unit, so mstatus.FS has
+        # to leave Off as well.  Emitted only for a floating-point geometry,
+        # which is what keeps every round-one-to-three program byte-identical.
+        head += [
+            f"    li    t0, {MSTATUS_FS_INITIAL}",
+            "    csrs  mstatus, t0        # enable floating-point state",
+        ]
 
     body = _ime_path(geom, alloc) + _rvv_path(geom) + _compare(geom)
 
@@ -828,6 +958,14 @@ def directed_suite(vlen: int, seed: int = 0,
       ``ime_8w_``  v8wmmacc.vv (W=8, SEW 64)
       ``ime_t_``   the transposing tile transfers, W=1, every SEW
 
+    Round four appends one more, last:
+
+      ``ime_f_``   vfmmacc.vv, W=1, SEW 32 and 64 (binary32 / binary64)
+
+    whose programs carry a *scalar* rv64f / rv64d reference instead of the
+    RVV one -- see :func:`_fp_ref_path` for why, and for the implementation
+    disclosure the exact comparison rests on.
+
     The transposing tier reuses vmmacc.vv for the arithmetic: what is under
     test is vmttl.v / vmtts.v, and pairing them with a multiply-accumulate
     that is already green isolates a tile-layout failure from an arithmetic
@@ -848,27 +986,40 @@ def directed_suite(vlen: int, seed: int = 0,
     out = []
     tiers = []
     if "vmmacc.vv" in insns:
-        tiers.append(("ime_", sews, (1,), ("op",)))
+        tiers.append(("ime_", sews, (1,), ("op",), ("int",)))
     if "vqmmacc.vv" in insns:
         # SEW is the accumulator width, so the widening tier is enumerated
         # over the *C* widths that have a modelled input width: SEW=32 is
         # Zvvi8i32mm (Int8 -> Int32), which is what llama.cpp needs.
         tiers.append(("ime_q_", [w for w in widening_sews if w in sews], (4,),
-                      ("op",)))
+                      ("op",), ("int",)))
     for mnemonic, prefix, w in (("vwmmacc.vv", "ime_w_", 2),
                                 ("v8wmmacc.vv", "ime_8w_", 8)):
         if mnemonic in insns:
             tiers.append((prefix,
                           [x for x in widening_sews_by_w[w] if x in sews],
-                          (w,), ("op",)))
+                          (w,), ("op",), ("int",)))
     if "vmttl.v" in insns or "vmtts.v" in insns:
-        tiers.append(("ime_t_", sews, (1,), ("t",)))
+        tiers.append(("ime_t_", sews, (1,), ("t",), ("int",)))
+    if "vfmmacc.vv" in insns:
+        # Round four.  Appended last, after every integer tier, for the same
+        # byte-identity reason the round-three tiers were: a tree that passed
+        # round three must still see exactly the programs it saw, in order.
+        # The SEW list is intersected with rvv_ref.FP_FORMATS rather than
+        # taken from `sews`, because the floating-point tier's legal
+        # accumulator widths are a property of the format table (spec
+        # 1490-1493: altfmt is ignored, hence reserved-free, only at
+        # binary32 and binary64), not of the caller's sweep.
+        tiers.append(("ime_f_",
+                      [x for x in sews if x in rvv_ref.FP_FORMATS],
+                      (1,), ("op",), ("fp",)))
 
-    for prefix, tier_sews, ws, tloads in tiers:
+    for prefix, tier_sews, ws, tloads, kinds in tiers:
         for geom in rvv_ref.ime_legal_configs(vlen, sews=tier_sews,
                                               lmuls=lmuls,
                                               full_vl_only=full_vl_only,
-                                              ws=ws, tloads=tloads):
+                                              ws=ws, tloads=tloads,
+                                              kinds=kinds):
             if geom.emul_c == 16:
                 continue
             try:
@@ -1223,6 +1374,100 @@ def _allocatable_here(geom: TileGeometry) -> bool:
     return geom.emul_c != 16
 
 
+def check_round_four_emission() -> None:
+    """A floating-point program must be the round-one program plus FP.
+
+    The claim round four rests on is that vfmmacc.vv is the *same program*
+    as vmmacc.vv with a different funct6 and a different reference path: the
+    tile transfers, the vtype sequence, the C tile tail policy and the exact
+    bitwise comparison are all unchanged (spec 1500, "The K-dimension,
+    tile-dimension formulas, EMUL_C, and instruction-to-widening-factor
+    mapping are the same as for the integer family").  This asserts that
+    shape, and asserts the three things that are genuinely new.
+    """
+    import helpers
+
+    for geom in rvv_ref.ime_legal_configs(256, full_vl_only=True,
+                                          kinds=("fp",)):
+        if geom.emul_c == 16 or not _allocatable_here(geom):
+            continue
+        asm = emit_test(geom, rvv_ref.random_case(geom, random.Random(4)),
+                        "fp_probe")
+        peer = TileGeometry(geom.vlen, geom.sew, geom.lam, geom.lmul,
+                            geom.vl, 1, "op", "int")
+        int_asm = emit_test(peer, rvv_ref.random_case(peer, random.Random(4)),
+                            "int_probe")
+
+        # 1. Same five IME instructions, one of which is now vfmmacc.vv.
+        assert asm.count(".insn 4,") == 5, geom.describe()
+        assert f"# {geom.mnemonic} v" in asm
+        assert geom.mnemonic == "vfmmacc.vv"
+        for mnemonic in ("vmtl.v", "vmts.v"):
+            assert f"# {mnemonic} v" in asm, mnemonic
+        words = re.findall(r"\.insn 4, (0x[0-9a-f]+)", asm)
+        assert len(words) == 5
+        assert ime.decode(int(words[3], 0))[0] == "vfmmacc.vv", words
+        #    ... and the other four are byte-identical to the integer
+        #    program's, because only the arithmetic opcode moved.
+        int_words = re.findall(r"\.insn 4, (0x[0-9a-f]+)", int_asm)
+        assert words[:3] + words[4:] == int_words[:3] + int_words[4:], (
+            geom.describe())
+
+        # 2. The reference is the scalar F/D unit, not RVV, and it sets frm.
+        fsfx = _FP_SUFFIX[geom.sew]
+        assert "    csrwi frm, 0" in asm
+        assert f"    fmul.{fsfx} ft1, ft1, ft2" in asm
+        assert f"    fadd.{fsfx} ft0, ft0, ft1" in asm
+        assert _FP_LOAD[geom.sew] in asm and _FP_STORE[geom.sew] in asm
+        assert "vmul.vv" not in asm and "vredsum.vs" not in asm, (
+            "the floating-point tier must not use the integer RVV path")
+        #    One fmul and one fadd per (active element, k): the accumulation
+        #    is not reassociated and not fused.
+        terms = geom.m * geom.n * geom.k_eff
+        assert asm.count(f"fmul.{fsfx}") == terms, geom.describe()
+        assert asm.count(f"fadd.{fsfx}") == terms, geom.describe()
+        assert "fmadd" not in asm and "fmacc" not in asm, (
+            "a fused multiply-add is the rnd=xct disclosure, not rnd=frm")
+
+        # 3. Both extension state fields are enabled.
+        assert f"li    t0, {MSTATUS_VS_INITIAL}" in asm
+        assert f"li    t0, {MSTATUS_FS_INITIAL}" in asm
+        assert f"li    t0, {MSTATUS_FS_INITIAL}" not in int_asm
+
+        # The comparison is untouched: an exact integer compare over the raw
+        # SEW-wide bit patterns, with no tolerance and no FP printf.  That is
+        # what makes a NaN result testable -- spec 1880-1886 canonicalises
+        # every materialised NaN, so a NaN compares equal to a NaN and
+        # differs from everything else, exactly like any other value.
+        assert asm.count("beq   t4, t5, 1f") == geom.m * geom.n_max
+        assert "%f" not in asm and "%e" not in asm and "%g" not in asm
+        assert "%llx" not in asm
+
+        # The verdict line keeps helpers._GEOM_RE's three adjacent fields
+        # and gains the FP clause at the end.
+        assert f"TITAN PASS {geom.describe()}" in asm
+        assert geom.describe().endswith(f" FP=binary{geom.sew}")
+        match = helpers._GEOM_RE.search(f"TITAN PASS {geom.describe()}")
+        assert match and int(match.group("sew")) == geom.sew
+        assert int(match.group("vlen")) == geom.vlen
+        assert int(match.group("lam")) == geom.lam
+
+    # The data image is the FP bit patterns, emitted at the accumulator
+    # width -- W=1, so EEW_A == SEW and A, B and C all use one directive.
+    geom = TileGeometry(256, 32, 2, 1, 8, 1, "op", "fp")
+    a = [[0x3F800000] * geom.k_eff for _ in range(geom.m)]
+    b = [[0xBF800000] * geom.k_eff for _ in range(geom.n_max)]
+    c = [[0x00000000] * geom.n_max for _ in range(geom.m)]
+    asm = emit_test(geom, (a, b, c), "fp_data")
+    assert "    .word 0x3f800000" in asm.replace("0X", "0x").lower()
+    want = rvv_ref.fp_gemm_reference(a, b, c, geom)
+    #   -1.0 accumulated K_eff times, each a separately rounded product.
+    for row in want:
+        for value in row:
+            assert value == rvv_ref.fp_round(
+                1, rvv_ref.Fraction(geom.k_eff), geom.sew), hex(value)
+
+
 def check_verdict_contract() -> None:
     """helpers.classify_run must read what these programs actually print.
 
@@ -1306,6 +1551,7 @@ def main() -> int:
                   check_insn_words_decode, check_emitted_structure,
                   check_widening_emission, check_transposing_emission,
                   check_widening_verdict_geometry,
+                  check_round_four_emission,
                   check_verdict_contract):
         check()
         print(f"  ok  {check.__name__}")
@@ -1315,9 +1561,10 @@ def main() -> int:
         lines = sum(a.count("\n") for _, a, _ in suite)
         tally = {}
         for _, _, g in suite:
-            tally[(g.w, g.tload)] = tally.get((g.w, g.tload), 0) + 1
-        breakdown = " + ".join(f"{n} W={w}/{tl}"
-                               for (w, tl), n in sorted(tally.items()))
+            key = (g.kind, g.w, g.tload)
+            tally[key] = tally.get(key, 0) + 1
+        breakdown = " + ".join(f"{n} {kind} W={w}/{tl}"
+                               for (kind, w, tl), n in sorted(tally.items()))
         print(f"\nVLEN={args.vlen} {label}: {len(suite)} programs "
               f"({breakdown}), {lines:,} lines of assembly")
     return 0

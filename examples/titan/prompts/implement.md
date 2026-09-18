@@ -1,7 +1,7 @@
-Implement round three of the RISC-V Integrated Matrix Extension (Zvvm) in
-Saturn: `vwmmacc.vv` (W=2), `v8wmmacc.vv` (W=8), `vmttl.v`, `vmtts.v` -- on
-top of `vmmacc.vv`, `vmtl.v`, `vmts.v`, `vqmmacc.vv`, already implemented
-and passing.
+Implement round four of the RISC-V Integrated Matrix Extension (Zvvm) in
+Saturn: `vfmmacc.vv` at SEW 32 and 64 -- on top of `vmmacc.vv`, `vmtl.v`,
+`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`,
+already implemented and passing.
 
 Start by calling `read_spec` and reading the specification. Then read Saturn.
 The orientation in your system prompt tells you where to look; it does not
@@ -21,14 +21,15 @@ reports SKIP. A SKIP means you do not support that tile geometry,
 which is allowed. A mismatch means the IME path disagrees with a plain RVV 1.0
 sequence computing the same thing, and that is never allowed.
 
-## Rounds two and three
+## Rounds one through four
 
-Round two (`vqmmacc.vv`) is done and converged. Round three adds
-`vwmmacc.vv` (W=2), `v8wmmacc.vv` (W=8), and the transposing tile pair
-`vmttl.v` / `vmtts.v`. Where RTL for earlier instructions is already in the
-tree, extend it: every directed test that passes today must still pass. The
-spec's SAIL appendix is normative and outranks its prose -- never write
-something the SAIL does not say in order to make a test pass.
+Rounds one through three are done and converged: `vmmacc.vv`, `vmtl.v`,
+`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`.
+Round four adds exactly one instruction, `vfmmacc.vv`, at SEW 32 and 64
+only. Where RTL for earlier instructions is already in the tree, extend it:
+every directed test that passes today must still pass. The spec's SAIL
+appendix is normative and outranks its prose -- never write something the
+SAIL does not say in order to make a test pass.
 
 Three more facts. `vwmmacc.vv`/`v8wmmacc.vv` reuse the round-two datapath
 (SEW stays the accumulator width, tiles arrive via `vmtl.v`, only funct6 and
@@ -49,6 +50,16 @@ and logical element (r,k) lands at `4*flat_storage + k%4`, so the memory image
 is the plain row-major int8 panel the existing loader already fetches. The RTL
 work is a 4-way-packed int8 MAC datapath feeding the existing 32-bit C tile,
 not new addressing.
+
+Five facts about `vfmmacc.vv`. Titan discloses **G=1, psm=0, rnd=frm**
+(spec 1771): the DUT must not fuse multiply-add or sum groups, so
+`acc = fp_add(acc, fp_round_to_frm(fp_mul_exact(a,b)))` per increasing `k`,
+two roundings per term under `frm`. `vtype.SEW` is the accumulator width,
+as in round two; `altfmt_A`/`altfmt_B`/`altfmt` are ignored at SEW 32/64.
+`vm = 0` on funct6 `0x14` is **reserved** -- raise illegal-instruction.
+Its funct3 is **OPFVV (0x1), not OPIVV**, unlike every instruction so far.
+NaNs canonicalise and `fflags` OR across active elements, but the directed
+tests do not compare `fflags` either way.
 
 The matrix FU's `io.stall` must stay `valid`-only. Folding `post_write_stall`
 into the shared int/fp issue path once broke every `.vf` RVV test in the S2
@@ -104,7 +115,11 @@ iteration. `start` returns a job id at once; call `run_directed_wait(job_id)`
 until it returns the result, and never end your turn with one unfinished.
 Then: `change -> start("failing") -> wait -> read the values -> change`.
 `run_rvv_start` / `run_rvv_wait` are the same pair for the Stage 2 regression
-(same budget). Call `finish` only when `run_directed_start("all")` is 27/27,
+(same budget). One cosim run is not a verdict: the trace bridge flips about
+12% of runs on an unchanged binary (`titan_runs/nondet/`), so run a failing
+RVV test three times — `run_rvv_start(tests, reps=3)` — and judge by majority
+before you change RTL for it; a single pass does not clear a test either.
+Call `finish` only when `run_directed_start("all")` is 27/27,
 `run_rvv_start("failing")` is clean, and the tree holds no scaffolding.
 
 Do not modify any test or reference file, and do not run sbt, make or

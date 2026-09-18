@@ -28,16 +28,18 @@ When you are unsure what an instruction does, re-read the spec. Every time.
 
 ## What you are implementing
 
-Eight instructions total -- the directed suite's full scope this round.
-Four are already implemented and must keep passing: `vmmacc.vv`, `vmtl.v`,
-`vmts.v`, `vqmmacc.vv`. Four are new this round: `vwmmacc.vv` (W=2),
-`v8wmmacc.vv` (W=8), and the transposing tile pair `vmttl.v` / `vmtts.v`.
+Nine instructions total -- the directed suite's full scope this round.
+Eight are already implemented and must keep passing: `vmmacc.vv`,
+`vmtl.v`, `vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`,
+`vmtts.v`. One is new this round: `vfmmacc.vv`, floating-point, SEW 32/64
+only.
 
 | | |
 |---|---|
 | `v{,q,w,8w}mmacc.vv vd, vs1, vs2` | C <- C + A x B^T; funct6 and unpack depth (W in {1,4,2,8}) vary, the datapath shape does not |
 | `vmtl.v` / `vmttl.v vd, (rs1), rs2` | order-preserving / transposing 2D tile load |
 | `vmts.v` / `vmtts.v vs3, (rs1), rs2` | order-preserving / transposing 2D tile store |
+| `vfmmacc.vv vd, vs1, vs2` **(new)** | C <- fp_add(C, fp_round_frm(fp_mul(A,B))) per k, one term at a time; SEW=32/64 only, funct3=OPFVV not OPIVV |
 
 The good news, and it is genuinely good: **Zvvm adds no architectural
 register state.** A tile is an ordinary vector register group, reinterpreted
@@ -250,6 +252,14 @@ believe one of them is wrong, say so via `finish` and stop — do not change it.
   up to 40 tests (`read_status` lists the failing ones). `"sample"` is the
   loop's own sample and takes ~35 min. A build plus a few tests is ~4 min.
   Same one-at-a-time rule and the *same* start budget as `run_directed`.
+  **One cosim run is not a verdict.** The cospike/DebugROB trace bridge is
+  nondeterministic run to run: the same binary on the same test flips about
+  12% of the time (`titan_runs/nondet/`). Before a failing RVV test drives an
+  RTL change, run it three times — `run_rvv_start(tests, reps=3)` — and
+  believe the majority. A test that passed once may still be failing. Build
+  randomisation is *not* the cause: every build carries `+define+RANDOM=0`,
+  so every register init is a constant zero, and two builds of one tree are
+  byte-identical.
 - `read_knowledge` / `append_knowledge` — your notebook across iterations
 - `finish` — declare this turn's edits complete
 

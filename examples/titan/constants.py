@@ -145,7 +145,21 @@ BASELINE_CONFIG = os.environ.get("TITAN_BASELINE_CONFIG",
 CONFIG_PACKAGE = os.environ.get("TITAN_CONFIG_PACKAGE", "chipyard")
 BUILD_MAKE_JOBS = int(os.environ.get("TITAN_BUILD_MAKE_JOBS", "16"))
 BUILD_TIMEOUT_S = int(os.environ.get("TITAN_BUILD_TIMEOUT_S", "3600"))
+#: 8 stays, measured (``titan_runs/nondet/``, 2026-09-18).  Median per cosim
+#: test: 47-66 s at 8 threads vs 115-174 s at 1 thread (2.3-2.6x slower), and
+#: 1 thread is also *flakier* -- 9/32 runs failed there against 8/64 at 8
+#: threads, with the failure mode changing to the DebugROB ``popTrace`` "PC
+#: mismatch spike 10004 != DUT 10000" at bootrom instruction 2.  Thread count
+#: is not the source of the run-to-run flips; one thread is worse on both
+#: axes.
 VERILATOR_THREADS = int(os.environ.get("TITAN_VERILATOR_THREADS", "8"))
+
+#: Pins every ``RANDOMIZE_*`` init word to constant zero.  firrtl2 emits the
+#: ``RANDOM`` macro ``ifndef``-guarded, so this command-line define wins and
+#: ``$random`` never fires: simulator randomisation is *inert*, and two builds
+#: of one tree are byte-identical (``titan_runs/nondet/``).  Register-init
+#: randomisation therefore cannot make a logically inert RTL change flip a
+#: test -- that story (``titan_runs/dummy_fu/``) is disproved.
 SIM_ZERO_INIT_DEFINES = "+define+RANDOM=0"
 
 # --- DUT geometry ----------------------------------------------------------
@@ -199,9 +213,54 @@ ROUND_TWO_INSNS = ("vqmmacc.vv",)
 #: titan_runs/round3_design.md.
 ROUND_THREE_INSNS = ("vwmmacc.vv", "v8wmmacc.vv", "vmttl.v", "vmtts.v")
 
+#: Round four opens the floating-point half of the family with exactly one
+#: instruction:
+#:
+#:   vfmmacc.vv (W=1) at SEW = 32 and SEW = 64 -- binary32 x binary32 ->
+#:   binary32 and binary64 x binary64 -> binary64.
+#:
+#: Why one and not seven.  A floating-point result is *not* determined by
+#: the instruction alone: spec 1536-1600 partitions the K_eff products into
+#: groups of an implementation-defined size G, reduces each group to a
+#: partial sum under an implementation-defined psm, and rounds that partial
+#: sum under an implementation-defined rnd, and an implementation must
+#: disclose its (SEW, W, LAMBDA) -> (G, psm, rnd) table (spec 1652-1656).
+#: Titan discloses G=1, psm=0, rnd=frm, which spec 1771 names as the tuple
+#: that makes a Zvvm implementation match the analogous Zvtm instruction
+#: "For input element widths of 32 bits or greater".  At W=1 that collapses
+#: to one scalar multiply and one scalar add per k, in increasing k --
+#: which is the only arrangement the *test program* can recompute on the DUT
+#: with baseline rv64imafd instructions, so the harness keeps its
+#: differential shape and its exact bit-for-bit comparison.
+#:
+#: The other six are deferred, each for a concrete missing capability:
+#:
+#:   vfwmmacc.vv / vfqmmacc.vv / vf8wmmacc.vv -- at W>1 a group is a
+#:     sub-dot-product of W products that psm=0 requires to be summed
+#:     *exactly* before a single rounding (spec 1546-1553, 1566).  No
+#:     sequence of rv64imafd operations reproduces round_frm(C + p0 + p1)
+#:     with one rounding, so the reference would have to become a
+#:     precomputed image and the programs would stop being differential.
+#:     They additionally need the vtype.altfmt_A / altfmt_B input-format
+#:     decode at every SEW below 64.
+#:   vfmmacc.vv at SEW 8 and 16 -- OFP8 (E4M3/E5M2), binary16 and bfloat16
+#:     inputs, selected by altfmt_A / altfmt_B (spec 1129-1142).  The
+#:     baseline -march has no scalar arithmetic at any of those widths, so
+#:     the on-DUT reference path cannot be written.
+#:   vfwimmacc.vv / vfqimmacc.vv / vf8wimmacc.vv -- the vm=0 microscaled
+#:     integer-input forms.  They need the E8M0 paired block scales in v0
+#:     (spec 2116-2180), the bs block-size field, the NaN-scale early-exit
+#:     rule (spec 1812-1826) and a v0 that no VectorAlloc currently
+#:     reserves.  Their arithmetic is fully deterministic (spec 1643-1648),
+#:     so they are the natural round five.
+#:
+#: See titan_runs/round4_design.md for the full survey and the citations.
+ROUND_FOUR_INSNS = ("vfmmacc.vv",)
+
 #: Every instruction the generators know how to emit and judge.  The order is
 #: round order, so an index into this is an implementation milestone.
-ALL_INSNS = ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
+ALL_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
+             + ROUND_FOUR_INSNS)
 
 #: What a seeded tree already implements, and what this round adds.
 #: ``helpers.instruction_scope`` reads these two names first and only falls
@@ -209,16 +268,16 @@ ALL_INSNS = ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
 #: hook it left open so that a new round needs no edit in helpers.py.  Set
 #: them and every prompt names the right halves: rounds one and two are the
 #: regression surface, round three is the work.
-IMPLEMENTED_INSNS = ROUND_ONE_INSNS + ROUND_TWO_INSNS
-NEW_INSNS = ROUND_THREE_INSNS
+IMPLEMENTED_INSNS = ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
+NEW_INSNS = ROUND_FOUR_INSNS
 
 
 def _scope_insns() -> tuple:
     """Which instructions this run's directed suite and prompts cover.
 
     ``TITAN_INSNS`` selects the scope.  It accepts a round name -- ``one``,
-    ``two``, ``three``, ``all`` -- or an explicit comma-separated mnemonic
-    list, and defaults to ``all`` (rounds one + two + three).  Unknown
+    ``two``, ``three``, ``four``, ``all`` -- or an explicit comma-separated
+    mnemonic list, and defaults to ``all`` (rounds one to four).  Unknown
     mnemonics raise here rather than silently generating an empty suite six
     minutes into a loop iteration.
 
@@ -237,6 +296,7 @@ def _scope_insns() -> tuple:
     named = {"one": ROUND_ONE_INSNS, "1": ROUND_ONE_INSNS,
              "two": ROUND_TWO_INSNS, "2": ROUND_TWO_INSNS,
              "three": ROUND_THREE_INSNS, "3": ROUND_THREE_INSNS,
+             "four": ROUND_FOUR_INSNS, "4": ROUND_FOUR_INSNS,
              "all": ALL_INSNS, "": ALL_INSNS}
     if raw.lower() in named:
         return named[raw.lower()]
@@ -245,7 +305,7 @@ def _scope_insns() -> tuple:
     if unknown:
         raise ValueError(
             f"TITAN_INSNS={raw!r}: unknown mnemonic(s) {unknown}; "
-            f"expected a round name (one/two/three/all) or a subset of "
+            f"expected a round name (one/two/three/four/all) or a subset of "
             f"{ALL_INSNS}")
     return chosen
 
@@ -440,6 +500,15 @@ AGENT_RUNS_PER_ITER = int(os.environ.get("TITAN_AGENT_RUNS_PER_ITER", "6"))
 #: A cosim run is ~15s per test, so 40 is ~10 minutes on top of the build --
 #: about the most that fits in a turn without the model losing the thread.
 RVV_AGENT_MAX_TESTS = int(os.environ.get("TITAN_RVV_AGENT_MAX_TESTS", "40"))
+
+#: Most repeats one ``run_rvv_start`` call may ask for (``reps``).
+#: A single cosim run is not a verdict: the cospike/DebugROB DPI trace bridge
+#: is nondeterministic run to run, and the same binary on the same test flips
+#: ~12% of runs (``titan_runs/nondet/``: 8/64 at 8 threads, 9/32 at 1).
+#: ``reps`` re-runs the selection on the *same* build and reports ``k/n
+#: passed`` per test so the agent can judge by majority.  5 is the ceiling
+#: because the cost is linear and a turn has to end.
+RVV_AGENT_MAX_REPS = int(os.environ.get("TITAN_RVV_AGENT_MAX_REPS", "5"))
 
 #: How many failing RVV test names ``read_status`` prints.  Same cap: the
 #: point of the list is that the agent knows what "failing" selects, and a

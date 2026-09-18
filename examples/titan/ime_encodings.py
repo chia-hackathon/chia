@@ -62,8 +62,20 @@ ROUND_TWO = ("vqmmacc.vv",)
 #: titan_runs/round3_design.md.
 ROUND_THREE = ("vwmmacc.vv", "v8wmmacc.vv", "vmttl.v", "vmtts.v")
 
+#: Round four opens the floating-point family, Zvvfmm, with its W=1 entry.
+#: The four unscaled floating-point multiply-accumulates are their own
+#: contiguous funct6 run on OPFVV -- 0x14/0x15/0x16/0x17 for W=1/2/4/8 -- and
+#: are *not* aliases of the integer opcodes; the three microscaled
+#: integer-input forms (vfwimmacc.vv / vfqimmacc.vv / vf8wimmacc.vv) are the
+#: vm=0 decodes of the integer OPIVV opcodes 0x39/0x3a/0x3b, which
+#: :func:`check_mx_split` already pins.  On vfmmacc.vv vm is a *constant* 1
+#: (vm=0 is reserved, spec 1347); on the three widening FP forms vm is a
+#: real field that selects unscaled (1) from MX-scaled (0).  Only
+#: vfmmacc.vv is implemented -- see titan_runs/round4_design.md.
+ROUND_FOUR = ("vfmmacc.vv",)
+
 #: Everything the tile load/store and multiply-accumulate emission covers.
-IMPLEMENTED = ROUND_ONE + ROUND_TWO + ROUND_THREE
+IMPLEMENTED = ROUND_ONE + ROUND_TWO + ROUND_THREE + ROUND_FOUR
 
 #: ``lambda[2:0]`` in vtype, and the immediate lambda field of a tile
 #: load/store.  Spec table "lambda[2:0] (selected lambda) encoding".
@@ -172,12 +184,17 @@ def insn(name: str, **ops: int) -> str:
 
 def asm(name: str, **ops: int) -> str:
     """LLVM mnemonic form.  Requires -menable-experimental-extensions."""
-    if name in ("vmmacc.vv", "vwmmacc.vv", "vqmmacc.vv", "v8wmmacc.vv"):
+    if name in ("vmmacc.vv", "vwmmacc.vv", "vqmmacc.vv", "v8wmmacc.vv",
+                "vfmmacc.vv"):
         # Same operand shape across the whole integer family: vd is the
         # EMUL_C-sized C group, vs1/vs2 the LMUL-sized A and B groups.  The
         # widening forms differ only in funct6 and in how many logical
         # elements vtype.SEW-wide storage carries; SEW is always the
-        # *accumulator* width.
+        # *accumulator* width.  vfmmacc.vv has the same three-operand shape
+        # (spec 1629: `vfmmacc.vv vd, vs1, vs2`); it is in this branch and
+        # not a new one because vm is a pinned constant there, exactly as it
+        # is on the integer forms.  The three widening FP mnemonics take a
+        # fourth `v0.scale` operand when vm=0 and are not emitted.
         return f"{name} v{{vd}}, v{{vs1}}, v{{vs2}}".format(**ops)
     if name in ("vmtl.v", "vmts.v", "vmttl.v", "vmtts.v"):
         reg = "vd" if name in ("vmtl.v", "vmttl.v") else "vs3"
@@ -366,6 +383,92 @@ def check_round_three_bits() -> None:
         assert LAMBDA_DECODING[(word >> 29) & 0x7] == lam, lam
 
 
+def check_round_four_bits() -> None:
+    """Pin the round-four encoding against the v0.9.0 wavedrom blocks.
+
+    The floating-point family has its own contiguous funct6 run, on OPFVV
+    rather than OPIVV (spec encoding table at 1336-1342, per-instruction
+    wavedrom blocks at 5633 / 5848 / 5726 / 5514)::
+
+        | `vfmmacc.vv vd, vs1, vs2`               | 1 |  funct6 0x14
+        | `vfwmmacc.vv vd, vs1, vs2[, v0.scale]`  | 2 |  funct6 0x15
+        | `vfqmmacc.vv vd, vs1, vs2[, v0.scale]`  | 4 |  funct6 0x16
+        | `vf8wmmacc.vv vd, vs1, vs2[, v0.scale]` | 8 |  funct6 0x17
+
+    vfmmacc.vv Encoding (spec 5633-5643)::
+
+        { bits: 7, name: 0x57, attr: ['OP-V'] },
+        { bits: 5, name: 'vd' },
+        { bits: 3, name: 0x1, attr: ['OPFVV'] },
+        { bits: 5, name: 'vs1' },
+        { bits: 5, name: 'vs2' },
+        { bits: 1, name: 1 },
+        { bits: 6, name: 0x14, attr: ['vfmmacc.vv'] }
+
+    Three claims worth pinning, because each of them is a decoder bug
+    waiting to happen:
+
+    1.  The FP run is a *different funct3* from the integer run.  The two
+        families overlap in funct6 -- 0x14..0x17 is not 0x38..0x3b, but a
+        decoder that ignores funct3 would still have to get the OPFVV /
+        OPIVV split right for the *microscaled* forms, which genuinely do
+        share funct6 with the integer ones.
+    2.  vm is pinned to 1 on vfmmacc.vv: spec 1347, "For `vfmmacc.vv`,
+        `vm=0` is reserved", and the Sail body opens with
+        `if vm == 0 then return Illegal_Instruction();` (5684).  So it must
+        decode as a constant here and must not appear as an operand.
+    3.  vm is a *field* on the other three, splitting unscaled from
+        MX-scaled (spec 1349-1351).  That is the one structural difference
+        between vfmmacc.vv and its widening siblings, and it is why round
+        four can implement the W=1 entry without touching v0 at all.
+    """
+    word = encode("vfmmacc.vv", vd=4, vs1=8, vs2=12)
+    assert word & 0x7F == 0x57, f"vfmmacc.vv opcode {word & 0x7F:#x} != OP-V"
+    assert (word >> 12) & 0x7 == 0x1, (
+        f"vfmmacc.vv funct3 {(word >> 12) & 7:#x} != OPFVV (0x1)")
+    assert (word >> 25) & 0x1 == 1, "vfmmacc.vv vm is not pinned to 1"
+    assert (word >> 26) & 0x3F == 0x14, (
+        f"vfmmacc.vv funct6 {(word >> 26) & 0x3F:#x} != 0x14")
+    assert (word >> 7) & 0x1F == 4 and (word >> 15) & 0x1F == 8
+    assert (word >> 20) & 0x1F == 12
+    assert decode(word) == ("vfmmacc.vv",
+                            {"vd": 4, "vs1": 8, "vs2": 12}), decode(word)
+    assert operands("vfmmacc.vv") == ("vd", "vs1", "vs2"), (
+        "vfmmacc.vv must not expose vm as an operand: vm=0 is reserved")
+
+    # The whole run, in order, on OPFVV -- and *disjoint* from the integer
+    # run, which lives at 0x38..0x3b on OPIVV.
+    fp_run = ("vfmmacc.vv", "vfwmmacc.vv", "vfqmmacc.vv", "vf8wmmacc.vv")
+    int_run = ("vmmacc.vv", "vwmmacc.vv", "vqmmacc.vv", "v8wmmacc.vv")
+    for offset, name in enumerate(fp_run):
+        assert _const(name, 26) == 0x14 + offset, (
+            f"{name} funct6 {_const(name, 26):#x} != {0x14 + offset:#x}")
+        assert _const(name, 12) == 0x1, f"{name} is not OPFVV"
+    for offset, name in enumerate(int_run):
+        assert _const(name, 26) == 0x38 + offset, name
+        assert _const(name, 12) == 0x0, f"{name} is not OPIVV"
+    assert not set(fp_run) & set(int_run)
+
+    # vm: constant on vfmmacc.vv, a field on the three widening forms.
+    assert _const("vfmmacc.vv", 25) == 1
+    for name in fp_run[1:]:
+        assert "vm" in operands(name), (
+            f"{name} vm is no longer a field -- the MX split moved, so "
+            f"re-read spec 1349-1351 before trusting the round-four scope")
+
+    # An assembly template exists and reads as the spec writes it.
+    assert asm("vfmmacc.vv", vd=4, vs1=8, vs2=12) == "vfmmacc.vv v4, v8, v12"
+
+    # The round-four word must not collide with anything already emitted.
+    sample = {"vd": 4, "vs3": 4, "vs1": 8, "vs2": 12, "rs1": 10, "rs2": 11,
+              "vm": 1, "lambda": 0}
+    words = {}
+    for name in IMPLEMENTED:
+        w = encode(name, **{op: sample[op] for op in operands(name)})
+        assert w not in words, f"{name} and {words[w]} encode to {w:#010x}"
+        words[w] = name
+
+
 def check_llvm_drift() -> None:
     """The round-one three must be encoding-identical to what LLVM assembles.
 
@@ -403,13 +506,15 @@ def check_mx_split() -> None:
 
 def main() -> int:
     for check in (check_table, check_round_one_bits, check_round_two_bits,
-                  check_round_three_bits, check_llvm_drift, check_mx_split):
+                  check_round_three_bits, check_round_four_bits,
+                  check_llvm_drift, check_mx_split):
         check()
         print(f"  ok  {check.__name__}")
     print(f"\nZvvm v{SPEC_VERSION}: {len(INSTRUCTIONS)} instructions, "
           f"round one = {', '.join(ROUND_ONE)}, "
           f"round two = {', '.join(ROUND_TWO)}, "
-          f"round three = {', '.join(ROUND_THREE)}")
+          f"round three = {', '.join(ROUND_THREE)}, "
+          f"round four = {', '.join(ROUND_FOUR)}")
     sample = {"vd": 4, "vs3": 4, "vs1": 8, "vs2": 12, "rs1": 10, "rs2": 11,
               "vm": 1, "lambda": 0}
     for name in IMPLEMENTED:

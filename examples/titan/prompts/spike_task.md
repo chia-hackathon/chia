@@ -1,19 +1,21 @@
-Add the RISC-V Integrated Matrix Extension (Zvvm) to Spike. Four
+Add the RISC-V Integrated Matrix Extension (Zvvm) to Spike. Eight
 instructions are already implemented and passing: `vmmacc.vv`, `vmtl.v`,
-`vmts.v`, `vqmmacc.vv`. Round three adds four more: `vwmmacc.vv`,
-`v8wmmacc.vv`, `vmttl.v`, `vmtts.v` -- plus the `vtype` fields they need.
+`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`.
+Round four adds one more: `vfmmacc.vv`, at SEW 32 and 64 only -- plus the
+`frm`-governed rounding it needs.
 
 Start with `read_spec`. The specification carries formal SAIL semantics for
 each instruction; transcribe those. Spike's source is at `${SPIKE_SRC_PATH}`.
 
-## Rounds two and three
+## Rounds one through four
 
-Round two (`vqmmacc.vv`) is done and converged. Round three adds
-`vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`. If a working model for
-earlier instructions is already applied in the tree, extend it --
-everything that passes today must still pass. The SAIL appendix is
-normative and outranks the prose and the tests, for the new instructions as
-much as the old.
+Rounds one through three are done and converged: `vmmacc.vv`, `vmtl.v`,
+`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`.
+Round four adds exactly one instruction, `vfmmacc.vv`, at SEW 32 and 64
+only. If a working model for earlier instructions is already applied in
+the tree, extend it -- everything that passes today must still pass. The
+SAIL appendix is normative and outranks the prose and the tests, for the
+new instruction as much as the old.
 
 Two facts that save a wrong turn here. `vmttl.v`/`vmtts.v` are
 `vmtl.v`/`vmts.v` with two changes: bits 27:26 `0b01` not `0b00`, and offset
@@ -23,6 +25,16 @@ tile_reg_idx(...)` is unchanged, `rs2 = 0` default LD is now
 `0x39`/`0x3a`/`0x3b` is not a don't-care: it decodes
 `vfwimmacc.vv`/`vfqimmacc.vv`/`vf8wimmacc.vv` (out of scope) -- raise
 illegal-instruction, don't leave it unhandled.
+
+Five facts about `vfmmacc.vv`. Titan discloses **G=1, psm=0, rnd=frm**
+(spec 1771): the model must not fuse multiply-add or sum groups, so
+`acc = fp_add(acc, fp_round_to_frm(fp_mul_exact(a,b)))` per increasing `k`,
+two roundings per term under `frm`. `vtype.SEW` is the accumulator width,
+as in round two; `altfmt_A`/`altfmt_B`/`altfmt` are ignored at SEW 32/64.
+`vm = 0` on funct6 `0x14` is **reserved** -- raise illegal-instruction.
+Its funct3 is **OPFVV (0x1), not OPIVV**, unlike every instruction so far.
+NaNs canonicalise and `fflags` OR across active elements, but the directed
+tests do not compare `fflags` either way.
 
 ## Suggested order
 

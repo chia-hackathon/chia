@@ -77,6 +77,13 @@ def _every_geometry(vlen: int) -> Iterator[TileGeometry]:
         yield from rvv_ref.ime_legal_configs(
             vlen, sews=rvv_ref.WIDENING_SEWS_BY_W[w], ws=(w,))
     yield from rvv_ref.ime_legal_configs(vlen, tloads=("t",))
+    # Round four's floating-point tier, appended last for the same reason.
+    # vfmmacc.vv rides the identical five-instruction program shape -- only
+    # the arithmetic opcode and the reference path change -- so it is a pool
+    # entry, not new machinery.  Its cases are drawn as rounding witnesses
+    # (rvv_ref.random_fp_case), so a randomly sampled floating-point stress
+    # program is as sharp as a directed one.
+    yield from rvv_ref.ime_legal_configs(vlen, kinds=("fp",))
 
 
 def _allocatable(geom: TileGeometry) -> bool:
@@ -95,7 +102,8 @@ def generate(vlen: int, count: int, seed: int = 0
     for index, geom in enumerate(geometry_mix(vlen, rng, count)):
         widen = "" if geom.w == 1 else f"_w{geom.w}"
         trans = "" if geom.tload == "op" else "_t"
-        name = (f"stress_{index:06d}_sew{geom.sew}{widen}{trans}"
+        fp = "" if geom.kind == "int" else "_fp"
+        name = (f"stress_{index:06d}_sew{geom.sew}{widen}{trans}{fp}"
                 f"_lam{geom.lam}_lmul{geom.lmul}_n{geom.n}")
         case = rvv_ref.random_case(geom, rng)
         out.append((name, ime_tests.emit_test(geom, case, name), geom))
@@ -177,6 +185,16 @@ def check_emits() -> None:
         # pool whose names lie is a pool you cannot bisect.
         assert ("_t_" in name) == (geom.tload == "t"), name
         assert (f"_w{geom.w}_" in name) == (geom.w != 1), name
+        assert ("_fp_" in name) == (geom.kind == "fp"), name
+        if geom.kind == "fp":
+            # The floating-point programs carry the scalar rv64f / rv64d
+            # reference, not the RVV one, and set both extension state
+            # fields.  A stress program that silently fell back to the
+            # integer path would be green for the wrong reason.
+            assert "vmul.vv" not in asm and "vredsum.vs" not in asm, name
+            assert "    csrwi frm, 0" in asm, name
+            assert f"fmul.{ime_tests._FP_SUFFIX[geom.sew]} " in asm, name
+            assert f"li    t0, {ime_tests.MSTATUS_FS_INITIAL}" in asm, name
         assert f"# {geom.mnemonic} " in asm, name
         assert f"# {geom.load_mnemonic} " in asm, name
         assert f"# {geom.store_mnemonic} " in asm, name
@@ -216,9 +234,10 @@ def main() -> int:
     geometries = {g.describe() for _, _, g in programs}
     tally = {}
     for _, _, g in programs:
-        tally[(g.w, g.tload)] = tally.get((g.w, g.tload), 0) + 1
-    breakdown = " + ".join(f"{n} W={w}/{tl}"
-                           for (w, tl), n in sorted(tally.items()))
+        key = (g.kind, g.w, g.tload)
+        tally[key] = tally.get(key, 0) + 1
+    breakdown = " + ".join(f"{n} {kind} W={w}/{tl}"
+                           for (kind, w, tl), n in sorted(tally.items()))
     print(f"\nVLEN={args.vlen}: {len(programs)} stress programs "
           f"({breakdown}) covering "
           f"{len(geometries)} distinct tile geometries")

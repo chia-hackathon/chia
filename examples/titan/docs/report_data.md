@@ -433,6 +433,37 @@ shows the judge itself carried a nondeterministic `exit -11` failure mode that i
 I trust the artifacts over the ledger note here: three independent artifact classes agree, and the ledger
 note was written from memory during a manual stop.
 
+### 3.4a Root cause of that nondeterminism — and a superseded conclusion (added 2026-09-18)
+
+**Superseded:** the 2026-09-17 investigation in `titan_runs/dummy_fu/` concluded that simulations compile
+with `RANDOMIZE_REG_INIT`, that changing the number of entries in a functional-unit list re-rolls every
+register's initial value, and that this is why logically inert RTL changes flip `.vf` verdicts. That
+conclusion is **wrong**. It is left in place in `dummy_fu/README.md` (now banner-marked) as the record of
+what was believed; do not cite it as mechanism.
+
+**What replaces it — the controlled experiment at `titan_runs/nondet/`** (`results.json`, `README.md`):
+
+* `nodes.build_saturn` puts `+define+RANDOM=0` on every verilator command line, and firrtl2 emits
+  `` `ifndef RANDOM / `define RANDOM $random ``, so the command-line define wins: every randomised init is
+  constant zero. **Randomisation is inert, and always was** — including in every `dummy_fu` arm, all of
+  which were built through `build_saturn`. (`dummy_fu`'s `norand.diff` in fact *removes* the deterministic
+  zero-init, leaving those registers X.)
+* Two independent `reset → apply → build` cycles of the same tree produce **byte-identical** simulators
+  (`sha256[:16] = 4770505caeec5e0d`, 16,575,928 B). There is no build-to-build variation to explain.
+* **The same binary flips verdicts run to run**: 8 of 64 runs at `VERILATOR_THREADS=8` (12.5%), and 9 of 32
+  at 1 thread (28%) — one thread is *worse*, and 2.3–2.6× slower per test (median 115–174 s vs 47–66 s), so
+  the Verilator thread pool is not the mechanism either. `VERILATOR_THREADS = 8` stays.
+* The cause is run-to-run nondeterminism in the **cospike / Shuttle-DebugROB DPI trace bridge**. At 8
+  threads the failures are `wdata mismatch reg 5` — the scalar compare stream, not the vector unit; at 1
+  thread they become `PC mismatch spike 10004 != DUT 10000` at bootrom instruction 2, i.e. the `popTrace`
+  out-of-order hazard of §5.5, still live despite `WithShuttleRetireWidth(1)`.
+* `dummy_fu`'s numbers are one build and one run per arm; its determinism was asserted, never measured.
+
+Consequences for everything above: §3.4's r9 21/21/23 and the "flaky four" are this bridge, not the design;
+**a single cosim run is not a verdict** (~12% false-fail rate per test), and the `.vf` gate is partly
+measuring the harness. The loop's S2 sample and full-suite gate remain single-run by choice (cost), now
+commented as such in `titan_loop.py`; the agent-facing `run_rvv_start` takes `reps` and reports `k/n passed`.
+
 ### 3.5 Caveats on these numbers
 
 * `<run>/resources.csv` is **not run-scoped** — it appears to be a snapshot of a shared appending monitor
@@ -1164,4 +1195,4 @@ Net: the ABI hardening is real and permanent judge hygiene, but it was a **red h
 5. **Header/ABI drift is mitigated, not detected** (§7.5).
 6. **S2 runs a 150-test stride sample, not the full suite** (§1.4, §2.1) in every loop run; the only near-full sweep is the offline `a3_verify` 839-test run.
 7. **S2 is judged on a 1-wide retire host** (`WithShuttleRetireWidth(1)`, `constants.py:89-114`): a bug appearing only when two instructions commit in the same cycle is outside that gate. S1 still runs dual-issue. The principled fix is upstream in Shuttle.
-8. **S2 itself is nondeterministic** (§3.4): identical designs produced 21/21/23 failures with a recurring `exit -11` simulator death. Nothing in the loop accounts for judge flakiness.
+8. **S2 itself is nondeterministic** (§3.4): identical designs produced 21/21/23 failures with a recurring `exit -11` simulator death. Nothing in the loop accounts for judge flakiness. **Root cause found 2026-09-18 (§3.4a, `titan_runs/nondet/`): the cospike/DebugROB DPI trace bridge, ~12% of runs on an unchanging binary — not register-init randomisation, which is inert, and not thread count.**

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
@@ -32,7 +33,8 @@ from chia.base.tools.ChiaTool import ChiaTool
 
 import helpers
 from constants import (AGENT_RUNS_PER_ITER, RUN_DIRECTED_DRAIN_TIMEOUT_S,
-                       RUN_DIRECTED_WAIT_CAP, RVV_STATUS_NAMES)
+                       RUN_DIRECTED_WAIT_CAP, RVV_AGENT_MAX_REPS,
+                       RVV_STATUS_NAMES)
 
 
 class SpecTool(ChiaTool):
@@ -208,6 +210,76 @@ def write_status(status_path: str,
         fh.write("\n".join(lines) + "\n")
 
 
+# --- run_rvv repetition ----------------------------------------------------
+#: A failing test block in ``helpers.format_regression_failure`` is "## name".
+_RVV_FAIL_RE = re.compile(r"^## (\S+)\s*$", re.M)
+#: "(run_rvv: ..., 3/12 failing)" and the clean "12/12 pass".
+_RVV_FAILING_HEAD_RE = re.compile(r"(\d+)/(\d+) failing")
+_RVV_PASS_HEAD_RE = re.compile(r"(\d+)/(\d+) pass\b")
+
+
+def _rvv_rep_verdict(body: str) -> Tuple[Optional[int], set]:
+    """``(tests_run, failing_names)`` for one ``run_rvv`` result body.
+
+    ``None`` for the count means the body was not a verdict at all -- a build
+    failure or a harness error -- and that rep must not be counted as a pass.
+    """
+    fails = set(_RVV_FAIL_RE.findall(body))
+    m = _RVV_FAILING_HEAD_RE.search(body)
+    if m:
+        return int(m.group(2)), fails
+    m = _RVV_PASS_HEAD_RE.search(body)
+    if m:
+        return int(m.group(2)), fails
+    return None, fails
+
+
+def _rvv_reps_summary(bodies: Sequence[str]) -> str:
+    """Fold N repeats of the same selection into one majority verdict.
+
+    Why this exists: the cospike/DebugROB DPI trace bridge is nondeterministic
+    run to run, and the *same* binary on the *same* test flips about 12% of
+    the time (``titan_runs/nondet/``).  One run is not a verdict.  Each test
+    that failed in at least one rep is reported as ``k/n passed`` so the agent
+    can judge by majority instead of chasing a flip.
+    """
+    n = len(bodies)
+    per_rep = [_rvv_rep_verdict(b) for b in bodies]
+    valid = [i for i, (ran, _) in enumerate(per_rep) if ran is not None]
+    names = sorted({name for _, fails in per_rep for name in fails})
+    lines = [f"(run_rvv: {n} reps of the same build -- a single cosim run is "
+             f"not a verdict; the trace bridge flips ~12% of runs, see "
+             f"titan_runs/nondet/)\n"]
+    if not valid:
+        lines.append("No rep produced a verdict (build or harness failure). "
+                     "The last rep said:\n")
+        lines.append(bodies[-1] if bodies else "(no output)")
+        return "\n".join(lines)
+    if len(valid) < n:
+        lines.append(f"{n - len(valid)} of {n} reps produced no verdict "
+                     f"(build or harness failure) and are counted as "
+                     f"failures below.\n")
+    ran = per_rep[valid[0]][0] or 0
+    if not names:
+        lines.append(f"All {ran} test(s) passed {len(valid)}/{n} reps.\n")
+    else:
+        lines.append("Per-test verdicts (k/n = reps passed):\n")
+        for name in names:
+            passed = sum(1 for i in valid if name not in per_rep[i][1])
+            call = ("FAILING" if passed * 2 < n else
+                    "flaky -- majority pass" if passed < n else "pass")
+            lines.append(f"- {name}: {passed}/{n} passed ({call})")
+        clean = ran - len(names)
+        if clean > 0:
+            lines.append(f"\nThe other {clean} test(s) in this selection "
+                         f"passed {n}/{n} reps.")
+        lines.append("\nAct on the majority. A test that passed once is not "
+                     "cleared; a test that failed once is not broken.")
+    lines.append("\n--- last rep, in full ---\n")
+    lines.append(bodies[valid[-1]])
+    return "\n".join(lines)
+
+
 class RunDirectedTool(ChiaTool):
     """Lets the agent build and test its own change, mid-turn -- by polling.
 
@@ -326,7 +398,7 @@ class RunDirectedTool(ChiaTool):
         return self._start("directed", tests, rebuild)
 
     def run_rvv_start(self, tests: str = "failing",
-                      rebuild: bool = True) -> str:
+                      rebuild: bool = True, reps: int = 1) -> str:
         """Start an RVV regression run of your current tree. Returns at once.
 
         This is Stage 2: Saturn's own riscv-vector-tests, judged by lockstep
@@ -346,12 +418,26 @@ class RunDirectedTool(ChiaTool):
             available: the full 841 cannot be run inside a turn.
         rebuild: leave True unless you have changed nothing since your last
             call and only want the tests re-run.
+        reps: how many times to run the selection, on the *same* build
+            (default 1, max 5). A single cosim run is not a verdict: the
+            cospike trace bridge flips about 12% of runs on an unchanged
+            binary, so pass reps=3 for a failing test and believe the
+            majority. The result then reports each test as "k/n passed".
+            Costs one start but reps times the test time.
 
         A cosim build plus a handful of tests is about four minutes. Shares
         one budget and one chipyard node with run_directed_start, so only one
         job of either kind runs at a time.
         """
-        return self._start("rvv", tests, rebuild)
+        try:
+            reps = int(reps)
+        except (TypeError, ValueError):
+            return "reps must be an integer between 1 and %d." % RVV_AGENT_MAX_REPS
+        if reps < 1 or reps > RVV_AGENT_MAX_REPS:
+            return (f"reps={reps} is out of range: 1 to "
+                    f"{RVV_AGENT_MAX_REPS}. Three is the useful value -- it "
+                    f"is enough for a majority and the cost is linear.")
+        return self._start("rvv", tests, rebuild, reps)
 
     async def run_rvv_wait(self, job_id: str = "",
                            max_wait_s: int = 90) -> str:
@@ -366,7 +452,9 @@ class RunDirectedTool(ChiaTool):
 
         On completion returns either "N/N pass" or the divergence report:
         one block per failing test with cospike's abort window, and the path
-        to the full logs.
+        to the full logs. If the job was started with reps > 1 it returns the
+        per-test "k/n passed" majority verdict first, then the last rep in
+        full.
         """
         return await self._wait("rvv", job_id, max_wait_s)
 
@@ -413,7 +501,8 @@ class RunDirectedTool(ChiaTool):
         return self._KINDS.get(job.get("kind") or "directed",
                                self._KINDS["directed"])["label"]
 
-    def _start(self, kind: str, tests: str, rebuild: bool) -> str:
+    def _start(self, kind: str, tests: str, rebuild: bool,
+               reps: int = 1) -> str:
         names = self._KINDS[kind]
         running = self._running_job()
         if running is not None:
@@ -437,14 +526,18 @@ class RunDirectedTool(ChiaTool):
         self._bump(used)
         job_id = f"{names['prefix']}{seq}"
         jobs = self._read_jobs()
+        reps = max(1, min(int(reps or 1), RVV_AGENT_MAX_REPS))
         jobs[job_id] = {"job_id": job_id, "seq": seq, "kind": kind,
                         "tests": tests, "rebuild": bool(rebuild),
+                        "reps": reps,
                         "state": "running", "started": time.time(),
                         "finished": None, "result": None}
         self._write_jobs(jobs)
-        self._submit(job_id, kind, tests, bool(rebuild), seq)
+        self._submit(job_id, kind, tests, bool(rebuild), seq, reps)
         return (f"Started job {job_id} ({names['label']}, tests={tests}, "
-                f"rebuild={bool(rebuild)}); {seq}/{self.max_runs} starts used "
+                f"rebuild={bool(rebuild)}"
+                + (f", reps={reps}" if reps > 1 else "")
+                + f"); {seq}/{self.max_runs} starts used "
                 f"this turn (shared budget).\nCall {names['wait']}"
                 f"('{job_id}') now, and keep calling it until it returns a "
                 f"result. Do not end your turn while it is unfinished: the "
@@ -480,20 +573,29 @@ class RunDirectedTool(ChiaTool):
 
     # --- worker side --------------------------------------------------
     def _submit(self, job_id: str, kind: str, tests: str, rebuild: bool,
-                seq: int) -> None:
+                seq: int, reps: int = 1) -> None:
         if self._pool is None:
             self._pool = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="run_directed")
-        self._pool.submit(self._work, job_id, kind, tests, rebuild, seq)
+        self._pool.submit(self._work, job_id, kind, tests, rebuild, seq, reps)
 
     def _work(self, job_id: str, kind: str, tests: str, rebuild: bool,
-              seq: int) -> None:
+              seq: int, reps: int = 1) -> None:
         label = self._KINDS[kind]["label"]
         try:
             runner = self.rvv_runner if kind == "rvv" else self.runner
             if runner is None:
                 raise RuntimeError(f"no {label} runner is configured")
-            body = runner(tests, rebuild, seq)
+            reps = max(1, min(int(reps or 1), RVV_AGENT_MAX_REPS))
+            if kind == "rvv" and reps > 1:
+                bodies = []
+                for rep in range(reps):
+                    # Only the first rep may rebuild: the whole point is to
+                    # re-run the SAME binary, which is where the flips live.
+                    bodies.append(runner(tests, rebuild and rep == 0, seq))
+                body = _rvv_reps_summary(bodies)
+            else:
+                body = runner(tests, rebuild, seq)
         except Exception as exc:                            # noqa: BLE001
             # Never let a dispatch failure look like a test failure: the
             # agent would go and debug its RTL over a Ray problem.

@@ -24,6 +24,9 @@ dimension; one that appears everywhere points at something structural.
   hand; `run_directed_start` is that build.
 - If the failure you were given is an RVV regression, reproduce it yourself
   with `run_rvv_start("failing")` → `run_rvv_wait` before you finish.
+  One cosim run is not a verdict — the trace bridge flips ~12% of runs on an
+  unchanged binary (`titan_runs/nondet/`). Use `reps=3` and judge by majority
+  before an RVV failure drives an RTL change; one pass does not clear a test.
 - Do not spawn sub-agents. Do the work in this session.
 
 ## Reading a directed failure

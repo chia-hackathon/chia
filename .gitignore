@@ -46,3 +46,4 @@ docs/_build/
 # User-specific outputs and scratch
 *-log
 out/
+*.bak-*

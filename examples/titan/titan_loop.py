@@ -145,11 +145,11 @@ def _build_directed(dump: helpers.Dumper, vlen: int, full_sweep: bool
     """Assemble the directed programs and return (tests, geometry by name).
 
     Two tiers.  Per-iteration runs one program per (SEW, LAMBDA, LMUL) at full
-    VL -- about thirty, covering every tile geometry and register allocation.
-    The gate sweeps partial N as well, which is roughly two hundred programs
-    and half a million lines of assembly: worth paying once when the cheap tier
-    is already green, not worth paying sixty times.  Partial N is where the C
-    tile tail policy lives, so the gate cannot skip it.
+    VL -- 92, covering every tile geometry and register allocation. The gate
+    sweeps partial N as well, which is 608 programs and well over a million
+    lines of assembly: worth paying once when the cheap tier is already
+    green, not worth paying sixty times.  Partial N is where the C tile tail
+    policy lives, so the gate cannot skip it.
     """
     suite = ime_tests.directed_suite(vlen, full_vl_only=not full_sweep)
     refs = {name: nodes.build_ime_test.chia_remote(asm, name, BUILD_WORK_DIR,
@@ -691,6 +691,23 @@ def _dump_regression_logs(dump: helpers.Dumper, stem: str,
     dump.text(f"{stem}.simlogs.txt", "\n".join(chunks))
 
 
+#: How many times the gate may hand the design back to the agent and then
+#: re-check it before giving up.
+#:
+#: Before r17 there was no re-check at all: the gate ran the directed sweep
+#: and then the full RVV regression, and on a failure handed the agent one
+#: debug ``_iterate``.  ``_iterate`` converges on *its own* criteria -- the
+#: directed suite plus the sampled regression -- so in r16_0918_0129 a gate
+#: that had failed 12 of 837 full-suite tests was "fixed" by a directed pass
+#: of 92/92 and the run walked straight into Stage 3 with the regression
+#: never re-run.  The gate now re-runs ``_gate`` in full after every debug
+#: re-entry, so whatever it failed on is what it re-checks, and only a clean
+#: directed sweep *and* a clean full suite pass it.  Each re-entry keeps its
+#: own ``DEBUG_MAX_ITERS`` iteration cap; this bounds how many re-entries the
+#: gate will pay for.
+GATE_DEBUG_ROUNDS = int(os.environ.get("TITAN_GATE_DEBUG_ROUNDS", "3"))
+
+
 #: The cosim simulator the most recent successful ``_run_s2`` built, together
 #: with the digest of the tree it was elaborated from.
 #:
@@ -761,6 +778,13 @@ def _run_s2(dump: helpers.Dumper, label: str, attempt: int, pg_opts,
     _LAST_COSIM.update(artifact=cosim_artifact, tree=_tree_digest(pg_opts),
                        label=label, attempt=attempt)
 
+    # SINGLE-RUN VERDICT, knowingly.  Each of these tests runs once, and the
+    # cospike/DebugROB DPI trace bridge is nondeterministic run to run: the
+    # same binary on the same test flips ~12% of runs (titan_runs/nondet/,
+    # 8/64 at VERILATOR_THREADS=8).  So this sample carries a false-failure
+    # rate of roughly 12% per failing test.  Repeating it here would multiply
+    # the per-iteration S2 cost, so it is left single-run; the agent-facing
+    # path has `reps` (tools.run_rvv_start) for the cases that matter.
     regression_failures, ran = _run_regression(cosim_artifact)
     # Before the branch: a clean run has to clear the set too, or the agent's
     # `run_rvv_start("failing")` would keep re-running tests that now pass.
@@ -1103,6 +1127,13 @@ def _gate_regression(dump: helpers.Dumper, pg_opts, run_id: str,
                seconds=round(time.time() - t0, 1))
         return False, message
 
+    # SINGLE-RUN VERDICT, knowingly -- same caveat as _run_s2.  Every test
+    # here runs once, and the cospike/DebugROB trace bridge flips ~12% of runs
+    # on an unchanged binary (titan_runs/nondet/), so a gate failure list of
+    # this size is expected to contain a handful of false failures and a
+    # borderline test can pass the gate by luck.  Re-running the whole 841 to
+    # majority would triple the most expensive step in the run; when a gate
+    # failure matters, confirm it with run_rvv_start(..., reps=3).
     failing, ran = _run_regression(cosim_artifact, sample=False)
     wall = round(time.time() - t0, 1)
     # Same merge rule as _run_s2: only what ran changes, so the agent's
@@ -1772,7 +1803,9 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
         gate_ok, gate_message = _gate(artifact, dump, status_path, vlen,
                                       pg_opts=pg_opts, run_id=run_id,
                                       rvv_failing_path=rvv_failing_path)
-        if not gate_ok:
+        result["gate"] = gate_ok
+        gate_rounds = 0
+        while not gate_ok:
             # Two ways to get here.  Without a message: the cheap tier passed
             # and the full sweep did not, so the fault lives in partial-N
             # behaviour -- the C tile tail policy, almost certainly.  With
@@ -1780,8 +1813,19 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
             # not, and the message is the same regression feedback a
             # per-iteration S2 failure produces.  Re-enter with whichever it
             # is as the evidence.
+            if gate_rounds >= GATE_DEBUG_ROUNDS:
+                _event("gate_debug_exhausted", rounds=gate_rounds)
+                result["gate"] = False
+                result["gate_failure"] = (
+                    "gate", f"still failing after {gate_rounds} debug "
+                    f"re-entries (cap GATE_DEBUG_ROUNDS={GATE_DEBUG_ROUNDS})")
+                return result
+            gate_rounds += 1
+            _event("gate_debug_start", round=gate_rounds,
+                   half="regression" if gate_message else "directed")
             ok, artifact = _iterate(
-                llm, rtl_tools, dump, status_path, finish, label="gate",
+                llm, rtl_tools, dump, status_path, finish,
+                label=f"gate{gate_rounds}" if gate_rounds > 1 else "gate",
                 vlen=vlen, max_iters=DEBUG_MAX_ITERS,
                 first_message=gate_message or (
                               "The full directed sweep, which includes "
@@ -1796,6 +1840,19 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
             result["gate"] = ok
             if not ok:
                 return result
+            # The whole point of r17.  ``_iterate`` converged on the directed
+            # suite and the *sampled* regression; neither is what the gate
+            # failed on.  Re-run ``_gate`` itself -- the full directed sweep
+            # and then, unsampled, the whole riscv-vector-tests suite -- so
+            # the half that failed is the half that has to come back clean.
+            # ``_gate_regression`` reuses the cosim build ``_run_s2`` left in
+            # ``_LAST_COSIM`` when the tree has not moved since, and emits its
+            # ``gate_regression`` event on every pass, so each re-check shows
+            # up in the trace.
+            gate_ok, gate_message = _gate(artifact, dump, status_path, vlen,
+                                          pg_opts=pg_opts, run_id=run_id,
+                                          rvv_failing_path=rvv_failing_path)
+            result["gate"] = gate_ok
 
         if stress:
             if spike_artifact is None:
@@ -1883,7 +1940,8 @@ def _archive(run_id: str, out_dir: str, result: Dict[str, object]) -> None:
 def _render_summary(run_id: str, result: Dict[str, object]) -> str:
     lines = [f"# Titan run {run_id}", ""]
     for key in ("vlen", "model", "model_digest", "rtl_source", "rtl_digest",
-                "s1_s2", "gate", "stress_done", "stress_failure",
+                "s1_s2", "gate", "gate_failure", "stress_done",
+                "stress_failure",
                 "converged"):
         if key in result:
             lines.append(f"- **{key}**: {result[key]}")

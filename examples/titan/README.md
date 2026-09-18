@@ -9,29 +9,39 @@ edge-LLM 的 **INT8 GEMM** ——「C += A × Bᵀ」的 tile MAC 與 2D tile lo
 `rvv_ref.py` 是人先寫好的、riscv-vector-tests 是 Saturn 原本就附的、Spike IME 模型
 在 RTL 之前先收斂。三個 judge 都不是實作者自己的產物。
 
-## 1. 已實作 / 未實作的指令（8 / 15）
+## 1. 已實作 / 未實作的指令（9 / 15）
 
-完整取捨與理由見 `docs/round3_design.md`（§1 全 15 條調查、§2 批次決策）。
+前八條的完整取捨與理由見 `docs/round3_design.md`（§1 全 15 條調查、§2 批次決策）。
+第四輪 `vfmmacc.vv` 的調查與批次決策見 `titan_runs/round4_design.md`——這份設計
+note 尚未收錄進 `docs/`，本節第四輪的數字都以它為出處。
 
-| 已完成（8） | 群組 | 輪次 |
+| 已完成（9） | 群組 | 輪次 |
 |---|---|---|
 | `vmmacc.vv` | Zvvmm | r1 |
 | `vqmmacc.vv` | Zvvmm | r2 |
 | `vwmmacc.vv`、`v8wmmacc.vv` | Zvvmm | r3 |
 | `vmtl.v`、`vmts.v` | Zvvmtls | r1 |
 | `vmttl.v`、`vmtts.v` | Zvvmttls | r3 |
+| `vfmmacc.vv`（僅 SEW=32/64） | Zvvfmm | r4 |
 
 Zvvmm（整數矩陣 MAC，W=1/2/4/8）與 Zvvmtls/Zvvmttls（順序保留與轉置的 tile
-load/store）都已完整關閉。
+load/store）都已完整關閉。Zvvfmm 目前只開了 `vfmmacc.vv`（W=1）這一格，且僅
+SEW=32/64：這兩個寬度上 `altfmt_A`/`altfmt_B`/`altfmt` 是 ignored/reserved，
+不需要格式解碼，且 Titan 揭露的 `G=1, psm=0, rnd=frm`（spec 1771）讓測試程式
+能用 baseline `rv64imafd` 的 `fmul`/`fadd` 精確重算同一個 differential 參考
+（`titan_runs/round4_design.md` §1–2）。
 
-**延後的 7 條全部屬於 Zvvfmm**：`vfmmacc.vv`、`vfwmmacc.vv`、`vfqmmacc.vv`、
-`vf8wmmacc.vv`、`vfwimmacc.vv`、`vfqimmacc.vv`、`vf8wimmacc.vv`。理由（`round3_design.md` §2.5–2.6）：
-對「INT8 GEMM」這個目標買不到東西；需要一整套新東西（FP MAC array、`altfmt` 格式解碼、
-`frm`/`fflags`、G/psm/rnd 累加與捨入模型、MX（E8M0）scale 解碼、OFP8/OFP4 子字組格式），
-而這些都落在共用的 int/fp issue path —— 正是第一輪 bug 群聚的地方（見「已知限制」§2）。
-後三條 MX 整數輸入形式（`vf*immacc`）是穿著整數 opcode 的 FP-accumulate 指令，在 funct6
-0x39/0x3a/0x3b 上只以 `vm` 一個 bit 與 `vwmmacc`/`vqmmacc`/`v8wmmacc` 區分，因此繼承同一個
-延後決定；本輪只實作 `vm=1`。
+**延後的 6 條全部屬於 Zvvfmm**：`vfwmmacc.vv`、`vfqmmacc.vv`、`vf8wmmacc.vv`
+（`vfmmacc.vv` 的 W>1 姊妹）與 `vfwimmacc.vv`、`vfqimmacc.vv`、`vf8wimmacc.vv`
+（MX 整數輸入）。理由（`titan_runs/round4_design.md` §2.3–2.5）：W>1 時
+psm=0 要求 `W` 個子乘積先精確加總、只捨入一次，rv64imafd 的乘加序列重現不了
+單次捨入，reference 會變成寫死的影像而失去 differential 性質；SEW=8/16 需要
+`altfmt`（OFP8／binary16／bfloat16）解碼，baseline `-march` 在這些寬度上又沒有
+純量算術可以寫參考；三條 MX 整數輸入形式缺 `v0` 成對 E8M0 block scale 的配置、
+`bs` 欄位與 NaN-scale 提前退出規則，且 `VectorAlloc` 目前把 `v0` 配給 A/B tile，
+本輪未動。r1–r3 對 funct6 0x39/0x3a/0x3b 只實作了 `vm=1`（整數 macc）；`vm=0`
+在這三個 funct6 上解碼的正是 `vfwimmacc.vv`/`vfqimmacc.vv`/`vf8wimmacc.vv`，
+繼承同一個延後決定，仍在此列。
 
 ## 2. 五個驗證階段與最終數字
 
@@ -49,6 +59,13 @@ S2 的 837 是全套 841 扣掉 **4 支有文件記錄的排除**（`docs/r15_fu
 `machine_vsetvl-0` / `vsetivli-0` / `vsetvli-0` 則因為 IME v0.9.0 要求 IME-legal 的 vsetvli 把
 非零 lambda 寫進 `vtype[62:60]`，stock Spike 不認識 IME 永遠回 0，凡是把 vtype 值寫回純量
 暫存器比對的測試在 stock Spike 下**不可能**通過；這些欄位改由 S3 以 IME Spike 模型 lockstep 判定。
+
+**round four 之後 suite 又長大了一輪。** per-iteration directed suite 80 →
+**92** 支（新增 12 支浮點：SEW=32 七支、SEW=64 五支），S1 gate 548 → **608**
+支（新增 60 支）。這兩個數字出自 `titan_runs/round4_design.md` §7 的
+byte-identical regression 記錄——round four 自己的完整驗證（r16）還沒跑完，
+**還沒有對應的 `docs/` 檔案**，所以上表的 `r15 結果` 欄仍是最後一次收斂進
+`docs/` 的紀錄，維持不動；`92`/`608` 目前只能追到 `titan_runs/round4_design.md`。
 
 ## 3. 怎麼跑
 
@@ -76,7 +93,7 @@ hunks，套用後先跑 attempt 0，讓 agent 的第一個 prompt 帶著真實�
 | 變數 | 預設 | 作用 |
 |---|---|---|
 | `TITAN_CHIPYARD_PATH` | `/home/ray/chipyard` | 容器內的 Chipyard 樹 |
-| `TITAN_INSNS` | `all` | 指令範圍：`one` / `two` / `three` / `all` 或逐條 mnemonic；`one` 可跑位元相同的回歸 |
+| `TITAN_INSNS` | `all` | 指令範圍：`one` / `two` / `three` / `four` / `all` 或逐條 mnemonic；`one` 可跑位元相同的回歸 |
 | `TITAN_VLEN` / `TITAN_DLEN` | `256` / `128` | Saturn 組態 |
 | `TITAN_SYNTH_CONFIG` / `TITAN_BASELINE_CONFIG` | `TitanV256D128ShuttleConfig` / … | 建置與對照組態 |
 | `TITAN_RVV_TESTS_DIR` / `TITAN_REGRESSION_BASELINE` | 見 `constants.py` | riscv-vector-tests 位置與 S2 排除清單 |

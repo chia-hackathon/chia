@@ -76,22 +76,6 @@ def reset_chipyard(chipyard_path: str = CHIPYARD_PATH, extension: str = "") -> s
 
 
 @ChiaFunction(resources={"chipyard": 0.9})
-def apply_diff(diff: str, chipyard_path: str = CHIPYARD_PATH, extension: str = "") -> str:
-    """Seed the (freshly reset) tree with a prior run's probe diff, so a
-    pipeline can resume from a known implementation instead of re-deriving it.
-    Probe diffs are chipyard-rooted (see collect_diff); legacy Saturn-rooted
-    seeds still apply via --directory.
-    TODO: this should be offered with bypassing."""
-    if extension: get_profiler().add_info({"extension": extension})
-    for extra in ((), ("--directory", SATURN_REPO_REL)):
-        p = subprocess.run(["git", "apply", "--whitespace=nowarn", *extra],
-                           input=diff, cwd=chipyard_path, capture_output=True, text=True)
-        if p.returncode == 0:
-            return "applied" + (" (legacy saturn-rooted)" if extra else "")
-    return f"FAILED: {p.stderr[-500:]}"
-
-
-@ChiaFunction(resources={"chipyard": 0.9})
 def collect_diff(chipyard_path: str = CHIPYARD_PATH, extension: str = "") -> str:
     """The LLM's accumulated edits as ONE chipyard-rooted unified diff: the
     chipyard-level changes (the cosim config) plus every submodule in
@@ -120,8 +104,11 @@ def collect_diff(chipyard_path: str = CHIPYARD_PATH, extension: str = "") -> str
 @ChiaFunction(resources={"chipyard": 0.9})
 def apply_diff(diff: str, chipyard_path: str = CHIPYARD_PATH,
                extension: str = "") -> str:
-    """Reseed the tree from a `collect_diff` output (``git apply`` from the
-    chipyard root; the diff's a/<submodule>/ prefixes are made for this).
+    """Seed the (freshly reset) tree with a prior run's probe diff, so a
+    pipeline can resume from a known implementation instead of re-deriving
+    it. Reseeds the tree from a `collect_diff` output (``git apply`` from
+    the chipyard root; the diff's a/<submodule>/ prefixes are made for
+    this).
 
     Used by ``--model-diff`` to reuse a converged Stage M Spike model from an
     earlier run instead of paying for the model agent again.  Returns "" on

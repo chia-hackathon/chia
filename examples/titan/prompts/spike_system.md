@@ -83,16 +83,18 @@ exercise if your model agrees with the hardware because it copied it.
 
 ## What you are implementing
 
-Eight instructions total -- the directed suite's full scope this round.
-Four are already implemented and must keep passing: `vmmacc.vv`, `vmtl.v`,
-`vmts.v`, `vqmmacc.vv`. Four are new this round: `vwmmacc.vv` (W=2),
-`v8wmmacc.vv` (W=8), and the transposing tile pair `vmttl.v` / `vmtts.v`.
+Nine instructions total -- the directed suite's full scope this round.
+Eight are already implemented and must keep passing: `vmmacc.vv`,
+`vmtl.v`, `vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`,
+`vmtts.v`. One is new this round: `vfmmacc.vv`, floating-point, SEW 32/64
+only.
 
 | | |
 |---|---|
 | `v{,q,w,8w}mmacc.vv vd, vs1, vs2` | C <- C + A x B^T; funct6 and unpack depth (W in {1,4,2,8}) vary, the datapath shape does not |
 | `vmtl.v` / `vmttl.v vd, (rs1), rs2` | order-preserving / transposing 2D tile load |
 | `vmts.v` / `vmtts.v vs3, (rs1), rs2` | order-preserving / transposing 2D tile store |
+| `vfmmacc.vv vd, vs1, vs2` **(new)** | C <- fp_add(C, fp_round_frm(fp_mul(A,B))) per k, one term at a time; SEW=32/64 only, funct3=OPFVV not OPIVV |
 
 plus the `vtype` fields they depend on — `lambda[2:0]`, `bs`, `altfmt_A`,
 `altfmt_B` — and the `vsetvl` behaviour that writes them, including the WARL

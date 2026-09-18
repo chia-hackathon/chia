@@ -53,6 +53,22 @@ _ABI = {
     **{f"x{i}": i for i in range(32)},
 }
 
+#: Floating-point register names, for the round-four reference path.  Only
+#: the ABI names the generator actually emits, plus the fN forms.
+_FABI = {
+    **{f"ft{i}": i for i in range(8)},
+    **{f"fs{i}": 8 + i for i in range(2)},
+    **{f"fa{i}": 10 + i for i in range(8)},
+    **{f"fs{i}": 16 + i for i in range(2, 12)},
+    **{f"ft{i}": 25 + i for i in range(3, 9)},
+    **{f"f{i}": i for i in range(32)},
+}
+
+#: Scalar FP mnemonic suffix -> element width.  ``.s`` is binary32, ``.d``
+#: binary64; there is no ``.h`` in the baseline -march, which is why round
+#: four's floating-point tier stops at SEW >= 32.
+_FP_WIDTH = {"s": 32, "d": 64}
+
 _DIRECTIVE_WIDTH = {".byte": 1, ".half": 2, ".word": 4, ".dword": 8}
 
 
@@ -78,6 +94,17 @@ class Machine:
     vtype: int = 0
     vl: int = 0
     mstatus: int = 0
+    #: The scalar floating-point register file, held as raw bit patterns
+    #: rather than host floats: NaN payloads, signed zeros and subnormals all
+    #: have to survive a load/store round trip unchanged, and the harness
+    #: compares bits.  Arithmetic goes through rvv_ref's exact model, so the
+    #: host's float type is never in the loop.
+    f: List[int] = field(default_factory=lambda: [0] * 32)
+    #: fcsr.frm.  The reset value is 0 (RNE) and the emitted programs set it
+    #: explicitly with `csrwi frm, 0` anyway; anything else would need a
+    #: rounding mode argument threaded through rvv_ref.fp_round, which round
+    #: four does not generate.  See rvv_ref.FP_FRM.
+    frm: int = 0
     stdout: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -255,6 +282,13 @@ def _reg(token: str) -> int:
     raise SimError(f"not a register: {token!r}")
 
 
+def _freg(token: str) -> int:
+    try:
+        return _FABI[token]
+    except KeyError:
+        raise SimError(f"not a floating-point register: {token!r}") from None
+
+
 def _vreg(token: str) -> int:
     m = re.fullmatch(r"v(\d+)", token.strip())
     if not m:
@@ -356,6 +390,44 @@ def run(program: Program, machine: Machine, limit: int = 20_000_000) -> int:
                                                  machine.sew), machine.sew)
         elif mnemonic == "vredsum.vs":
             _vredsum(machine, ops)
+        elif mnemonic == "csrwi":
+            # The only CSR the generator writes immediately is frm, and the
+            # only value it writes is 0 (RNE).  Anything else would mean the
+            # two paths of a program disagree about the rounding mode, which
+            # is precisely the bug this refuses to model silently.
+            if ops[0] != "frm":
+                raise SimError(f"csrwi {ops[0]} is not modelled")
+            machine.frm = int(ops[1], 0)
+            if machine.frm != rvv_ref.FP_FRM:
+                raise SimError(
+                    f"csrwi frm, {machine.frm}: rvv_ref's reference model "
+                    f"implements round-to-nearest-even only")
+        elif mnemonic in ("flw", "fld", "fsw", "fsd"):
+            # Raw bit moves: no canonicalisation, no host float anywhere, so
+            # a signalling NaN or a -0.0 survives the round trip.
+            width = 4 if mnemonic[-1] == "w" else 8
+            m = re.fullmatch(r"(-?\d+)\((\w+)\)", ops[1])
+            if not m:
+                raise SimError(f"bad memory operand: {ops[1]!r}")
+            addr = x[_reg(m.group(2))] + int(m.group(1))
+            if mnemonic[1] == "l":
+                machine.f[_freg(ops[0])] = machine.load(addr, width,
+                                                        signed=False)
+            else:
+                machine.store(addr, width, machine.f[_freg(ops[0])])
+        elif mnemonic.split(".")[0] in ("fmul", "fadd") and len(ops) == 3:
+            # Sail fp_mul / fp_add at frm: one exact operation, one rounding,
+            # canonical NaN out (spec 1870-1872, 1880-1886).  rvv_ref is the
+            # single authority, so the model here and the reference the
+            # directed program is judged against cannot drift apart.
+            op, suffix = mnemonic.split(".")
+            try:
+                width = _FP_WIDTH[suffix]
+            except KeyError:
+                raise SimError(f"{mnemonic} is not modelled") from None
+            fn = rvv_ref.fp_mul if op == "fmul" else rvv_ref.fp_add
+            machine.f[_freg(ops[0])] = fn(machine.f[_freg(ops[1])],
+                                          machine.f[_freg(ops[2])], width)
         elif mnemonic == ".insn":
             _ime(machine, int(ops[1], 0))
         else:
@@ -477,8 +549,16 @@ _MACC_W = {"vmmacc.vv": 1, "vwmmacc.vv": 2,
 _TILE_LS = {"vmtl.v": False, "vmts.v": False,
             "vmttl.v": True, "vmtts.v": True}
 
+#: Floating-point multiply-accumulate mnemonic -> widening factor W.  Round
+#: four implements the W=1 entry only; the widening FP forms are absent
+#: rather than present-and-approximate, so a program that reached one would
+#: raise SimError instead of quietly scoring itself against a model nobody
+#: derived.  See titan_runs/round4_design.md.
+_FP_MACC_W = {"vfmmacc.vv": 1}
 
-def _geometry(machine: Machine, w: int = 1) -> TileGeometry:
+
+def _geometry(machine: Machine, w: int = 1,
+              kind: str = "int") -> TileGeometry:
     """Decode vtype into a tile geometry.
 
     *w* comes from the *instruction*, not from vtype: vtype.SEW is the C
@@ -489,7 +569,38 @@ def _geometry(machine: Machine, w: int = 1) -> TileGeometry:
     SEW-wide storage elements and never look inside a packed element.
     """
     return TileGeometry(machine.vlen, machine.sew, machine.lam,
-                        machine.lmul, machine.vl, w)
+                        machine.lmul, machine.vl, w, "op", kind)
+
+
+def _fp_step(acc: int, a: int, b: int, width: int) -> int:
+    """One k of the floating-point accumulation, at rnd=frm.
+
+    Split out of :func:`_ime` so that
+    :func:`check_fp_rounding_is_load_bearing` can substitute the rnd=xct
+    step -- a fused multiply-add -- and show that the directed programs
+    actually distinguish the two.  Round-group-sum and accumulation both
+    round under frm (Sail 5259-5264 with ``round_group_sum`` returning
+    ``Some``), which is two roundings, not one.
+    """
+    return rvv_ref.fp_add(acc, rvv_ref.fp_mul(a, b, width), width)
+
+
+def _fp_step_fused(acc: int, a: int, b: int, width: int) -> int:
+    """The rnd=xct step: one rounding, over the exact product.
+
+    Sail 5262-5263, ``None() => acc = fp_add_internal(acc, S, ...)``.  Not
+    what Titan discloses, and only used by the negative control.
+    """
+    ka, sa, va = rvv_ref.fp_unpack(a, width)
+    kb, sb, vb = rvv_ref.fp_unpack(b, width)
+    kc, sc, vc = rvv_ref.fp_unpack(acc, width)
+    if "num" != ka or "num" != kb or "num" != kc:
+        return _fp_step(acc, a, b, width)      # specials: no difference here
+    product = (-va if sa else va) * (-vb if sb else vb)
+    total = (-vc if sc else vc) + product
+    if total == 0:
+        return 0
+    return rvv_ref.fp_round(1 if total < 0 else 0, abs(total), width)
 
 
 def _ime(machine: Machine, word: int) -> None:
@@ -534,6 +645,41 @@ def _ime(machine: Machine, word: int) -> None:
                              machine.load(addr, width, signed=False))
             else:
                 machine.store(addr, width, machine.vget(reg, flat_idx, sew))
+        return
+
+    if name in _FP_MACC_W:
+        # Sail fp_gemm (5243-5268) at the Titan disclosure
+        # G=1, psm=0, rnd=frm -- see rvv_ref.FP_DISCLOSURE and
+        # rvv_ref.fp_gemm_reference, which is the single authority for the
+        # arithmetic so that this model and the reference the directed
+        # program is judged against cannot drift apart.
+        #
+        # With W=1 and G=1, the `step` and `g0` loops of fp_gemm enumerate
+        # k = 0 .. K_eff-1 in strictly increasing order and each group is a
+        # single product, so the whole body is
+        #
+        #     acc = fp_add(acc, fp_round_to_frm(fp_mul_exact(a, b)))
+        #
+        # per k.  The geometry, the flat indices and the tail-column policy
+        # are character-for-character the integer ones: decode_gemm_geometry
+        # is format-agnostic (spec 1500, Sail 4884-4912), and mat_A_idx /
+        # mat_B_idx / mat_C_idx are shared.
+        geom = _geometry(machine, _FP_MACC_W[name], kind="fp")
+        geom.validate()
+        vd, vs1, vs2 = fields["vd"], fields["vs1"], fields["vs2"]
+        for i in range(geom.m):
+            for j in range(geom.n):
+                c_flat = rvv_ref.c_element_index(i, j, geom)
+                acc = machine.vget(vd, c_flat, sew)
+                for k in range(geom.k_eff):
+                    a = machine.vget(vs1,
+                                     rvv_ref.ab_element_index(i, k, geom),
+                                     sew)
+                    b = machine.vget(vs2,
+                                     rvv_ref.ab_element_index(j, k, geom),
+                                     sew)
+                    acc = _fp_step(acc, a, b, sew)
+                machine.vset(vd, c_flat, sew, acc)
         return
 
     if name not in _MACC_W:
@@ -595,8 +741,9 @@ def check_negative_control(geom: TileGeometry) -> None:
     def sabotage(machine: Machine, word: int) -> None:
         original(machine, word)
         name, fields = ime.decode(word)
-        if name in _MACC_W:
-            g = _geometry(machine, _MACC_W[name])
+        if name in _MACC_W or name in _FP_MACC_W:
+            g = (_geometry(machine, _FP_MACC_W[name], kind="fp")
+                 if name in _FP_MACC_W else _geometry(machine, _MACC_W[name]))
             index = rvv_ref.c_element_index(1 % g.m, 0, g)
             machine.vset(fields["vd"], index, machine.sew,
                          machine.vget(fields["vd"], index, machine.sew) ^ 1)
@@ -644,10 +791,45 @@ def check_transposing_is_load_bearing(vlen: int = 256) -> None:
         _TILE_LS.update(original)
 
 
+def check_fp_rounding_is_load_bearing(vlen: int = 256) -> None:
+    """A rnd=xct implementation must fail every floating-point program.
+
+    The floating-point tier's whole claim to be an exact test rests on the
+    Titan disclosure (rvv_ref.FP_DISCLOSURE: G=1, psm=0, rnd=frm).  If the
+    directed programs could not tell that apart from the other legal
+    disclosures, "exact bitwise compare" would be decoration: the DUT could
+    fuse the multiply-add -- the single most likely thing an FP MAC array
+    does -- and still be green.
+
+    So: substitute the rnd=xct step into the model and require every
+    geometry to fail.  Every one, not merely some, because a geometry whose
+    programs could not distinguish the two disclosures would be dead weight
+    in the tier and should be found now rather than believed later.
+    """
+    global _fp_step
+    original = _fp_step
+    _fp_step = _fp_step_fused
+    try:
+        checked = 0
+        for geom in rvv_ref.ime_legal_configs(vlen, full_vl_only=True,
+                                              kinds=("fp",)):
+            if geom.emul_c == 16 or not _allocatable(geom):
+                continue
+            code, output = simulate(geom, seed=0)
+            assert code != ime_tests.EXIT_PASS and "TITAN FAIL" in output, (
+                f"{geom.describe()}: a fused (rnd=xct) multiply-accumulate "
+                f"went undetected -- this geometry cannot distinguish the "
+                f"disclosed rounding and does not belong in the tier")
+            checked += 1
+        assert checked, "no floating-point geometry was checked"
+    finally:
+        _fp_step = original
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256)
-    parser.add_argument("--emit", metavar="SEW,LAMBDA,LMUL,N[,W][,op|t]",
+    parser.add_argument("--emit", metavar="SEW,LAMBDA,LMUL,N[,W][,op|t][,int|fp]",
                         help="run one geometry and print its output")
     parser.add_argument("--seeds", type=int, default=3,
                         help="random cases per geometry")
@@ -655,12 +837,14 @@ def main() -> int:
 
     if args.emit:
         toks = args.emit.split(",")
-        tload = "op"
+        tload, kind = "op", "int"
+        if toks[-1] in ("int", "fp"):
+            kind = toks.pop()
         if toks[-1] in ("op", "t"):
             tload = toks.pop()
         sew, lam, lmul, n, *rest = (int(t) for t in toks)
         geom = TileGeometry(args.vlen, sew, lam, lmul, n * lam * lmul,
-                            rest[0] if rest else 1, tload)
+                            rest[0] if rest else 1, tload, kind)
         code, output = simulate(geom)
         print(f"{geom.describe()}\nexit={code}\n{output}")
         return 0 if code == ime_tests.EXIT_PASS else 1
@@ -698,17 +882,29 @@ def main() -> int:
     controls += [g for g in rvv_ref.ime_legal_configs(
         args.vlen, full_vl_only=True, tloads=("t",))
         if g.emul_c != 16 and _allocatable(g) and g.m > 1][:1]
+    # ... and one of each round-four accumulator width.  A floating-point
+    # program has a second way to be vacuously green that the integer tiers
+    # do not: if both paths agreed on a wrong rounding they would still
+    # compare equal, so the control corrupts the *model* and checks the
+    # scalar reference disagrees with it.
+    for sew in sorted(rvv_ref.FP_FORMATS):
+        controls += [g for g in rvv_ref.ime_legal_configs(
+            args.vlen, sews=(sew,), full_vl_only=True, kinds=("fp",))
+            if g.emul_c != 16 and _allocatable(g) and g.m > 1][:1]
     for control in controls:
         check_negative_control(control)
         print(f"  ok  check_negative_control  {control.describe()}")
     check_transposing_is_load_bearing(args.vlen)
     print("  ok  check_transposing_is_load_bearing")
+    check_fp_rounding_is_load_bearing(args.vlen)
+    print("  ok  check_fp_rounding_is_load_bearing")
 
     tally = {}
     for g in geometries:
-        tally[(g.w, g.tload)] = tally.get((g.w, g.tload), 0) + 1
-    breakdown = " + ".join(f"{n} W={w}/{tl}"
-                           for (w, tl), n in sorted(tally.items()))
+        key = (g.kind, g.w, g.tload)
+        tally[key] = tally.get(key, 0) + 1
+    breakdown = " + ".join(f"{n} {kind} W={w}/{tl}"
+                           for (kind, w, tl), n in sorted(tally.items()))
     print(f"\nVLEN={args.vlen}: {ran} program executions across "
           f"{len(geometries)} geometries ({breakdown}), "
           f"{len(failures)} failed")
@@ -730,6 +926,7 @@ def _every_geometry(vlen: int):
         yield from rvv_ref.ime_legal_configs(
             vlen, sews=rvv_ref.WIDENING_SEWS_BY_W[w], ws=(w,))
     yield from rvv_ref.ime_legal_configs(vlen, tloads=("t",))
+    yield from rvv_ref.ime_legal_configs(vlen, kinds=("fp",))
 
 
 def _allocatable(geom: TileGeometry) -> bool:
