@@ -50,6 +50,14 @@ GEM5_WORKLOAD_DIR = os.environ.get("BPE_GEM5_WORKLOAD_DIR", "/home/ray/workloads
 
 SEED_PREDICTOR = os.environ.get("BPE_SEED_PREDICTOR", "tage")
 SEED_SOURCE = f"predictors/{SEED_PREDICTOR}.hpp"
+# Shown to the design agent as a worked example of ahead-pipelining in HARCOM,
+# the technique every CBP-NG winner used to get a whole predictor into one
+# cycle. Read from the seed root; the prompt says so when it is missing.
+REFERENCE_SOURCE = os.environ.get("BPE_REFERENCE_SOURCE",
+                                  "predictors/gshareN_ahead.hpp")
+# One write-up per CBP-NG 2025 winning entry, in placing order (file names sort
+# 1_, 2_, 3_). Variant k of a generation is shown entry k+1.
+WINNER_DESIGNS_DIR = PROMPTS_DIR / "cbpng_winners"
 
 # -- trace budget ------------------------------------------------------------
 #
@@ -244,6 +252,11 @@ GEM5_RUN_TIMEOUT_S = int(os.environ.get("BPE_GEM5_RUN_TIMEOUT_S", "3600"))
 LLM_BACKEND = os.environ.get("BPE_LLM_BACKEND", "claude").lower()
 LLM_MODEL = os.environ.get("BPE_LLM_MODEL", "claude-opus-4-6")
 LLM_TIMEOUT_SECONDS = int(os.environ.get("BPE_LLM_TIMEOUT_SECONDS", "1800"))
+# Wall-clock budget for one design, across its JSON retries. The design agent
+# builds and tests in its container and took 30-96 min in generations 11-13;
+# a generation waits for its slowest design, so one runaway stalls it. 80 min
+# cut off two of three generation-15 designs mid-exploration; 120 from gen 16.
+DESIGN_BUDGET_SECONDS = int(os.environ.get("BPE_DESIGN_BUDGET_SECONDS", "7200"))
 LLM_EXTRA_CLI_ARGS = ["--effort", "max"]
 LLM_RESOURCE = float(os.environ.get("BPE_LLM_RESOURCE", "1.0"))
 CLAUDE_PROJECTS_DIR = os.environ.get(

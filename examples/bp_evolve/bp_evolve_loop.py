@@ -78,7 +78,10 @@ def split_traces(all_traces: list[str], *, inner: int, held_out_fraction: float,
     # Hold out a quarter, but never so many that the inner loop is left empty:
     # a sweep with no inner traces would run, score nothing, and report an
     # empty archive as though the search had failed.
-    n_held = min(max(1, int(len(traces) * held_out_fraction)), len(traces) - 1)
+    # A fraction of 0 is the explicit choice to score on every trace and give
+    # up the held-out check, not a rounding accident, so it holds out nothing.
+    n_held = (0 if held_out_fraction <= 0 else
+              min(max(1, int(len(traces) * held_out_fraction)), len(traces) - 1))
     held_out = traces[:n_held]
     rest = traces[n_held:]
     return rest[:inner], rest, held_out
@@ -243,6 +246,12 @@ def run_sweep(args) -> int:
         print(f"seed predictor not found: {seed_path}", file=sys.stderr)
         return 2
     seed_source = open(seed_path).read()
+    ref_path = os.path.join(seed_root, C.REFERENCE_SOURCE)
+    reference_source = (open(ref_path).read()
+                        if os.path.exists(ref_path) else "")
+    winner_designs = [open(os.path.join(C.WINNER_DESIGNS_DIR, f)).read()
+                      for f in sorted(os.listdir(C.WINNER_DESIGNS_DIR))
+                      if f.endswith(".md")]
 
     all_traces = resolve_traces(args.trace_dir, args.host_trace_dir)
     if not all_traces:
@@ -334,6 +343,15 @@ def run_sweep(args) -> int:
             print(f"[gen 0] seed VFS {ev.fitness:.4f}  {ev.feedback.splitlines()[1].strip()}")
             db.snapshot_archive(0, archive)
 
+        # A resumed archive scored on a different trace set is re-scored on
+        # this one before anything is compared against it: VFS on 126 traces
+        # and VFS on 168 are two different numbers, and a variant beating an
+        # elite measured on the other set would be beating the trace sample.
+        if args.resume_archive and any(e.n_traces != len(inner)
+                                       for e in archive.elites):
+            archive = _rescore_archive(archive, inner, cbp_node, args)
+            db.snapshot_archive(resume_from - 1, archive)
+
         last_feedback: dict[str, str] = {}
         offline_args: dict[str, dict] = {}
         # Survives across generations: everything the port-fidelity gate needs.
@@ -387,50 +405,106 @@ def run_sweep(args) -> int:
             # instructions -- around ten minutes during which fifteen slots had
             # nothing to do.  Concurrent variants fill them, and the builds
             # (~8 s each) stop being serialised behind the scoring as well.
-            proposals = []
+            # The offline arm draws a parent and then its mutation from the
+            # same rng, interleaved, and must keep that order to replay earlier
+            # sweeps. The design arm draws its parents first and sends the
+            # design calls out together. Each variant gets its own LLM session
+            # (reused by its repair rounds): one resumed session cannot take
+            # concurrent calls, and a session carried across variants
+            # hill-climbs in its context instead of in the archive
+            # (agents.make_llm).
+            #
+            # Variant k of the design arm is also given the write-up of the
+            # CBP-NG 2025 entry that placed k+1 (cycled if K > 3): one worked
+            # design per variant, so the three do not all start from the same
+            # idea.
+            drawn, outcomes, vllms = [], [], {}
+
+            def _one(vid, parent, k=0):
+                return _propose(
+                    args.arm, vllms.get(vid), parent, archive, rng,
+                    feedback=last_feedback.get(parent.variant_id, ""),
+                    generation=gen, vid=vid,
+                    offline_args=offline_args.get(parent.variant_id),
+                    reference_source=reference_source,
+                    winner_design=(winner_designs[k % len(winner_designs)]
+                                if winner_designs else ""))
+
             for k in range(args.variants_per_generation):
                 parent = archive.select_parent(rng)
                 if parent is None:
                     break
                 vid = f"gen{gen:03d}_{k}"
-                try:
-                    proposal = _propose(
-                        args.arm, llm, parent, archive, rng,
-                        feedback=last_feedback.get(parent.variant_id, ""),
-                        generation=gen, vid=vid,
-                        offline_args=offline_args.get(parent.variant_id))
-                except agents.AgentError as e:
-                    print(f"[gen {gen}] {vid}: agent failed: {e}")
-                    continue
-
-                variant = Variant(
+                drawn.append((vid, parent))
+                if args.arm == "offline":
+                    try:
+                        outcomes.append(_one(vid, parent))
+                    except agents.AgentError as e:
+                        outcomes.append(e)
+                else:
+                    vllms[vid] = agents.make_llm(f"bp_evolve_design_{vid}")
+            def _variant_of(vid, parent, proposal):
+                v = Variant(
                     variant_id=vid, struct_name=proposal["struct_name"],
                     harcom_source=proposal["source"], parent_id=parent.variant_id,
                     generation=gen, rationale=proposal["rationale"],
                     template_args=proposal.get("template_args", ""))
                 if args.arm == "offline":
                     offline_args[vid] = proposal["args"]
-                proposals.append((vid, variant, parent))
+                return v
 
+            def _score(vid, variant, parent):
+                try:
+                    return _evaluate_core(
+                        variant, cbp_node=cbp_node, traces=inner,
+                        archive=archive, parent=parent,
+                        llm=vllms.get(vid, llm), cbp_root=args.cbp_root)
+                except Exception as e:   # one variant must not sink the
+                    # generation; the others already ran.
+                    print(f"[gen {gen}] {vid}: evaluation raised: "
+                          f"{type(e).__name__}: {e}")
+                    return None
+
+            def _design_then_score(vid, parent, k):
+                # A design call can take an hour; a variant starts scoring the
+                # moment its own design is back instead of waiting for the
+                # slowest of the generation, so the cbp_ng slots do not idle.
+                try:
+                    proposal = _one(vid, parent, k)
+                except agents.AgentError as e:
+                    print(f"[gen {gen}] {vid}: agent failed: {e}")
+                    return None
+                variant = _variant_of(vid, parent, proposal)
+                print(f"[gen {gen}] {vid}: designed, scoring")
+                return (vid, variant, parent), _score(vid, variant, parent)
+
+            proposals: list = []
             cores: list = []
-            if proposals:
+            if args.arm == "offline":
+                for (vid, parent), proposal in zip(drawn, outcomes):
+                    if isinstance(proposal, Exception):
+                        print(f"[gen {gen}] {vid}: agent failed: {proposal}")
+                        continue
+                    proposals.append(
+                        (vid, _variant_of(vid, parent, proposal), parent))
+                if proposals:
+                    with futures.ThreadPoolExecutor(
+                            max_workers=len(proposals),
+                            thread_name_prefix=f"gen{gen:03d}") as pool:
+                        futs = [pool.submit(_score, vid, variant, parent)
+                                for vid, variant, parent in proposals]
+                        cores = [f.result() for f in futs]
+            elif drawn:
                 with futures.ThreadPoolExecutor(
-                        max_workers=len(proposals),
+                        max_workers=len(drawn),
                         thread_name_prefix=f"gen{gen:03d}") as pool:
-                    futs = [
-                        pool.submit(
-                            _evaluate_core, variant, cbp_node=cbp_node,
-                            traces=inner, archive=archive, parent=parent,
-                            llm=llm, cbp_root=args.cbp_root)
-                        for _vid, variant, parent in proposals]
-                    for (vid, _v, _p), fut in zip(proposals, futs):
-                        try:
-                            cores.append(fut.result())
-                        except Exception as e:   # one variant must not sink the
-                            # generation; the others already ran.
-                            print(f"[gen {gen}] {vid}: evaluation raised: "
-                                  f"{type(e).__name__}: {e}")
-                            cores.append(None)
+                    futs = [pool.submit(_design_then_score, vid, parent, k)
+                            for k, (vid, parent) in enumerate(drawn)]
+                    for f in futs:
+                        r = f.result()
+                        if r is not None:
+                            proposals.append(r[0])
+                            cores.append(r[1])
 
             for (vid, _variant, parent), core in zip(proposals, cores):
                 if core is None:
@@ -462,8 +536,49 @@ def run_sweep(args) -> int:
     return 0
 
 
+def _rescore_archive(archive: Archive, traces, cbp_node, args) -> Archive:
+    """Every elite rebuilt from its source and re-run on ``traces``.
+
+    Returns a fresh archive: the cells are re-derived too, because EPI and the
+    latencies move with the trace set and an elite can change band. Two elites
+    landing in one cell keep the better, as any insertion would; one that no
+    longer builds or runs is dropped and said so.
+    """
+    old = archive.elites
+    print(f"re-scoring {len(old)} resumed elites on {len(traces)} traces "
+          f"(scored on {sorted({e.n_traces for e in old})})", flush=True)
+    fresh = Archive(archive.epi_edges, archive.p1_bins, archive.p2_bins)
+
+    def one(e):
+        variant = Variant(
+            variant_id=e.variant_id, struct_name=e.struct_name,
+            harcom_source=e.source, parent_id=e.parent_id,
+            generation=e.generation, template_args=e.template_args,
+            rationale=f"re-score on {len(traces)} traces")
+        outcomes, artifacts = build_fn(
+            variant, [Tier.CBP_NG], cbp_node=cbp_node, cbp_root=args.cbp_root)
+        if Tier.CBP_NG in artifacts:
+            outcomes[Tier.CBP_NG] = run_fn_tier0(
+                variant, artifacts[Tier.CBP_NG], traces, cbp_node=cbp_node)
+        return e, Evaluation(variant=variant, tiers=outcomes)
+
+    with futures.ThreadPoolExecutor(max_workers=max(1, len(old))) as pool:
+        done = [f.result() for f in [pool.submit(one, e) for e in old]]
+    for e, ev in done:            # archive order, so ties resolve as before
+        ev = result_mapper_fn(ev, fresh, None)
+        if ev.fitness is None:
+            print(f"  {e.variant_id}: dropped ({ev.failure.value})", flush=True)
+            continue
+        print(f"  {e.variant_id}: VFS {e.vfs:.4f} -> {ev.fitness:.4f}"
+              f"{'' if ev.archived else '  (lost its cell)'}", flush=True)
+    b = fresh.best()
+    print(f"re-scored: {len(fresh)} cells, best "
+          f"{b.variant_id if b else '-'} VFS {b.vfs if b else 0:.4f}", flush=True)
+    return fresh
+
+
 def _propose(arm, llm, parent, archive, rng, *, feedback, generation, vid,
-             offline_args):
+             offline_args, reference_source="", winner_design=""):
     """One proposal from whichever arm is active."""
     if arm == "offline":
         p = agents.offline_design(parent.source, parent.struct_name, rng,
@@ -476,7 +591,8 @@ def _propose(arm, llm, parent, archive, rng, *, feedback, generation, vid,
         llm, parent_source=parent.source,
         parent_summary=parent.summary(),
         archive_summary=_archive_summary(archive),
-        feedback=feedback, generation=generation)
+        feedback=feedback, generation=generation,
+        reference_source=reference_source, winner_design=winner_design)
 
 
 def _parse_template_args(text: str) -> dict | None:

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -369,6 +370,7 @@ class ClaudeCodeLLM(LLMCallBase):
         max_tool_iterations: int = 100,
         dangerously_skip_permissions: bool = True,
         config=UNSET,
+        retry_on_timeout: bool = True,
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
@@ -377,6 +379,9 @@ class ClaudeCodeLLM(LLMCallBase):
         self.logging_name = logging_name
         self.retries = retries
         self.timeout_seconds = timeout_seconds
+        # False makes timeout_seconds a hard wall-clock cap on the call: a
+        # timed-out attempt is not resumed and retried.
+        self.retry_on_timeout = retry_on_timeout
         self.model = model
         self.extra_cli_args = extra_cli_args or []
         self.logger = logging.getLogger(logging_name)
@@ -547,6 +552,8 @@ class ClaudeCodeLLM(LLMCallBase):
                 self.logger.warning(
                     "Timeout on attempt %d/%d", attempt + 1, self.retries,
                 )
+                if not getattr(self, "retry_on_timeout", True):
+                    break
 
             except Exception as exc:
                 self.logger.warning(
@@ -907,6 +914,9 @@ class ClaudeCodeLLM(LLMCallBase):
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            # its own process group, so a timeout can take down the tool
+            # subprocesses (builds, test runs) that hold our pipes open
+            start_new_session=True,
         )
 
         proc.stdin.write(user_message)
@@ -948,7 +958,21 @@ class ClaudeCodeLLM(LLMCallBase):
         t1.start()
         t2.start()
 
-        proc.wait()
+        try:
+            proc.wait(timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            # The capture path gets this from subprocess.run; the streaming
+            # path had no timeout at all, so a runaway session never ended.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+            log_file.write(f"[timeout] killed after {self.timeout_seconds}s\n")
+            log_file.close()
+            raise
         t1.join()
         t2.join()
 

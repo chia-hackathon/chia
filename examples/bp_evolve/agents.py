@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import time
 from string import Template
 
 from chia.base.ChiaFunction import get
@@ -105,6 +106,7 @@ def make_llm(logging_name: str = "bp_evolve_agent", *, resume_session: bool = Tr
         resume_session=resume_session,
         projects_cwd=C.CLAUDE_PROJECTS_DIR,
         extra_cli_args=list(C.LLM_EXTRA_CLI_ARGS),
+        retry_on_timeout=False,
     )
 
 
@@ -115,10 +117,19 @@ def _ask(llm, prompt: str, tools: list | None = None) -> QueryResult:
     )
 
 
-def _ask_json(llm, prompt: str, validate, tools=None, retries: int = 2) -> dict:
+def _ask_json(llm, prompt: str, validate, tools=None, retries: int = 2,
+              budget_seconds: float | None = None) -> dict:
     """Ask, parse, validate; on failure re-ask with the reason appended."""
     last = ""
+    deadline = time.monotonic() + budget_seconds if budget_seconds else None
     for attempt in range(retries + 1):
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left < 60:
+                raise AgentError(f"design budget of {budget_seconds:.0f}s spent: {last}")
+            # The llm travels to the worker with each call, so this is the
+            # cap the CLI subprocess runs under.
+            llm.timeout_seconds = int(left)
         text = prompt if attempt == 0 else (
             f"{prompt}\n\n---\nYour previous reply was rejected: {last}\n"
             f"Reply with ONLY the JSON object, matching the schema exactly.")
@@ -165,6 +176,7 @@ def _validate_source_reply(obj: dict, key: str = "source") -> tuple[bool, str]:
 
 def design(llm, *, parent_source: str, parent_summary: dict,
            archive_summary: str, feedback: str, generation: int,
+           reference_source: str = "", winner_design: str = "",
            tools=None) -> dict:
     """Propose one new predictor by editing a parent's HARCOM source.
 
@@ -179,8 +191,14 @@ def design(llm, *, parent_source: str, parent_summary: dict,
         ARCHIVE=archive_summary,
         FEEDBACK=feedback or "(this is the first variant from this parent)",
         GENERATION=str(generation),
+        REFERENCE_SOURCE=reference_source or "// (reference not available)",
+        WINNER_DESIGN=winner_design or "(no winning design to show)",
     )
-    return _ask_json(llm, prompt, _validate_source_reply, tools)
+    try:
+        return _ask_json(llm, prompt, _validate_source_reply, tools,
+                         budget_seconds=C.DESIGN_BUDGET_SECONDS)
+    finally:
+        llm.timeout_seconds = C.LLM_TIMEOUT_SECONDS   # repairs keep the default
 
 
 def repair(llm, *, source: str, struct_name: str, diagnostics: str,
