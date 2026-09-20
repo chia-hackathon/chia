@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as futures
 import datetime
+import json
 import os
 import random
 import sys
@@ -418,9 +419,19 @@ def run_sweep(args) -> int:
             # CBP-NG 2025 entry that placed k+1 (cycled if K > 3): one worked
             # design per variant, so the three do not all start from the same
             # idea.
+            #
+            # --serial-variants runs them one at a time instead.  Nothing about
+            # the archive changes; what it buys is that one LLM session is open
+            # at a time, which is what an account's session limit counts.
             drawn, outcomes, vllms = [], [], {}
 
             def _one(vid, parent, k=0):
+                pre = _preloaded_design(args.preloaded_designs, vid)
+                if pre is not None:
+                    print(f"[gen {gen}] {vid}: preloaded design "
+                          f"(struct {pre['struct_name']}); no agent call",
+                          flush=True)
+                    return pre
                 return _propose(
                     args.arm, vllms.get(vid), parent, archive, rng,
                     feedback=last_feedback.get(parent.variant_id, ""),
@@ -489,14 +500,15 @@ def run_sweep(args) -> int:
                         (vid, _variant_of(vid, parent, proposal), parent))
                 if proposals:
                     with futures.ThreadPoolExecutor(
-                            max_workers=len(proposals),
+                            max_workers=(1 if args.serial_variants
+                                         else len(proposals)),
                             thread_name_prefix=f"gen{gen:03d}") as pool:
                         futs = [pool.submit(_score, vid, variant, parent)
                                 for vid, variant, parent in proposals]
                         cores = [f.result() for f in futs]
             elif drawn:
                 with futures.ThreadPoolExecutor(
-                        max_workers=len(drawn),
+                        max_workers=(1 if args.serial_variants else len(drawn)),
                         thread_name_prefix=f"gen{gen:03d}") as pool:
                     futs = [pool.submit(_design_then_score, vid, parent, k)
                             for k, (vid, parent) in enumerate(drawn)]
@@ -593,6 +605,29 @@ def _propose(arm, llm, parent, archive, rng, *, feedback, generation, vid,
         archive_summary=_archive_summary(archive),
         feedback=feedback, generation=generation,
         reference_source=reference_source, winner_design=winner_design)
+
+
+def _preloaded_design(dirpath: str | None, vid: str) -> dict | None:
+    """A design written out by hand instead of asked for, or None.
+
+    What this is for: a generation whose designs came back but whose scoring
+    was interrupted.  The agent call is the scarce half -- it takes an hour and
+    it is what an account's session limit counts -- so a variant whose design
+    survives in the transcript is re-scored from that design rather than
+    re-proposed.  Validated on the same path a reply is, because a file edited
+    by hand is no more trustworthy than a model's JSON.
+    """
+    if not dirpath:
+        return None
+    path = os.path.join(dirpath, f"{vid}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        obj = json.load(fh)
+    ok, why = agents._validate_source_reply(obj)
+    if not ok:
+        raise agents.AgentError(f"{path}: {why}")
+    return obj
 
 
 def _parse_template_args(text: str) -> dict | None:
@@ -1389,6 +1424,21 @@ def main(argv=None) -> int:
     p.add_argument("--generations", type=int, default=C.GENERATIONS)
     p.add_argument("--variants-per-generation", type=int,
                    default=C.VARIANTS_PER_GENERATION)
+    p.add_argument("--preloaded-designs", default=None, metavar="DIR",
+                   help="DIR/<variant id>.json is used as that variant's "
+                        "design instead of calling the agent (same three "
+                        "fields a reply has, same validation). For re-scoring "
+                        "a generation whose designs came back but whose run "
+                        "was interrupted: the agent call is the hour, the "
+                        "scoring is the CPU. Design arm only.")
+    p.add_argument("--serial-variants", action="store_true",
+                   help="run the generation's K variants one at a time instead "
+                        "of concurrently. The archive still sees them in "
+                        "proposal order, so the sweep is unchanged -- what "
+                        "changes is that only one LLM session is open at a "
+                        "time, which is what a per-account session limit "
+                        "counts. Costs the overlap: a generation takes the sum "
+                        "of the K design+score times rather than the longest.")
     p.add_argument("--inner-traces", type=int, default=C.INNER_TRACES)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cbp-root", default=C.CBP_NG_ROOT,
@@ -1459,6 +1509,9 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     if args.tune_bounds and args.bounds_rule is not None:
         p.error("--tune-bounds and --bounds-rule are two arms; pick one")
+    if args.preloaded_designs and args.arm == "offline":
+        p.error("--preloaded-designs is the design arm's; the offline arm's "
+                "proposals are a seeded draw and replay for free")
 
     if args.selftest:
         return selftest(args)
