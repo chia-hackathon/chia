@@ -489,8 +489,35 @@ def run_sweep(args) -> int:
                 print(f"[gen {gen}] {vid}: designed, scoring")
                 return (vid, variant, parent), _score(vid, variant, parent)
 
+            def _finish(vid, parent, core):
+                """Score one finished variant against the archive and record it.
+
+                Kept out of the phase above so that archive.add still happens on
+                this thread and in proposal order.
+                """
+                if core is None:
+                    return
+                ev, _v, rounds, scored = core
+                if not scored:
+                    ev = result_mapper_fn(ev, archive, parent)
+                db.record_evaluation(ev, rounds)
+                evaluations.append(ev)
+                last_feedback[vid] = ev.feedback
+
+                flag = ("ARCHIVED" if ev.archived else ev.failure.value)
+                score = f"{ev.fitness:.4f}" if ev.fitness is not None else "  --  "
+                print(f"[gen {gen}] {vid}: VFS {score}  {flag}"
+                      + (f"  (repairs: {rounds})" if rounds else ""), flush=True)
+
             proposals: list = []
             cores: list = []
+            # Under --serial-variants a variant is recorded the moment it is
+            # done rather than with the rest of the generation.  Completion
+            # order is proposal order there, so the archive sees exactly the
+            # same sequence; what changes is that a driver killed mid-generation
+            # costs the variants still running instead of all of them, which is
+            # how generation 26 lost two designs that had already been written.
+            record_now = args.serial_variants
             if args.arm == "offline":
                 for (vid, parent), proposal in zip(drawn, outcomes):
                     if isinstance(proposal, Exception):
@@ -505,7 +532,10 @@ def run_sweep(args) -> int:
                             thread_name_prefix=f"gen{gen:03d}") as pool:
                         futs = [pool.submit(_score, vid, variant, parent)
                                 for vid, variant, parent in proposals]
-                        cores = [f.result() for f in futs]
+                        for (vid, _v, parent), f in zip(proposals, futs):
+                            cores.append(f.result())
+                            if record_now:
+                                _finish(vid, parent, cores[-1])
             elif drawn:
                 with futures.ThreadPoolExecutor(
                         max_workers=(1 if args.serial_variants else len(drawn)),
@@ -517,21 +547,12 @@ def run_sweep(args) -> int:
                         if r is not None:
                             proposals.append(r[0])
                             cores.append(r[1])
+                            if record_now:
+                                _finish(r[0][0], r[0][2], r[1])
 
-            for (vid, _variant, parent), core in zip(proposals, cores):
-                if core is None:
-                    continue
-                ev, _v, rounds, scored = core
-                if not scored:
-                    ev = result_mapper_fn(ev, archive, parent)
-                db.record_evaluation(ev, rounds)
-                evaluations.append(ev)
-                last_feedback[vid] = ev.feedback
-
-                flag = ("ARCHIVED" if ev.archived else ev.failure.value)
-                score = f"{ev.fitness:.4f}" if ev.fitness is not None else "  --  "
-                print(f"[gen {gen}] {vid}: VFS {score}  {flag}"
-                      + (f"  (repairs: {rounds})" if rounds else ""))
+            if not record_now:
+                for (vid, _variant, parent), core in zip(proposals, cores):
+                    _finish(vid, parent, core)
 
             db.snapshot_archive(gen, archive)
             best = archive.best()
