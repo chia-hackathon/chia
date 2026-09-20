@@ -25,7 +25,10 @@ design in it. That means there are two ways to succeed:
 
 1. beat the design currently holding a cell, on VFS, at the same cost, or
 2. land in a cell nobody occupies — a different energy band or a different
-   latency pair is worth as much as a higher score.
+   latency pair is kept even at a lower score.
+
+Taking a cell keeps a design; it does not make it a good one. See "Where the
+remaining score is" below before choosing a target.
 
 Current archive:
 
@@ -84,11 +87,48 @@ Two consequences:
   per cycle. At 1.1 cycles it rounds to 2 and loses most of the gain.
 * Measured on the published entries, a 10% gain in throughput, MPI and EPI
   is worth about +2.4%, +1.4% and +0.2% VFS. Throughput dominates until the
-  predictor is already one cycle; past that point accuracy and energy matter.
+  predictor is already one cycle. Past that point it turns around: see
+  "Where the remaining score is" below, where the score peaks in throughput.
 
 `reg` values carry the time they were written. A RAM read launched in one
 block's `predict1` and latched into a `reg` is consumed by the next block
 300 ps later, and that is how a long table access is hidden.
+
+## Where the remaining score is: accuracy
+
+The archive's best designs are already at one cycle (or zero), so latency has
+little left to give. What they have not closed is accuracy.
+
+**VFS is peaked in throughput, and the front is already sitting on the peak.**
+`normalizedEPI` carries a `speedup^3.2` term, so past a certain throughput each
+extra block per cycle costs more energy than it earns back. Hold MPKI and EPI
+fixed and sweep T through the score itself: at MPKI 5.6 / EPI 362 the maximum
+is VFS 0.9875 at **T = 8.96**, and the current best design runs at T = 8.97.
+T = 9.4 scores 0.9863, T = 12 scores 0.9418. One generation lost all three of
+its designs by raising T from 8.8 to 9.2-9.6 while giving back 0.3 MPKI.
+
+The peak height is a function of **MPKI alone**: at MPKI 4.8 / EPI 524 the
+maximum is 0.9936 (at T = 8.59). No amount of throughput reaches it. So once
+you are at one cycle and near T = 9, stop buying throughput -- removing stalls,
+lengthening blocks, dropping the true-block rule -- and buy accuracy. At that
+operating point (T about 9, EPI 200-500 fJ/inst), measured with the score
+itself:
+
+* **1 MPKI less is worth about +0.015 VFS.**
+* 100 fJ/inst less is worth about +0.0017 VFS, so one MPKI is worth
+  850-930 fJ/inst. Spending energy to buy accuracy pays until well past that.
+* The archive's best sit at 5.5-6.0 MPKI. MORSL reached 4.8 MPKI at 524 fJ/inst
+  and Fan 5.2 MPKI at 313 fJ/inst, both at one cycle. Closing that gap is worth
+  about +0.02 VFS, more than any cell in the archive has gained in a generation.
+
+So aim this design at a **lower MPKI at the same latency**. The levers that
+worked for the winners: more tagged tables and more, longer, better-spread
+history lengths; a corrector or loop/bias component for what TAGE gets wrong;
+better allocation and replacement; and ahead-pipelining the table reads so
+storage can grow without breaking the 300 ps cycle. A design that saves energy
+and gives back accuracy is almost always a worse design, even if it takes an
+empty or weakly held low-energy cell. In your rationale, report the MPKI you
+measured against your parent's on the same trace.
 
 ## What the CBP-NG 2025 winners did
 
@@ -156,6 +196,25 @@ transcribe: adapt what fits your parent, combine it with the techniques
 above, or take a different route.
 
 ${WINNER_DESIGN}
+
+## Building and testing before you reply
+
+A CBP-NG checkout is at `/home/ray/cbp-ng` (`harcom.hpp`, `cbp.cpp`,
+`cbp.hpp`, `predictors/`, and `gcc_test_trace.gz`). Copy it somewhere under
+`/tmp` to work in. The compiler is `x86_64-conda-linux-gnu-g++`, and zlib comes
+from the conda prefix, so the build line is:
+
+```
+x86_64-conda-linux-gnu-g++ -std=c++20 -O3 -Wall -Wextra -pedantic -Wold-style-cast \
+  -Werror -Wno-deprecated-declarations -Wno-mismatched-tags \
+  -I/home/ray/anaconda3/include -L/home/ray/anaconda3/lib \
+  -Wl,-rpath,/home/ray/anaconda3/lib -o cbp cbp.cpp -lz
+./cbp gcc_test_trace.gz gcc 1000000 40000000
+```
+
+Build and run your design on that trace before you reply. (If tool access is
+not available in your environment, carefully check your design against HARCOM rules
+and output the JSON object directly; the harness will compile and lint it).
 
 ## Reply
 

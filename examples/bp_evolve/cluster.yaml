@@ -167,6 +167,10 @@ available_node_types:
             run_options:
                 - "-v ${HOME}/.claude-bpevolve:/home/ray/.claude"
                 - "-e CLAUDE_CONFIG_DIR=/home/ray/.claude"
+                - "-v ${HOME}/.config/gcloud:/home/ray/.config/gcloud:ro"
+                - "-e GOOGLE_CLOUD_PROJECT=project-65f9e385-584e-47a2-906"
+                - "-e GOOGLE_CLOUD_LOCATION=global"
+                - "-e GOOGLE_APPLICATION_CREDENTIALS=/home/ray/.config/gcloud/application_default_credentials.json"
 
 # The head runs the driver, so its environment is the one that must have this
 # checkout's chia and a matching Ray (workers get chia shipped to them as Ray

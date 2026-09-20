@@ -261,8 +261,8 @@ LLM_EXTRA_CLI_ARGS = ["--effort", "max"]
 LLM_RESOURCE = float(os.environ.get("BPE_LLM_RESOURCE", "1.0"))
 CLAUDE_PROJECTS_DIR = os.environ.get(
     "BPE_CLAUDE_PROJECTS_DIR", "/home/ray/.claude/projects/-home-ray-llm-env")
-GEMINI_MODEL = os.environ.get("BPE_GEMINI_MODEL", "gemini-3.6-flash")
-VERTEX_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
+GEMINI_MODEL = os.environ.get("BPE_GEMINI_MODEL", "gemini-3.8-flash")
+VERTEX_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "project-65f9e385-584e-47a2-906")
 VERTEX_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 VERTEX_MAX_TOKENS = int(os.environ.get("BPE_VERTEX_MAX_TOKENS", "65536"))
 
