@@ -72,6 +72,16 @@ _FP_WIDTH = {"s": 32, "d": 64}
 _DIRECTIVE_WIDTH = {".byte": 1, ".half": 2, ".word": 4, ".dword": 8}
 
 
+class IllegalInstruction(Exception):
+    """The architecture says this instruction traps here.
+
+    Distinct from :class:`SimError`, which means *the model does not know*.
+    Conflating the two is how a legality tier ends up reporting "not
+    modelled" as "correctly rejected"; keeping them apart is what lets the
+    ``ime_mxl_`` programs be judged at all.
+    """
+
+
 class SimError(RuntimeError):
     """The program did something this interpreter refuses to guess about."""
 
@@ -105,6 +115,11 @@ class Machine:
     #: rounding mode argument threaded through rvv_ref.fp_round, which round
     #: four does not generate.  See rvv_ref.FP_FRM.
     frm: int = 0
+    #: M-mode trap state.  The ``ime_mxl_`` legality programs install their
+    #: own handler, so the model has to deliver a trap rather than abort.
+    mtvec: int = 0
+    mepc: int = 0
+    mcause: int = 0
     stdout: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -137,6 +152,19 @@ class Machine:
         reg, pos = base + index // per_reg, index % per_reg
         if reg > 31:
             raise SimError(f"vector group v{base} + {index} runs past v31")
+        if eew < 8:
+            # Sub-byte elements.  Round six is the first family to need
+            # them: vfqimmacc.vv at SEW=16 and vf8wimmacc.vv at SEW=32 have
+            # EEW_A = SEW/W = 4 (MXINT4).  Spec 1206-1219 fixes the packing
+            # -- two per byte, the *even* index in the LOW nibble -- and
+            # getting that order backwards silently transposes every pair of
+            # K elements, which reads as an arithmetic bug rather than a
+            # layout one.  Only eew=4 occurs; anything narrower would need a
+            # bit-addressed path and is rejected rather than guessed at.
+            if eew != 4:
+                raise SimError(f"EEW={eew} is not modelled")
+            byte = self.v[reg][pos // 2]
+            return (byte >> (4 * (pos % 2))) & 0xF
         width = eew // 8
         return int.from_bytes(self.v[reg][pos * width:(pos + 1) * width],
                               "little")
@@ -146,6 +174,13 @@ class Machine:
         reg, pos = base + index // per_reg, index % per_reg
         if reg > 31:
             raise SimError(f"vector group v{base} + {index} runs past v31")
+        if eew < 8:
+            if eew != 4:
+                raise SimError(f"EEW={eew} is not modelled")
+            shift = 4 * (pos % 2)
+            byte = self.v[reg][pos // 2] & ~(0xF << shift) & 0xFF
+            self.v[reg][pos // 2] = byte | ((value & 0xF) << shift)
+            return
         width = eew // 8
         self.v[reg][pos * width:(pos + 1) * width] = \
             _zext(value, eew).to_bytes(width, "little")
@@ -164,6 +199,38 @@ class Machine:
         offset, width = ime.VTYPE_IME_FIELDS["lambda"]
         code = (self.vtype >> (64 - offset)) & ((1 << width) - 1)
         return ime.LAMBDA_DECODING[code]
+
+    @property
+    def bs(self) -> int:
+        """vtype.bs -- the microscaling block size selector (spec 1160-1176).
+
+        An IME field, so it is keyed by offset below XLEN like `lambda`, and
+        like `lambda` it is unreachable from vsetvli: the emitted programs
+        write it through the register form.
+        """
+        offset, width = ime.VTYPE_IME_FIELDS["bs"]
+        return (self.vtype >> (64 - offset)) & ((1 << width) - 1)
+
+    @property
+    def altfmt(self) -> int:
+        """vtype.altfmt -- the C accumulator format selector.
+
+        NOT an IME field.  Spec 856-861 makes it the *base* altfmt defined by
+        Zvfbfa, which is keyed by an absolute lsb rather than by an offset
+        below XLEN; conflating the two keyings would silently read the wrong
+        bit at XLEN != 64.  See ime_encodings.VTYPE_BASE_FIELDS.
+        """
+        lsb, width = ime.VTYPE_BASE_FIELDS["altfmt"]
+        return (self.vtype >> lsb) & ((1 << width) - 1)
+
+    @property
+    def altfmt_ab(self) -> Tuple[int, int]:
+        """(vtype.altfmt_A, vtype.altfmt_B), the *input* format selectors."""
+        out = []
+        for name in ("altfmt_A", "altfmt_B"):
+            offset, width = ime.VTYPE_IME_FIELDS[name]
+            out.append((self.vtype >> (64 - offset)) & ((1 << width) - 1))
+        return out[0], out[1]
 
     @property
     def vlmax(self) -> int:
@@ -265,6 +332,17 @@ def assemble(source: str) -> Program:
 # execution
 # ---------------------------------------------------------------------------
 
+#: The M-mode CSRs the legality programs touch.  Deliberately a short list:
+#: anything else still raises "not modelled" rather than silently reading 0.
+_M_CSRS = ("mtvec", "mepc", "mcause")
+
+#: Bytes per instruction, for the one place a program observes a text
+#: address: mepc/mtvec in the ime_mxl_ legality tier.  Every IME and RVV
+#: instruction the generated programs emit is 4 bytes (no compressed
+#: encodings -- the harness assembles with plain rv64imafdv), so the mapping
+#: between this model's text index and the architectural address is exact.
+_TEXT_STRIDE = 4
+
 _MEM_WIDTH = {"lb": 1, "lh": 2, "lw": 4, "ld": 8,
               "lbu": 1, "lhu": 2, "lwu": 4,
               "sb": 1, "sh": 2, "sw": 4, "sd": 8}
@@ -314,17 +392,36 @@ def run(program: Program, machine: Machine, limit: int = 20_000_000) -> int:
         if pc >= len(program.text):
             raise SimError("fell off the end of .text")
         mnemonic, ops = program.text[pc]
+        faulting_pc = pc
         pc += 1
         x = machine.x
 
         if mnemonic == "li":
             x[_reg(ops[0])] = _sext(int(ops[1], 0), 64)
         elif mnemonic == "la":
-            x[_reg(ops[0])] = program.data[ops[1]]
+            if ops[1] in program.data:
+                x[_reg(ops[0])] = program.data[ops[1]]
+            elif ops[1] in program.labels:
+                # A *text* label -- the ime_mxl_ programs take the address of
+                # their trap handler.  This model steps a list of decoded
+                # instructions rather than bytes, so a text address is the
+                # index scaled by 4: the handler does `addi t0, t0, 4` on
+                # mepc to step over the faulting instruction, and that has to
+                # mean one instruction here too.  _TEXT_STRIDE is the single
+                # place that convention is written down.
+                x[_reg(ops[0])] = program.labels[ops[1]] * _TEXT_STRIDE
+            else:
+                raise SimError(f"la: unknown label {ops[1]!r}")
         elif mnemonic == "mv":
             x[_reg(ops[0])] = x[_reg(ops[1])]
         elif mnemonic == "add":
             x[_reg(ops[0])] = _sext(x[_reg(ops[1])] + x[_reg(ops[2])], 64)
+        elif mnemonic == "sub":
+            # Round six's int_to_fp bit-splice negates an exponent with
+            # `sub t1, x0, rs`; the tier is integer-only by construction, so
+            # this is the one scalar op it needed that rounds one to five
+            # never emitted.
+            x[_reg(ops[0])] = _sext(x[_reg(ops[1])] - x[_reg(ops[2])], 64)
         elif mnemonic == "addi":
             x[_reg(ops[0])] = _sext(x[_reg(ops[1])] + int(ops[2], 0), 64)
         elif mnemonic == "srli":
@@ -361,9 +458,21 @@ def run(program: Program, machine: Machine, limit: int = 20_000_000) -> int:
                 raise SimError(f"csrs {ops[0]} is not modelled")
             machine.mstatus |= x[_reg(ops[1])]
         elif mnemonic == "csrr":
-            if ops[1] != "vtype":
+            if ops[1] == "vtype":
+                x[_reg(ops[0])] = machine.vtype
+            elif ops[1] in _M_CSRS:
+                x[_reg(ops[0])] = getattr(machine, ops[1])
+            else:
                 raise SimError(f"csrr {ops[1]} is not modelled")
-            x[_reg(ops[0])] = machine.vtype
+        elif mnemonic == "csrw":
+            if ops[0] not in _M_CSRS:
+                raise SimError(f"csrw {ops[0]} is not modelled")
+            setattr(machine, ops[0], x[_reg(ops[1])])
+        elif mnemonic == "mret":
+            # The handler advances mepc past the faulting instruction itself
+            # (`addi t0, t0, 4`), so mepc already points where execution
+            # resumes.  See _TEXT_STRIDE.
+            pc = machine.mepc // _TEXT_STRIDE
         elif mnemonic in _MEM_WIDTH:
             width = _MEM_WIDTH[mnemonic]
             m = re.fullmatch(r"(-?\d+)\((\w+)\)", ops[1])
@@ -431,7 +540,19 @@ def run(program: Program, machine: Machine, limit: int = 20_000_000) -> int:
             machine.f[_freg(ops[0])] = fn(machine.f[_freg(ops[1])],
                                           machine.f[_freg(ops[2])], width)
         elif mnemonic == ".insn":
-            _ime(machine, int(ops[1], 0))
+            try:
+                _ime(machine, int(ops[1], 0))
+            except IllegalInstruction:
+                # Deliver an M-mode illegal-instruction trap (mcause 2) to
+                # the handler the program installed.  Without this the
+                # ime_mxl_ legality tier cannot be simulated at all, and an
+                # untestable tier is how a judge bug survives.
+                machine.mcause = 2
+                machine.mepc = faulting_pc * _TEXT_STRIDE
+                if not machine.mtvec:
+                    raise SimError(
+                        "illegal instruction with no handler installed")
+                pc = machine.mtvec // _TEXT_STRIDE
         else:
             raise SimError(f"unhandled instruction: {mnemonic} {ops}")
 
@@ -578,6 +699,17 @@ _TILE_LS = {"vmtl.v": False, "vmts.v": False,
 #: derived.  See titan_runs/round4_design.md.
 _FP_MACC_W = {"vfmmacc.vv": 1}
 
+#: Round six.  Microscaled integer-input, FP-accumulate mnemonic -> W.
+#:
+#: These ride the *integer* funct6 run: 0x39/0x3a/0x3b at vm=1 decode as
+#: vwmmacc.vv / vqmmacc.vv / v8wmmacc.vv and at vm=0 as these three (Sail
+#: 5963-5975, 6196-6205, 6082-6091).  ime_encodings.decode already resolves
+#: the vm split, so this table is keyed on the resolved mnemonic and the
+#: model never has to look at vm itself -- which is also why a decoder that
+#: mis-routed vm would show up here as the *wrong arithmetic*, not as an
+#: unknown instruction.
+_MX_MACC_W = {"vfwimmacc.vv": 2, "vfqimmacc.vv": 4, "vf8wimmacc.vv": 8}
+
 
 #: The three Sail index functions the model uses, held as rebindable module
 #: globals rather than called through ``rvv_ref.`` directly.  They are the
@@ -590,6 +722,34 @@ _FP_MACC_W = {"vfmmacc.vv": 1}
 _C_INDEX = rvv_ref.c_element_index
 _AB_INDEX = rvv_ref.ab_element_index
 _TILE_REG_IDX = rvv_ref.tile_reg_idx
+
+#: Round six's two sabotageable pieces, held as globals for the same reason.
+#: ``_MX_PAIR_INDEX`` is where the v0 paired-scale layout is decided
+#: (spec 2161-2170); ``_MX_BLOCK_DOT`` is where the Sail's "unbounded
+#: mathematical integer, no overflow" (5128-5130) is either honoured or
+#: quietly turned back into the round-one modular habit.  Those are the two
+#: mistakes this round is most likely to make.
+_MX_PAIR_INDEX = rvv_ref.mx_pair_index
+
+
+def _mx_block_dot(machine: Machine, vs1: int, vs2: int, i: int, j: int,
+                  k_lo: int, k_hi: int, geom: TileGeometry,
+                  eew_ab: int) -> int:
+    """Sail ``int_block_dot`` over one microscaling block, exactly.
+
+    Signed regardless of altfmt_A/altfmt_B: Sail 5397 passes the literals
+    ``true``/``true``.  No modular reduction anywhere -- that is the whole
+    difference from ``int_gemm``.
+    """
+    total = 0
+    for k in range(k_lo, k_hi + 1):
+        a = machine.vget(vs1, _AB_INDEX(i, k, geom), eew_ab)
+        b = machine.vget(vs2, _AB_INDEX(j, k, geom), eew_ab)
+        total += _sext(a, eew_ab) * _sext(b, eew_ab)
+    return total
+
+
+_MX_BLOCK_DOT = _mx_block_dot
 
 
 def _linear_c_index(i: int, j: int, geom: TileGeometry) -> int:
@@ -736,6 +896,106 @@ def _ime(machine: Machine, word: int) -> None:
                 machine.vset(vd, c_flat, sew, acc)
         return
 
+    if name in _MX_MACC_W:
+        # Sail int_scaled_gemm (5373-5410).  Two structural facts decide
+        # this block, and both are easy to get wrong in the direction of
+        # "looks plausible, is not the architecture":
+        #
+        #  * There is no G / psm / rnd here at all.  int_scaled_gemm never
+        #    calls get_fp_grouping / get_fp_psm / get_fp_rnd and has no G
+        #    legality check, unlike fp_gemm at 5238-5242; spec 1283-1287 and
+        #    1645-1652 state it in prose.  Nothing about the Titan FP
+        #    disclosure applies.
+        #  * The loop nest is j / i / s -- there is NO LMUL step loop.  The
+        #    block/step intersection and shortened groups of spec 2030-2060
+        #    belong to fp_scaled_gemm; int_block_dot here is handed the whole
+        #    block interval.  Pasting that logic in would be a model bug that
+        #    presents as an RTL bug.
+        #
+        # The arithmetic itself is delegated to rvv_ref so that this model
+        # and the reference the generated program is judged against cannot
+        # drift -- the same discipline the floating-point branch follows.
+        w = _MX_MACC_W[name]
+        # Every legality rule for this family lives in TileGeometry.validate
+        # and the rvv_ref helpers below, and every one of them corresponds to
+        # a place the Sail returns Illegal_Instruction -- reserved (W, SEW)
+        # cells, the microscaling constraints, the altfmt rules.  So a
+        # rejection here is a *trap*, not a gap in the model, and has to be
+        # delivered to the program's handler rather than aborting the run.
+        # The ime_mxl_ tier is entirely made of these cases.
+        try:
+            geom = _geometry(machine, w, kind="mx")
+            geom.validate()
+        except ValueError:
+            raise IllegalInstruction from None
+        altfmt = machine.altfmt
+        # Architectural legality, not model coverage: each of these is a
+        # place the Sail returns Illegal_Instruction, so each raises
+        # IllegalInstruction and the run loop delivers a trap.
+        try:
+            eew_ab, fmt = rvv_ref.mx_legal_cell(w, sew, altfmt)
+        except ValueError:
+            raise IllegalInstruction from None
+        if machine.altfmt_ab != (0, 0):
+            # MXINT is signed unconditionally; Sail 6045-6046 / 6162-6163 /
+            # 6277-6278 reject altfmt_A or altfmt_B = 1 outright.
+            raise IllegalInstruction
+        bs = machine.bs
+        try:
+            rvv_ref.mx_check_legality(w, geom.lmul, sew, geom.lam, bs)
+        except ValueError:
+            raise IllegalInstruction from None
+        block_size = rvv_ref.mx_block_size(bs)
+        blocks = rvv_ref.mx_block_count(geom.k_eff, block_size)
+        stride = rvv_ref.mx_scale_stride(sew, geom.lam)
+        vd, vs1, vs2 = fields["vd"], fields["vs1"], fields["vs2"]
+        if 0 in (vd, vs1, vs2) or \
+                any(r <= 0 < r + n for r, n in
+                    ((vd, geom.emul_c), (vs1, geom.lmul), (vs2, geom.lmul))):
+            # Prose Exceptions only -- absent from the Sail -- but a program
+            # that overlapped v0 would be reading its own scales as data,
+            # which is worth catching loudly rather than simulating.
+            raise SimError(
+                f"{name}: vd/vs1/vs2 register groups must not overlap v0, "
+                f"which holds the paired E8M0 block scales (spec 2129-2170)")
+
+        def scale_pair(m: int, s_idx: int) -> Tuple[int, int]:
+            """(scale_A byte, scale_B byte) from v0 at p = m*R + s.
+
+            Spec 2161-2170 and Sail 5110-5117: v0 is read at the *pair*
+            width, low byte scale_A and high byte scale_B.  A and B use the
+            same function of (row-or-column index, block index) out of the
+            same register; only the index they pass differs.
+            """
+            pair = machine.vget(0, _MX_PAIR_INDEX(m, s_idx, stride),
+                                rvv_ref.MX_PAIR_WIDTH)
+            return pair & 0xFF, (pair >> 8) & 0xFF
+
+        for j in range(geom.n):
+            for i in range(geom.m):
+                c_flat = _C_INDEX(i, j, geom)
+                acc = machine.vget(vd, c_flat, sew)
+                nan_out = False
+                for s_idx in range(blocks):
+                    a_byte, _ = scale_pair(i, s_idx)
+                    _, b_byte = scale_pair(j, s_idx)
+                    blk, is_nan = rvv_ref.mx_block_scale(a_byte, b_byte,
+                                                         sew, fmt)
+                    if is_nan:
+                        nan_out = True
+                        break          # Sail 5392
+                    k_lo, k_hi = rvv_ref.mx_block_interval(
+                        s_idx, block_size, geom.k_eff)
+                    dot = _MX_BLOCK_DOT(machine, vs1, vs2, i, j,
+                                        k_lo, k_hi, geom, eew_ab)
+                    fp_sum = rvv_ref.mx_int_to_fp(dot, sew, fmt)
+                    acc = rvv_ref.fp_add(
+                        acc, rvv_ref.fp_mul(blk, fp_sum, sew, fmt), sew, fmt)
+                machine.vset(vd, c_flat, sew,
+                             rvv_ref.fp_default_nan(sew, fmt) if nan_out
+                             else acc)
+        return
+
     if name not in _MACC_W:
         raise SimError(f"{name} is not modelled "
                        f"(implemented: {ime.IMPLEMENTED})")
@@ -782,6 +1042,13 @@ def simulate(geom: TileGeometry, seed: int = 0) -> Tuple[int, str]:
     """
     if geom.check == "clayout":
         program = assemble(ime_tests.emit_clayout_test(geom))
+    elif geom.kind == "mx":
+        # Round six.  Its operands are not a plain random_case: the tier
+        # rests on the result being exactly representable, so the plan has
+        # to choose bounds, scales and per-element modes together.  See
+        # ime_tests.mx_random_plan.
+        plan = ime_tests.mx_random_plan(geom, random.Random(seed))
+        program = assemble(ime_tests.emit_mx_test(plan))
     else:
         case = rvv_ref.random_case(geom, random.Random(seed))
         program = assemble(ime_tests.emit_test(geom, case))
@@ -1088,6 +1355,15 @@ def main() -> int:
     print("  ok  check_clayout_catches_transposed_c")
     check_linear_c_index_is_the_gap(args.vlen)
     print("  ok  check_linear_c_index_is_the_gap")
+    for check in (check_mx_scale_layout_is_load_bearing,
+                  check_mx_wrapping_is_unobservable_here,
+                  check_mx_nibble_order_is_load_bearing,
+                  check_mxl_tier,
+                  check_mxl_legality_is_load_bearing,
+                  check_round_seven_sub_byte_path,
+                  check_round_seven_sweep_is_not_yet_live):
+        check(args.vlen)
+        print(f"  ok  {check.__name__}")
 
     tally = {}
     for g in geometries:
@@ -1099,6 +1375,206 @@ def main() -> int:
           f"{len(geometries)} geometries ({breakdown}), "
           f"{len(failures)} failed")
     return 1 if failures else 0
+
+
+def check_mxl_tier(vlen: int = 256) -> None:
+    """The legality programs must pass against the reference model.
+
+    This tier is not geometry-driven -- ``emit_mxl_test`` takes a mnemonic,
+    not a ``TileGeometry`` -- so it is invisible to the sweep in
+    :func:`main`, and for a while it shipped with no meta-judge at all.
+    That mattered: when r19's Stage M reported two ``ime_mxl_`` failures
+    there was no way to tell a model defect from a judge bug without reading
+    the assembly by hand.  Running them here answers that question in one
+    command, and is why the model needs CSR and trap support at all.
+    """
+    for mnemonic in ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv"):
+        program = assemble(ime_tests.emit_mxl_test(vlen, mnemonic))
+        machine = Machine(vlen=vlen)
+        code = run(program, machine)
+        output = "".join(machine.stdout)
+        assert code == ime_tests.EXIT_PASS and "TITAN PASS" in output, (
+            f"ime_mxl_{mnemonic}: the legality tier does not pass against "
+            f"the reference model:\n{output.strip()}")
+
+
+def check_mxl_legality_is_load_bearing(vlen: int = 256) -> None:
+    """A model that accepts an illegal configuration must fail the tier.
+
+    Half of each ``ime_mxl_`` program asserts that something traps.  A model
+    that never raises would satisfy the other half and could look green if
+    the trap cases were mis-wired, so make the model permissive and require
+    every program to notice.
+
+    The sabotage targets the *model's* legality gate, not ``rvv_ref``'s
+    rules: rvv_ref is what the programs are judged against.
+    """
+    original = _ime
+
+    def permissive(machine, word):
+        try:
+            return original(machine, word)
+        except IllegalInstruction:
+            return None            # silently execute nothing, raise no trap
+
+    globals()["_ime"] = permissive
+    try:
+        caught = 0
+        for mnemonic in ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv"):
+            program = assemble(ime_tests.emit_mxl_test(vlen, mnemonic))
+            machine = Machine(vlen=vlen)
+            code = run(program, machine)
+            output = "".join(machine.stdout)
+            if code != ime_tests.EXIT_PASS and "TITAN FAIL" in output:
+                caught += 1
+        assert caught == 3, (
+            f"only {caught}/3 legality programs noticed a model that never "
+            f"raises illegal-instruction")
+    finally:
+        globals()["_ime"] = original
+
+
+def _mx_pool(vlen: int):
+    """The round-six geometries the sweep actually runs."""
+    return [g for g in rvv_ref.mx_legal_configs(vlen)
+            if g.emul_c != 16 and _allocatable(g)]
+
+
+def check_mx_scale_layout_is_load_bearing(vlen: int = 256) -> None:
+    """A model that transposes the v0 pair index must fail MX programs.
+
+    ``p = m*R + s`` (spec 2161-2170, Sail 5110-5117) against ``s*R + m``.
+    This is the single most likely implementation error in round six -- the
+    two factors are a row index and a block index out of the same register,
+    and nothing about the encoding makes the order obvious.
+
+    Sabotaging the *model* and not ``rvv_ref`` is the point: rvv_ref is what
+    the generated programs are judged against, so moving it would move the
+    reference and the defendant together.  That is the failure mode round
+    five exists to close.
+    """
+    global _MX_PAIR_INDEX
+    original = _MX_PAIR_INDEX
+    try:
+        _MX_PAIR_INDEX = lambda m, s, r: rvv_ref.mx_pair_index(s, m, r)
+        checked = blind = 0
+        for geom in _mx_pool(vlen):
+            stride = rvv_ref.mx_scale_stride(geom.sew, geom.lam)
+            blocks = rvv_ref.mx_block_count(geom.k_eff, rvv_ref.mx_block_size(0))
+            if stride == 1 or (geom.m == 1 and blocks == 1):
+                # m*R+s and s*R+m coincide; such a geometry cannot see this
+                # error at all.  Counted, not silently skipped -- "the
+                # control passed" must not be able to mean "the control was
+                # never applicable".
+                blind += 1
+                continue
+            try:
+                code, output = simulate(geom, seed=0)
+            except SimError:
+                # Reading off the end of v0 is also a detection: the
+                # sabotaged index is out of range for this geometry.
+                checked += 1
+                continue
+            assert code != ime_tests.EXIT_PASS and "TITAN FAIL" in output, (
+                f"{geom.describe()}: a transposed v0 paired-scale index went "
+                f"undetected")
+            checked += 1
+        assert checked, (
+            f"no round-six geometry could see the v0 index transposition "
+            f"({blind} were blind to it)")
+    finally:
+        _MX_PAIR_INDEX = original
+
+
+def check_mx_wrapping_is_unobservable_here(vlen: int = 256) -> None:
+    """A modulo-2**SEW block dot product provably cannot fail this tier.
+
+    This started life as a negative control -- sabotage ``int_block_dot``
+    into the round-one modular habit that Sail 5128-5130 forbids ("returns
+    an unbounded mathematical integer (no overflow)") and require the tier
+    to notice.  It never fires, and the reason is structural rather than
+    accidental, so the check states the structure instead of pretending to
+    be a control.
+
+    Every round-six directed program is built so that ``|dot|`` fits the
+    accumulator *significand*, which is what makes the result exactly
+    representable and the on-DUT integer reference path valid at all.  But
+    ``p_C < SEW`` in every one of the seven cells (binary16 11 < 16,
+    bfloat16 8 < 16, binary32 24 < 32, binary64 53 < 64), so the exactness
+    bound is always far tighter than the wrap point.  A modulo-2**SEW
+    reduction is therefore the identity on every value this tier can
+    produce.
+
+    Shipping the control anyway would be worse than not having it: it would
+    go green for all 192 geometries and look like evidence that the exact
+    integer path had been witnessed, when nothing had been witnessed at all.
+    That is the mistake this project has already paid for once.
+
+    Where the exactness property *is* witnessed:
+
+      * ``rvv_ref.check_round_six_negative_controls`` sabotages the same line
+        in the *reference model* and searches for a geometry where it bites.
+        It finds one, because it is free to use peak native operands
+        (|a|=|b|=127) rather than the tier's exactness-bounded ones.
+      * Stage 3 lockstep against the Spike model, which is not bound by the
+        directed tier's operand construction.
+
+    So the assertion here is the arithmetic fact, checked over every cell and
+    both block sizes, not a simulation.
+    """
+    del vlen
+    for (w, sew), (_ewidth, fmts) in sorted(rvv_ref.MX_CELLS.items()):
+        for altfmt in sorted(fmts):
+            for bs in (0, 1):
+                bound = rvv_ref.mx_exact_operand_bound(w, sew, altfmt, bs)
+                peak = rvv_ref.mx_block_size(bs) * bound * bound
+                assert peak < (1 << (sew - 1)), (
+                    f"W={w} SEW={sew} altfmt={altfmt} bs={bs}: |dot| can "
+                    f"reach {peak} >= 2**{sew - 1}, so a modulo-2**SEW block "
+                    f"dot product IS observable here after all -- this check "
+                    f"must go back to being a real negative control")
+
+
+def check_mx_nibble_order_is_load_bearing(vlen: int = 256) -> None:
+    """A model that packs the A tile's MXINT4 nibbles backwards must fail.
+
+    Spec 1206-1219 puts the *even* element index in the LOW nibble.
+
+    The sabotage swaps the nibble order on the **A side only**.  Swapping it
+    on both sides is the obvious thing to write and is worthless: the block
+    dot product is a sum over k, so exchanging a[k] with a[k^1] *and* b[k]
+    with b[k^1] merely reorders the terms and the sum is unchanged.  A
+    control written that way would go green everywhere and mean nothing.
+    One-sided is both the discriminating version and the realistic bug --
+    an implementation unpacks A and B through separate paths.
+    """
+    global _MX_BLOCK_DOT
+    original = _MX_BLOCK_DOT
+
+    def swapped_a(machine, vs1, vs2, i, j, k_lo, k_hi, geom, eew_ab):
+        total = 0
+        for k in range(k_lo, k_hi + 1):
+            a = machine.vget(vs1, _AB_INDEX(i, k, geom) ^ 1, eew_ab)
+            b = machine.vget(vs2, _AB_INDEX(j, k, geom), eew_ab)
+            total += _sext(a, eew_ab) * _sext(b, eew_ab)
+        return total
+
+    int4 = [g for g in _mx_pool(vlen) if g.eew_ab == 4 and g.k_eff > 1]
+    assert int4, "no multi-K MXINT4 geometry in the round-six pool"
+    try:
+        _MX_BLOCK_DOT = swapped_a
+        caught = blind = 0
+        for geom in int4:
+            code, output = simulate(geom, seed=0)
+            if code != ime_tests.EXIT_PASS and "TITAN FAIL" in output:
+                caught += 1
+            else:
+                blind += 1
+        assert caught, (
+            f"no MXINT4 geometry noticed a one-sided nibble swap "
+            f"({blind} were blind to it)")
+    finally:
+        _MX_BLOCK_DOT = original
 
 
 def _every_geometry(vlen: int):
@@ -1121,6 +1597,104 @@ def _every_geometry(vlen: int):
     # rvv_ref.clayout_capable) and in the same W=1-then-W=4 tier order
     # ime_tests.directed_suite emits it in.
     yield from _clayout_geometries(vlen)
+    # Round six, appended last for the same append-don't-interleave reason:
+    # every earlier tier keeps the position -- and therefore the seeds --
+    # it had before.
+    yield from rvv_ref.mx_legal_configs(vlen)
+
+
+def check_round_seven_sub_byte_path(vlen: int = 256) -> None:
+    """The nibble path, re-proved at every round-seven OFP4 geometry.
+
+    Round six's first cut computed ``width = eew // 8`` in Machine.vget and
+    vset, which is 0 at EEW=4, so every MXINT4 A/B read returned 0 and 88
+    bfloat16 cells failed with what looked like an arithmetic bug.  Round
+    seven brings EEW=4 back -- OFP4 (E2M1) at (W=2,SEW=8), (W=4,SEW=16) and
+    (W=8,SEW=32) -- so the same hole would reopen in the same place.
+
+    The path is shared, so this does not re-implement it; it re-exercises it
+    over the *round-seven* register-group extents, which are new: an OFP4 A
+    tile at LMUL=8 spans more elements per group than any round-six MXINT4
+    tile did, and an index that runs past v31 must still be caught.
+
+    This is deliberately format-independent -- it checks packing and
+    addressing over raw nibbles, not OFP4 values -- so it runs today and
+    keeps running unchanged once the OCP documents land.
+    """
+    ofp4 = [g for g in rvv_ref.fpw_legal_configs(vlen) if g.eew_ab == 4]
+    assert ofp4, "no EEW_AB=4 round-seven geometry to exercise"
+    cells = {(g.w, g.sew) for g in ofp4}
+    assert cells == {(2, 8), (4, 16), (8, 32)}, cells
+
+    for geom in ofp4:
+        m = Machine(vlen)
+        per_reg = vlen // 4
+        # Every nibble of one m1 group, written then read back, with the
+        # even/odd order the spec fixes (1207-1219).  A byte-swapped
+        # implementation passes a symmetric pattern, so the value written to
+        # index i is a function of i that is *not* symmetric under swapping
+        # neighbouring pairs.
+        for i in range(per_reg):
+            m.vset(8, i, 4, (i * 7 + 3) & 0xF)
+        for i in range(per_reg):
+            got = m.vget(8, i, 4)
+            assert got == (i * 7 + 3) & 0xF, (geom.describe(), i, got)
+        # ... and the packing is observable as bytes: element 2n in the low
+        # nibble of byte n, element 2n+1 in the high nibble.
+        for n in range(per_reg // 2):
+            byte = m.v[8][n]
+            assert byte & 0xF == (2 * n * 7 + 3) & 0xF, (geom.describe(), n)
+            assert byte >> 4 == ((2 * n + 1) * 7 + 3) & 0xF, (
+                geom.describe(), n)
+        # Reading past the group's last register must raise, not wrap into
+        # v0 -- at LMUL=8 an OFP4 K row is the widest extent in the round.
+        try:
+            m.vget(24, per_reg * 8 + 1, 4)
+        except SimError:
+            pass
+        else:
+            raise AssertionError(
+                f"{geom.describe()}: a read past v31 must raise")
+
+    # Nothing narrower than a nibble is modelled, and must say so rather
+    # than silently returning a truncated value.
+    m = Machine(vlen)
+    for eew in (1, 2):
+        try:
+            m.vget(8, 0, eew)
+        except SimError:
+            continue
+        raise AssertionError(f"EEW={eew} must not be modelled")
+
+
+def check_round_seven_sweep_is_not_yet_live(vlen: int = 256) -> None:
+    """Round seven must not appear in the executed sweep until it can run.
+
+    The meta-judge's headline number is "N program executions across M
+    geometries".  If round-seven geometries entered ``_every_geometry``
+    before their generators existed, M would grow while the programs behind
+    it did not -- a judge reporting coverage it does not have, which is the
+    precise failure this file exists to make impossible.
+
+    So the invariant is asserted rather than left to discipline: the
+    executed sweep contains no kind='fpw' geometry, and the round-seven
+    enumeration is nonempty (so this check is about sequencing, not about an
+    empty set trivially satisfying it).
+    """
+    assert any(True for _ in rvv_ref.fpw_legal_configs(vlen)), \
+        "round seven enumerates nothing -- this check would be vacuous"
+    live = [g for g in _every_geometry(vlen) if g.kind == "fpw"]
+    assert not live, (
+        f"{len(live)} kind='fpw' geometries are in the executed sweep but "
+        f"round seven has no generators yet; see constants.ROUND_SEVEN_INSNS")
+    # And the round-seven cells that the OCP documents block are exactly the
+    # narrow-input ones, so the eventual unblock is a format change and not
+    # a legality change.
+    blocked = {(w, sew) for (w, sew), (_e, rows) in rvv_ref.FP_CELLS.items()
+               if any(f in rvv_ref.OCP_PENDING_FORMATS
+                      for row in rows.values() for f in row[:3])}
+    assert blocked == {(2, 8), (2, 16), (4, 16), (4, 32), (8, 32), (8, 64)}, \
+        sorted(blocked)
 
 
 def _clayout_geometries(vlen: int):
@@ -1130,7 +1704,8 @@ def _clayout_geometries(vlen: int):
 
 def _allocatable(geom: TileGeometry) -> bool:
     try:
-        ime_tests.VectorAlloc.allocate(geom)
+        ime_tests.VectorAlloc.allocate(geom,
+                                       reserve_v0=geom.kind == "mx")
     except ValueError:
         return False
     return True

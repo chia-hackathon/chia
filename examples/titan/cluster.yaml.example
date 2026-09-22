@@ -62,7 +62,14 @@
 #   * tool server 從 9000 起掃埠，避開 AETHER 的 8000 段。
 #
 # CPU 配額：主機 96 執行緒（2×24 核 SMT）。10 個節點若不指定 --num-cpus 各報 96、合計 960，配額形同虛設。
-#   head 2 + head_local 2 + database 1 + llm 8 + chipyard 16 + verilator_run 4×16 + riscv_build 3 = 96
+#   head 2 + head_local 2 + database 1 + llm 8 + chipyard 16 + verilator_run 2×16 + riscv_build 3 = 64
+#   NOTE: sized for a SHARED host.  4 cosim workers (4×16 = 64 CPUs) plus every
+#   other node type sums to exactly the 96 hardware threads, i.e. the budget
+#   assumes the machine is ours alone.  It is not: a second CHIA cluster and
+#   ~40 other users share it, and on 2026-09-23 this tipped the host to load
+#   155 with 4 GB RAM left.  2 workers caps our peak at 32 CPUs.  See also
+#   TITAN_REGRESSION_MAX_INFLIGHT / hostload.py, which throttle without a
+#   cluster restart (this file only takes effect on one).
 #   verilator 16/節點 = 2 支 8-thread sim（nodes.py num_cpus=VERILATOR_THREADS=8）。
 #   AETHER 叢集另有自己的 96；兩邊同時滿載時主機是 time-share，真正上限仍是 96。
 cluster_name: titan
@@ -144,7 +151,7 @@ available_node_types:
     # Verilator DUT sims + lockstep cospike。
     cosim:
         resources: {"verilator_run": 4}
-        num_workers: 4
+        num_workers: 2
         compatible_ips: ["<HEAD_IP>"]
         worker_env_commands:
             - "export CHIA_NUM_CPUS=16 CHIA_TOOL_BASE_PORT=9000 CHIA_TOOL_MAX_PORT=9199"

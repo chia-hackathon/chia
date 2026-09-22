@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import random
 import re
+import sys
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
@@ -136,23 +137,57 @@ class VectorAlloc:
     c: int
 
     @staticmethod
-    def allocate(geom: TileGeometry) -> "VectorAlloc":
+    def allocate(geom: TileGeometry,
+                 reserve_v0: bool = False) -> "VectorAlloc":
+        """Place A, B and C.
+
+        *reserve_v0* keeps ``v0`` free for the round-six microscaled forms,
+        whose paired E8M0 block scales live there (spec 2129-2170) and which
+        therefore cannot have the A tile sitting on top of them.  It defaults
+        to False and, at False, returns exactly what every round one to five
+        caller got before -- those tiers' emitted programs are required to
+        stay byte-identical, so this is an added option and not a changed
+        default.
+
+        At True the A tile starts at the first LMUL-aligned register above
+        v0, which is v[LMUL]: LMUL is a power of two, so v[LMUL] is
+        LMUL-aligned by construction, and it is the lowest such register that
+        is not v0.  That costs one LMUL-sized hole and is why the fit check
+        below asks for 3*LMUL rather than 2*LMUL.
+
+        A geometry that does not fit raises, and ime_stress filters on that
+        exception.  It deliberately does not fall back to a different
+        geometry: quietly testing a shape other than the one asked for is how
+        a family ends up with no coverage at all where it matters.
+        """
         c_base = 32 - geom.emul_c
-        if 2 * geom.lmul > c_base:
+        groups = 3 if reserve_v0 else 2
+        if groups * geom.lmul > c_base:
+            held = " (v0 held for the E8M0 block scales)" if reserve_v0 else ""
             raise ValueError(
-                f"{geom.describe()}: A, B (2 x LMUL={geom.lmul}) and C "
-                f"(EMUL_C={geom.emul_c}) do not fit in 32 vector registers")
-        return VectorAlloc(a=0, b=geom.lmul, c=c_base)
+                f"{geom.describe()}: A, B ({groups - 1} x LMUL={geom.lmul})"
+                f"{held} and C (EMUL_C={geom.emul_c}) do not fit in 32 "
+                f"vector registers")
+        base = geom.lmul if reserve_v0 else 0
+        return VectorAlloc(a=base, b=base + geom.lmul, c=c_base)
 
 
 def vtype_value(geom: TileGeometry, *, lmul: int, xlen: int = 64,
                 vta: int = 0, vma: int = 0, altfmt_a: int = 0,
-                altfmt_b: int = 0, bs: int = 0) -> int:
+                altfmt_b: int = 0, bs: int = 0, altfmt: int = 0) -> int:
     """Assemble a full vtype word, IME fields included.
 
     vsetvli/vsetivli cannot reach the IME fields -- they live above the
     vtypei immediate -- so every configuration here goes through the register
     form, `vsetvl`, which writes vtype wholesale from rs2.
+
+    ``altfmt`` is the *base* Zvfbfa output-format field, not one of the three
+    IME fields next to it, and it is the one round six needs: at SEW=16 it is
+    all that separates a binary16 accumulator from a bfloat16 one (spec
+    1092-1106).  It is keyed by an absolute bit position rather than by an
+    offset below XLEN -- see ime_encodings.VTYPE_BASE_FIELDS -- so it is
+    assembled in its own loop.  It defaults to 0, and 0 ORs in nothing, so
+    every round one to five caller gets exactly the word it got before.
     """
     value = (_VLMUL_FIELD[lmul] | (_VSEW_FIELD[geom.sew] << 3)
              | (vta << 6) | (vma << 7))
@@ -161,6 +196,10 @@ def vtype_value(geom: TileGeometry, *, lmul: int, xlen: int = 64,
         offset, width = ime.VTYPE_IME_FIELDS[name]
         assert field < (1 << width)
         value |= field << (xlen - offset)
+    for name, field in (("altfmt", altfmt),):
+        lsb, width = ime.VTYPE_BASE_FIELDS[name]
+        assert field < (1 << width)
+        value |= field << lsb
     return value
 
 
@@ -1284,6 +1323,1683 @@ def emit_clayout_test(geom: TileGeometry, name: str = "ime_clayout") -> str:
     return "\n".join(head + body + data) + "\n"
 
 
+
+# ---------------------------------------------------------------------------
+# round six: the MX integer-input, FP-accumulate family
+# ---------------------------------------------------------------------------
+#
+# vfwimmacc.vv / vfqimmacc.vv / vf8wimmacc.vv, all at vm=0.  rvv_ref owns the
+# architecture (see its "round six" section, transcribed from Sail
+# `int_scaled_gemm`, spec 5373-5410); everything here is program *shape*.
+#
+# Four tiers, each a separate verdict and each with its own reason to exist:
+#
+#   ime_mx_   exactness.  C = +0.0, one microscaling block, both E8M0 scale
+#             bytes 0x7F (= 2**0).  Under those conditions Sail 5396-5399
+#             collapses to `acc = int_to_fp(dot)` with no floating-point
+#             rounding anywhere, so the on-DUT reference is an exact integer
+#             dot product and one integer-to-float conversion -- which is
+#             what makes the tier work at binary16 and bfloat16, where the
+#             baseline -march has no scalar arithmetic at all.
+#   ime_mxs_  scale.  eA, eB = 127 +/- small over several blocks, still
+#             exact.  This is the tier that drives the block loop and the
+#             R-strided v0 layout.
+#   ime_mxn_  NaN.  0xFF planted in one scale byte, and the spec 2021-2024
+#             case where both encoded scales are finite but the converted
+#             pair is +0 x +inf.
+#   ime_mxl_  legality.  The negative cases that must take an
+#             illegal-instruction trap -- and, on the same three funct6
+#             values, the vm=1 words that must *not*.
+#
+# Nothing in this section is reachable from a round one to five geometry:
+# every entry point requires `geom.kind == "mx"`, which
+# TileGeometry.validate only accepts for the five (W, SEW) cells of
+# rvv_ref.MX_CELLS.  The earlier tiers' programs are byte-identical.
+
+#: What goes in a v0 scale byte that the architecture must never read.
+#: 0xFF is the E8M0 NaN encoding (spec 1993), so an implementation that
+#: reads one of these positions produces the default NaN instead of a
+#: number and the tier goes red on the spot.  The positions are:
+#:
+#:   * ``s >= S_blocks`` -- padding within a row of the scale array.  Spec
+#:     2222-2224: "Scale elements at block indices at or beyond `S_blocks`
+#:     are ignored."
+#:   * the ``scale_B`` byte of a pair at ``m >= N`` -- spec 2176-2181 says
+#:     those fields are ignored and do not affect `fflags`.
+#:
+#: Filling them with an inert 0x7F would test nothing; filling them with
+#: 0xFF is the cheapest way to turn "ignored" from a claim into a check.
+MX_POISON_SCALE = rvv_ref.MX_E8M0_NAN
+
+
+def mx_scale_image(geom: TileGeometry,
+                   scales_a: Sequence[Sequence[int]],
+                   scales_b: Sequence[Sequence[int]]) -> List[int]:
+    """The ``v0`` paired-scale register image, as VLEN/16 16-bit elements.
+
+    Spec 2129-2170 and Sail ``read_block_scales`` (5097-5122).  ``sw = 8``
+    and the pair width ``pw = 2*sw = 16``, so v0 is read as 16-bit elements:
+    the low byte [7:0] is ``scale_A`` -- one *row* of the A tile -- and the
+    high byte [15:8] is ``scale_B`` -- one *column* of B^T.  Pair element
+    ``p = m*R + s`` with the row stride ``R = LAMBDA * SEW / pw``
+    (:func:`rvv_ref.mx_scale_stride`, spec 2139), and the Sail reads the A
+    scale at ``i*R + s`` and the B scale at ``j*R + s`` -- the same index
+    function of a row/column number and a block number, out of the *same*
+    register.  There are not two scale registers.
+
+    ``M * R == VLEN / pw`` exactly (spec 2192-2197), so the image is one
+    whole vector register with nothing left over; that identity is asserted
+    here rather than assumed, because if it ever fails the padding rule
+    below is silently indexing off the end of the array.
+
+    *scales_a* and *scales_b* are both indexed ``[m][s]`` over the full
+    ``M x R`` array, padding included -- the caller decides what goes in the
+    padding, and :data:`MX_POISON_SCALE` is what the tiers put there.
+    """
+    r = rvv_ref.mx_scale_stride(geom.sew, geom.lam)
+    pairs = geom.vlen // rvv_ref.MX_PAIR_WIDTH
+    assert geom.m * r == pairs, (geom.describe(), r, pairs)
+    image = [0] * pairs
+    for m in range(geom.m):
+        for s in range(r):
+            a, b = scales_a[m][s], scales_b[m][s]
+            assert 0 <= a <= 0xFF and 0 <= b <= 0xFF, (m, s, a, b)
+            image[rvv_ref.mx_pair_index(m, s, r)] = a | (b << 8)
+    return image
+
+
+def mx_describe(geom: TileGeometry, altfmt: int, bs: int) -> str:
+    """The verdict-line geometry string, plus the two vtype bits it needs.
+
+    ``TileGeometry.describe`` cannot carry these: ``altfmt`` (the C
+    accumulator format) and ``bs`` (the microscaling block size) are vtype
+    fields, not tile geometry, and two round-six programs over the *same*
+    geometry differ in nothing else -- at (W=2, SEW=16) and (W=4, SEW=16)
+    altfmt picks binary16 or bfloat16 (spec 1092-1106) and the two are the
+    same 16 bits of storage.  Without this clause the two programs would
+    print identical verdict lines and a failure could not be attributed.
+
+    The clause goes at the very end, after ``describe``'s own, so that
+    helpers._GEOM_RE still sees ``VLEN=.. SEW=.. LAMBDA=..`` as three
+    adjacent fields.
+    """
+    _ewidth, fmt = rvv_ref.mx_legal_cell(geom.w, geom.sew, altfmt)
+    return (f"{geom.describe()} MXC={fmt} altfmt={altfmt} bs={bs} "
+            f"BLK={rvv_ref.mx_block_size(bs)}")
+
+
+def _pow2_bits(exponent: int, width: int, fmt: str):
+    """Bit pattern of an exactly representable ``2**exponent``, else None.
+
+    A normal power of two only: biased exponent in ``[1, emax-1]``, so no
+    subnormal, no infinity, no rounding.  That is deliberately narrower than
+    what E8M0 can encode -- :func:`rvv_ref.mx_decode_scale` will happily
+    return +0 or +inf for an out-of-range scale (spec 2008-2019), and those
+    cases belong to the NaN tier, not to the two exact ones.
+    """
+    _ebits, prec, bias, emax = rvv_ref.fp_fields(width, fmt)
+    biased = exponent + bias
+    if not 1 <= biased <= emax - 1:
+        return None
+    return biased << (prec - 1)
+
+
+@dataclass(frozen=True)
+class MxPlan:
+    """Everything one round-six directed program is built from.
+
+    Deliberately not a "case" tuple like rounds one to four use: a
+    microscaled program needs the two scale arrays as well as A, B and C,
+    and it needs the two vtype bits (``altfmt``, ``bs``) that the geometry
+    does not carry.  Bundling them means :func:`mx_element_plan` -- the one
+    place that decides what the DUT recomputes and what it is told -- takes
+    a single argument and cannot be handed a half-matched set.
+
+    ``scales_a`` and ``scales_b`` are both ``M x R``: the *whole* v0 array
+    including the padding columns, indexed ``[m][s]``.
+    ``rvv_ref.int_scaled_gemm_reference`` reads only ``s < S_blocks`` of
+    them, which is the padding rule (spec 2222-2224) expressed by the
+    reference simply declining to look.
+    """
+
+    geom: TileGeometry
+    altfmt: int
+    bs: int
+    a: Matrix
+    b: Matrix
+    c: Matrix
+    scales_a: List[List[int]]
+    scales_b: List[List[int]]
+    tier: str            # "mx" / "mxs" / "mxn" -- names the prefix and intent
+    tag: str             # what this particular program is for, in one phrase
+
+    @property
+    def fmt(self) -> str:
+        return rvv_ref.mx_legal_cell(self.geom.w, self.geom.sew,
+                                     self.altfmt)[1]
+
+    @property
+    def blocks(self) -> int:
+        return rvv_ref.mx_block_count(self.geom.k_eff,
+                                      rvv_ref.mx_block_size(self.bs))
+
+    def describe(self) -> str:
+        return mx_describe(self.geom, self.altfmt, self.bs)
+
+
+#: What the reference path does for one C tile element.
+#:
+#:   "compute"  -- recompute it on the DUT: an exact integer dot product
+#:                 over the whole K interval, one integer-to-float
+#:                 conversion, and one exponent addition for the common
+#:                 block scale.  Differential, which is the point.
+#:   "literal"  -- the architectural answer is not something a baseline
+#:                 rv64i sequence can recompute (a default NaN, an infinity,
+#:                 a signed zero out of a +0 x +inf pair), so the program
+#:                 carries rvv_ref's answer as a constant.  Round five's
+#:                 C-layout tier is the precedent: a non-differential
+#:                 expectation is the only way to observe some things at
+#:                 all, and it is honest as long as it is *named*.
+#:   "copy"     -- a C tile tail column, j >= N.  vta=0 leaves it
+#:                 undisturbed, so the reference copies c_init across and
+#:                 the comparison stays exact over the whole physical tile.
+MX_MODE_COMPUTE, MX_MODE_LITERAL, MX_MODE_COPY = 0, 1, 2
+
+
+def mx_element_plan(plan: MxPlan):
+    """``(reference tile, {(i, j): (mode, integer, exponent, literal)})``.
+
+    The reference tile is :func:`rvv_ref.int_scaled_gemm_reference`, full
+    stop -- this function never computes an expected value of its own.  What
+    it decides is only *how the program will arrive at that value*, and it
+    proves the choice: an element is marked "compute" only after the closed
+    form the emitted assembly implements has been checked, here, to equal
+    the reference bit for bit.  A judge that disagreed with rvv_ref would
+    therefore fail to generate rather than emit a wrong expectation.
+
+    The closed form is::
+
+        T = sum over blocks s of int_block_dot(i, j, block s)
+        result = int_to_fp(T, EEW_C, fmt_C)  +  E << (prec - 1)
+
+    and it is valid exactly when
+
+      * C[i][j] is +0.0 -- Sail 5395 seeds `acc` from C, and a nonzero seed
+        would need a floating-point add the reference path cannot do;
+      * every block's paired scale is a *normal power of two* 2**E with the
+        same E (so `fp_mul(blk_scale, fp_sum)` is an exponent addition and
+        never rounds, and the sum over blocks may be reassociated); and
+      * every partial sum is exactly representable, which is what
+        :func:`rvv_ref.mx_exact_operand_bound` and the per-K clamp in
+        :func:`_mx_operand_bound` buy.
+
+    Anything else falls through to "literal".  The fall-through is *not* a
+    quiet fix: each tier asserts how many of each mode it expects, so a
+    bound that stops being exact turns into a failing self-test rather than
+    into a tier that silently stopped being differential.
+    """
+    geom, bs, altfmt = plan.geom, plan.bs, plan.altfmt
+    width = geom.sew
+    _ewidth, fmt = rvv_ref.mx_legal_cell(geom.w, width, altfmt)
+    _ebits, prec, _bias, _emax = rvv_ref.fp_fields(width, fmt)
+    block_size = rvv_ref.mx_block_size(bs)
+    blocks = plan.blocks
+    ref = rvv_ref.int_scaled_gemm_reference(
+        plan.a, plan.b, plan.c, plan.scales_a, plan.scales_b, geom,
+        bs=bs, altfmt=altfmt)
+
+    out = {}
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            want = ref[i][j]
+            if j >= geom.n:
+                assert want == plan.c[i][j], (i, j)   # vta=0, spec 1811-1813
+                out[(i, j)] = (MX_MODE_COPY, 0, 0, 0)
+                continue
+            exps = set()
+            for s in range(blocks):
+                ea, eb = plan.scales_a[i][s], plan.scales_b[j][s]
+                exponent = (ea - rvv_ref.MX_E8M0_BIAS) \
+                    + (eb - rvv_ref.MX_E8M0_BIAS)
+                pattern = _pow2_bits(exponent, width, fmt)
+                blk, is_nan = rvv_ref.mx_block_scale(ea, eb, width, fmt)
+                if is_nan or pattern is None or blk != pattern:
+                    exps = None
+                    break
+                exps.add(exponent)
+            if exps is None or len(exps) != 1 or plan.c[i][j] != 0:
+                out[(i, j)] = (MX_MODE_LITERAL, 0, 0, want)
+                continue
+            exponent = exps.pop()
+            total = sum(
+                rvv_ref.mx_int_block_dot(
+                    plan.a, plan.b, i, j,
+                    *rvv_ref.mx_block_interval(s, block_size, geom.k_eff))
+                for s in range(blocks))
+            if not _mx_dut_representable(geom, plan.a, plan.b, i, j,
+                                         total, prec):
+                out[(i, j)] = (MX_MODE_LITERAL, 0, 0, want)
+                continue
+            bits = rvv_ref.mx_int_to_fp(total, width, fmt)
+            if total:
+                bits += exponent << (prec - 1)
+            if bits != want:
+                out[(i, j)] = (MX_MODE_LITERAL, 0, 0, want)
+                continue
+            out[(i, j)] = (MX_MODE_COMPUTE, total,
+                           exponent << (prec - 1), 0)
+    return ref, out
+
+
+def _mx_dut_representable(geom: TileGeometry, a: Matrix, b: Matrix,
+                          i: int, j: int, total: int, prec: int) -> bool:
+    """Can the emitted reference path actually compute this element?
+
+    Two conditions, and neither is implied by "the closed form equals
+    rvv_ref".  That distinction is the one a negative control caught: with a
+    single block, ``int_to_fp(dot)`` *is* the architectural answer whether or
+    not the dot fits the significand, so comparing the closed form against
+    the reference says nothing about whether the DUT-side assembly can
+    reproduce it.  What the assembly needs is:
+
+      * ``|T| <= 2**prec``, because :func:`_mx_convert_path` converts by
+        splicing bits rather than by rounding.  Above that bound the
+        conversion is a real rounding and the splice is simply wrong; and
+      * every per-chunk partial sum inside ``[-2**(SEW-1), 2**(SEW-1))``,
+        because ``vredsum.vs`` reduces modulo 2**SEW and ``vmv.x.s``
+        sign-extends what survives.  The chunking is the one
+        :func:`_mx_dot_path` emits, so this checks the sums the program will
+        actually form, not an idealised whole-row sum.
+
+    Elements that fail either test fall back to a literal, and each tier
+    asserts that none of its active elements did -- so a bound that stopped
+    being exact is a failing self-test, not a silently weakened tier.
+    """
+    if abs(total) > (1 << prec):
+        return False
+    chunk = min(geom.elems_per_reg, geom.k_eff)
+    limit = 1 << (geom.sew - 1)
+    for start in range(0, geom.k_eff, chunk):
+        partial = sum(a[i][k] * b[j][k]
+                      for k in range(start, min(start + chunk, geom.k_eff)))
+        if not -limit <= partial < limit:
+            return False
+    return True
+
+
+def _mx_operand_bound(geom: TileGeometry, altfmt: int, bs: int) -> int:
+    """Largest |A|, |B| that keeps every *prefix* of the K sum exact.
+
+    :func:`rvv_ref.mx_exact_operand_bound` bounds one block; the reference
+    path adds the blocks up in one integer register and then converts once,
+    so what has to stay inside the significand is the running total over the
+    whole K interval, which is up to ``S_blocks`` times larger.  Clamping to
+    both is the honest thing: the tier's exactness claim is about the value
+    the program actually computes.
+
+    Both bounds are at least 2 for every one of the seven cells (the binding
+    one is bfloat16, 8 significand bits), so no cell degenerates to an
+    all-zero tile -- which would pass anything.
+    """
+    ewidth, fmt = rvv_ref.mx_legal_cell(geom.w, geom.sew, altfmt)
+    _ebits, prec, _bias, _emax = rvv_ref.fp_fields(geom.sew, fmt)
+    native = (1 << (ewidth - 1)) - 1
+    bound = 0
+    while bound + 1 <= native \
+            and geom.k_eff * (bound + 1) ** 2 <= (1 << prec):
+        bound += 1
+    bound = min(bound, rvv_ref.mx_exact_operand_bound(
+        geom.w, geom.sew, altfmt, bs))
+    if bound < 1:
+        raise ValueError(
+            f"{mx_describe(geom, altfmt, bs)}: no nonzero operand bound "
+            f"keeps the whole K interval exact")
+    return bound
+
+
+def _mx_configure(geom: TileGeometry, *, lmul: int, vl: int, altfmt: int,
+                  bs: int, comment: str) -> List[str]:
+    """:func:`_configure` with the two round-six vtype bits set.
+
+    Separate from ``_configure`` rather than a pair of new keyword arguments
+    on it, because ``_configure`` emits the literal text of every round one
+    to five program and that text must not move.
+    """
+    return [
+        f"    # {comment}",
+        f"    li    t0, {vl}",
+        f"    li    t1, 0x{vtype_value(geom, lmul=lmul, altfmt=altfmt, bs=bs):x}",
+        "    vsetvl x0, t0, t1",
+    ]
+
+
+def _mx_ime_path(geom: TileGeometry, alloc: VectorAlloc, *, altfmt: int,
+                 bs: int) -> List[str]:
+    """The round-one tile sequence, plus v0, minus the A tile's old home.
+
+    Structurally :func:`_ime_path`: configure for the C transfer, load C,
+    configure for A/B, load both tiles, configure for compute, one
+    multiply-accumulate, configure back, store C.  Two things are new.
+
+    First, ``v0`` carries the paired E8M0 block scales and is loaded with an
+    ordinary ``vle16.v`` at LMUL=1, VL=VLEN/16 -- an architectural load of
+    the whole register, with no tile semantics, because the scale array is
+    not a tile: it is one register of 16-bit pairs (spec 2192-2197).  That
+    is why ``VectorAlloc.allocate`` is called with ``reserve_v0=True`` here
+    and why the A tile starts at v[LMUL] instead of v0.
+
+    Second, the compute configuration sets ``vtype.bs`` and ``vtype.altfmt``.
+    Neither is in the instruction encoding: ``bs`` is ``vtype[XLEN-5]``
+    (spec 1160-1176) and ``altfmt`` is the base Zvfbfa field.  They are set
+    on *every* vsetvl in the program, not just the compute one, because
+    `vsetvli`/`vsetivli` cannot reach them and a program that set them once
+    and then reconfigured for the C transfer would be relying on retention
+    rules (spec 888-889) that are not what is under test here.
+
+    The multiply-accumulate is emitted at vm=0 -- ime_encodings hardwires it,
+    so there is no operand to get wrong -- and at vm=1 the same funct6 would
+    be the round-one-to-three integer form.  ``ime_mxl_`` is the tier that
+    holds the decoder to that.
+    """
+    lam_imm = 0  # 0 as an instruction immediate means "use vtype.lambda"
+    out: List[str] = ["", "    # ---- IME path (microscaled, vm=0) ----"]
+    out += _mx_configure(geom, lmul=geom.lmul_c, vl=geom.vl_c_full,
+                         altfmt=altfmt, bs=bs,
+                         comment=f"C tile transfer config (LMUL=EMUL_C="
+                                 f"{geom.emul_c}, VL={geom.vl_c_full})")
+    out += _check_lambda_retained(geom)
+    out += [
+        "    la    a0, c_init",
+        f"    li    a1, {geom.m}          # LD = M: row-major M x M block",
+        f"    {ime.insn(geom.load_mnemonic, vd=alloc.c, rs1=RS1_ADDR, rs2=RS2_LD, vm=1, **{'lambda': lam_imm})}"
+        f"    # {geom.load_mnemonic} v{alloc.c}, (a0), a1",
+    ]
+    out += _mx_configure(geom, lmul=geom.lmul,
+                         vl=geom.lmul * geom.elems_per_reg,
+                         altfmt=altfmt, bs=bs,
+                         comment=f"A/B config (LMUL={geom.lmul}, full VL)")
+    for label, base in (("mat_a_tile", alloc.a), ("mat_b_tile", alloc.b)):
+        out += [
+            f"    la    a0, {label}",
+            f"    li    a1, {geom.linesize}",
+            f"    {ime.insn(geom.load_mnemonic, vd=base, rs1=RS1_ADDR, rs2=RS2_LD, vm=1, **{'lambda': lam_imm})}"
+            f"    # {geom.load_mnemonic} v{base}, (a0), a1",
+        ]
+    r = rvv_ref.mx_scale_stride(geom.sew, geom.lam)
+    pairs = geom.vlen // rvv_ref.MX_PAIR_WIDTH
+    out += [
+        "",
+        f"    # the paired E8M0 block scales into v0: {pairs} x 16-bit",
+        f"    # elements, pair p = m*R + s with R = LAMBDA*SEW/pw = {r}",
+        f"    # (spec 2129-2170, Sail 5097-5122).  A plain vle16.v at LMUL=1:",
+        "    # the scale array is one register of pairs, not a tile.",
+        f"    li    t0, {pairs}",
+        "    vsetvli t1, t0, e16, m1, ta, ma",
+        "    la    a0, v0_scales",
+        "    vle16.v v0, (a0)",
+    ]
+    out += _mx_configure(geom, lmul=geom.lmul, vl=geom.vl,
+                         altfmt=altfmt, bs=bs,
+                         comment=f"compute config (VL={geom.vl} -> "
+                                 f"N={geom.n}, bs={bs}, altfmt={altfmt})")
+    out += [
+        f"    {ime.insn(geom.mnemonic, vd=alloc.c, vs1=alloc.a, vs2=alloc.b)}"
+        f"    # {geom.mnemonic} v{alloc.c}, v{alloc.a}, v{alloc.b}, v0"
+        f"  (vm=0)",
+    ]
+    out += _mx_configure(geom, lmul=geom.lmul_c, vl=geom.vl_c_full,
+                         altfmt=altfmt, bs=bs,
+                         comment="back to the C tile config to store")
+    out += [
+        "    la    a0, c_ime",
+        f"    li    a1, {geom.m}",
+        f"    {ime.insn(geom.store_mnemonic, vs3=alloc.c, rs1=RS1_ADDR, rs2=RS2_LD, vm=1, **{'lambda': lam_imm})}"
+        f"    # {geom.store_mnemonic} v{alloc.c}, (a0), a1",
+    ]
+    return out
+
+
+def _mx_dot_path(geom: TileGeometry, elements) -> List[str]:
+    """Phase one of the reference: the exact integer dot products.
+
+    One ``vmul.vv`` + ``vredsum.vs`` per K chunk at vtype.SEW, summed into a
+    scalar register and spilled to ``ref_int`` as a 64-bit value.  This is
+    round two's widening reference path (:func:`_rvv_path_widening`) with
+    the accumulate-into-C step removed, and it is reused rather than rewritten
+    for the reason that path gives: ``mat_a`` / ``mat_b`` carry each narrow
+    input already sign-extended to a SEW-wide word, so an ordinary SEW-wide
+    ``vmul.vv`` reproduces the exact product.
+
+    The modular arithmetic of ``vredsum.vs`` is not a problem *and is not
+    being relied on to wrap*: the operand bound
+    (:func:`_mx_operand_bound`) keeps |T| <= 2**prec < 2**(SEW-1), so every
+    chunk partial and the total are exact signed values and ``vmv.x.s``
+    sign-extends them faithfully.  Sail ``int_block_dot`` (5128-5147)
+    returns an unbounded mathematical integer with no reduction at all, and
+    this tier stays inside the range where the two agree -- deliberately, so
+    that the conversion afterwards has nothing to round.
+
+    Note what is *absent*: no LMUL step loop and no block-and-step
+    intersection.  ``int_scaled_gemm`` has neither (spec 2030-2060 belongs
+    to ``fp_scaled_gemm``), and because every block of these tiers shares one
+    exponent the per-block dots may be added up as one sum over the whole K
+    interval.  :func:`mx_element_plan` proves that per element against
+    rvv_ref before this is allowed to run.
+    """
+    esz = geom.sew // 8
+    chunk = min(geom.elems_per_reg, geom.k_eff)
+    assert geom.k_eff % chunk == 0, geom.describe()
+    nchunks = geom.k_eff // chunk
+    out: List[str] = [
+        "",
+        "    # ---- reference path, phase 1: exact integer dot products ----",
+        f"    li    t0, {chunk}",
+        f"    vsetvli t1, t0, e{geom.sew}, m1, ta, ma",
+        "    la    a2, mat_a",
+        "    la    a3, mat_b",
+        "    la    a4, ref_int",
+    ]
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            if elements[(i, j)][0] != MX_MODE_COMPUTE:
+                continue
+            out += [f"    li    t6, 0              # T for C[{i},{j}]"]
+            for c in range(nchunks):
+                out += [
+                    f"    li    t0, {(i * geom.k_eff + c * chunk) * esz}",
+                    "    add   t2, a2, t0",
+                    f"    li    t0, {(j * geom.k_eff + c * chunk) * esz}",
+                    "    add   t3, a3, t0",
+                    f"    vle{geom.sew}.v v1, (t2)",
+                    f"    vle{geom.sew}.v v2, (t3)",
+                    "    vmul.vv v3, v1, v2",
+                    "    vmv.s.x v5, x0",
+                    "    vredsum.vs v4, v3, v5",
+                    "    vmv.x.s t5, v4",
+                    "    add   t6, t6, t5",
+                ]
+            out += [
+                f"    li    t0, {_c_off(geom, i, j) * 8}",
+                "    add   t2, a4, t0",
+                "    sd    t6, 0(t2)",
+            ]
+    return out
+
+
+def _mx_convert_path(geom: TileGeometry, width: int, fmt: str) -> List[str]:
+    """Phase two: int_to_fp, the block-scale exponent, and the tail copy.
+
+    A loop, not an unrolled body, and the distinction from :func:`_compare`
+    (which is unrolled precisely because it is the judge) is that this loop
+    does the *same* thing to every element: it reads three tables the
+    generator emitted and writes one result.  There is no per-element
+    control flow to get wrong, and 256 inlined copies of a 20-instruction
+    conversion would triple the size of every program in the tier.
+
+    The conversion itself is a bit-splice, not a rounding routine, and that
+    is the whole reason the exactness tier exists.  ``|T| <= 2**prec`` makes
+    ``int_to_fp`` exact, so:
+
+        sign     = T < 0
+        e        = floor(log2(|T|))
+        fraction = (|T| << (prec-1-e)) mod 2**(prec-1)
+        bits     = sign << (width-1) | (e + bias) << (prec-1) | fraction
+
+    with no round bit, no sticky bit and no tie rule anywhere -- which is
+    what lets the tier run at binary16 and bfloat16, where rv64imafd has no
+    scalar arithmetic and therefore no ``fcvt`` to call.  ``e == prec``
+    (i.e. |T| == 2**prec exactly) is the one case where the shift would go
+    negative; it is clamped to zero, and the mask then removes the hidden
+    bit for free.
+
+    The exponent of the common block scale is added afterwards, as an
+    integer addition into the exponent field.  That is exact because
+    :func:`mx_element_plan` has already established that every block's
+    paired scale is the *normal* power of two ``2**E``, so
+    ``fp_mul(2**E, x)`` is an exponent shift and cannot round or overflow.
+    ``T == 0`` skips it: ``int_to_fp(0)`` is +0.0 and ``2**E * (+0.0)`` is
+    +0.0, whose exponent field must stay zero.
+    """
+    _ebits, prec, bias, _emax = rvv_ref.fp_fields(width, fmt)
+    sfx = _SEW_SUFFIX[width]
+    esz = width // 8
+    shift = {2: 1, 4: 2, 8: 3}[esz]
+    frac_shift = 64 - (prec - 1)
+    total = geom.m * geom.n_max
+    return [
+        "",
+        f"    # ---- reference path, phase 2: int_to_fp to {fmt} ----",
+        "    li    s4, 0              # flat C element index",
+        ".Lmxcvt:",
+        f"    li    t0, {total}",
+        "    bge   s4, t0, .Lmxcvt_done",
+        "    slli  s5, s4, 3          # 8-byte stride of the side tables",
+        "    la    t1, ref_mode",
+        "    add   t1, t1, s4",
+        "    lbu   t2, 0(t1)",
+        f"    li    t0, {MX_MODE_LITERAL}",
+        "    beq   t2, t0, .Lmxcvt_lit",
+        f"    li    t0, {MX_MODE_COPY}",
+        "    beq   t2, t0, .Lmxcvt_copy",
+        "",
+        "    # int_to_fp(T): exact, so a bit-splice with no rounding",
+        "    la    t1, ref_int",
+        "    add   t1, t1, s5",
+        "    ld    a6, 0(t1)          # T, the exact integer dot product",
+        "    li    a7, 0",
+        "    beqz  a6, .Lmxcvt_store  # T = 0 -> +0.0, exponent stays clear",
+        "    mv    t1, a6",
+        "    li    t0, 0",
+        "    bge   a6, x0, .Lmxcvt_mag",
+        "    sub   t1, x0, a6         # |T|",
+        "    li    t0, 1",
+        ".Lmxcvt_mag:",
+        f"    slli  t0, t0, {width - 1}    # sign bit in place",
+        "    li    t2, 0              # e",
+        "    mv    t3, t1",
+        ".Lmxcvt_msb:",
+        "    li    t4, 1",
+        "    beq   t3, t4, .Lmxcvt_norm",
+        "    srli  t3, t3, 1",
+        "    addi  t2, t2, 1",
+        "    j     .Lmxcvt_msb",
+        ".Lmxcvt_norm:",
+        f"    li    t4, {prec - 1}",
+        "    sub   t4, t4, t2         # prec-1-e",
+        "    bge   t4, x0, .Lmxcvt_shift",
+        "    li    t4, 0              # |T| = 2**prec: hidden bit only",
+        ".Lmxcvt_shift:",
+        "    sll   t5, t1, t4",
+        f"    slli  t5, t5, {frac_shift}",
+        f"    srli  t5, t5, {frac_shift}   # fraction, hidden bit dropped",
+        f"    addi  t2, t2, {bias}",
+        f"    slli  t2, t2, {prec - 1}",
+        "    add   a7, t0, t2",
+        "    add   a7, a7, t5",
+        "",
+        "    # + the common block-scale exponent E (exact: 2**E is normal)",
+        "    la    t1, ref_bump",
+        "    add   t1, t1, s5",
+        "    ld    t0, 0(t1)",
+        "    add   a7, a7, t0",
+        "    j     .Lmxcvt_store",
+        "",
+        ".Lmxcvt_lit:",
+        "    # rvv_ref's answer, carried as a constant: a default NaN, an",
+        "    # infinity or a signed zero that no rv64i sequence recomputes.",
+        "    la    t1, ref_lit",
+        "    add   t1, t1, s5",
+        "    ld    a7, 0(t1)",
+        "    j     .Lmxcvt_store",
+        "",
+        ".Lmxcvt_copy:",
+        "    # C tile tail column, j >= N: vta=0 leaves it undisturbed.",
+        "    la    t1, c_init",
+        f"    slli  t0, s4, {shift}",
+        "    add   t1, t1, t0",
+        f"    l{sfx}    a7, 0(t1)",
+        "",
+        ".Lmxcvt_store:",
+        "    la    t1, c_rvv",
+        f"    slli  t0, s4, {shift}",
+        "    add   t1, t1, t0",
+        f"    s{sfx}    a7, 0(t1)",
+        "    addi  s4, s4, 1",
+        "    j     .Lmxcvt",
+        ".Lmxcvt_done:",
+    ]
+
+
+def _dword_table(label: str, values: Sequence[int], per_line: int) -> List[str]:
+    """A ``.dword`` table, *per_line* entries to a line, two's complement.
+
+    Separate from :func:`_matrix_data` because these tables are 64-bit
+    regardless of SEW: ``ref_int`` holds an exact integer dot product and
+    ``ref_bump`` an exponent-field delta that is negative whenever the
+    combined block scale is below 1.0, and both are read with ``ld``.
+    """
+    mask = (1 << 64) - 1
+    lines = [f"{label}:"]
+    for start in range(0, len(values), per_line):
+        row = values[start:start + per_line]
+        lines.append("    .dword " + ", ".join(f"0x{v & mask:x}" for v in row))
+    return lines
+
+
+def _mx_tile_data(label: str, mat: Matrix, geom: TileGeometry) -> List[str]:
+    """The A or B tile in tile-load memory layout, at the logical width.
+
+    Identical to what :func:`emit_test` emits for a widening geometry, with
+    one addition: at ``EEW_A = 4`` (MXINT4, the W=4/SEW=16 and W=8/SEW=32
+    cells) there is no 4-bit assembler directive, so each line is packed two
+    elements to a byte with the even index in the low nibble -- spec
+    1206-1219, via :func:`rvv_ref.mx_pack_int4`, which is the same authority
+    the reference model reads the packing from.
+
+    The line length works out either way: a tile line is ``ab_linesize``
+    logical elements = ``linesize`` storage elements of SEW bits, so
+    ``K_eff/2`` bytes at EEW_A=4 is exactly ``linesize * SEW/8``.  That
+    identity is asserted rather than trusted, because if it were false the
+    lines would overlap and every element but the first row would be wrong
+    in a way that looks like a tile-addressing bug in the DUT.
+    """
+    width = geom.ab_linesize
+    buf = rvv_ref.tile_layout_buffer(mat, width, geom)
+    chunked = [buf[i:i + width] for i in range(0, len(buf), width)]
+    if geom.eew_ab == 4:
+        packed = [rvv_ref.mx_pack_int4(line) for line in chunked]
+        assert len(packed[0]) == geom.linesize * geom.sew // 8, geom.describe()
+        return _matrix_data(label, packed, 8)
+    return _matrix_data(label, chunked, geom.eew_ab)
+
+
+def emit_mx_test(plan: MxPlan, name: str = "ime_mx") -> str:
+    """One microscaled differential program for *plan*.
+
+    The same shape every pair program has had since round one -- compute the
+    tile twice on the DUT, into ``c_ime`` and ``c_rvv``, and compare the two
+    memory images element by element with no tolerance -- with the reference
+    half replaced by the two phases :func:`_mx_dot_path` and
+    :func:`_mx_convert_path` describe.  The comparison, the failure evidence
+    and the verdict contract are :func:`_compare` and :func:`_epilogue`,
+    unchanged and uncopied.
+    """
+    geom = plan.geom
+    geom.validate()
+    if geom.kind != "mx":
+        raise ValueError(f"{geom.describe()}: emit_mx_test needs kind='mx'")
+    if geom.emul_c == 16:
+        raise ValueError(
+            f"{geom.describe()}: EMUL_C=16 has no single-instruction C tile "
+            f"transfer (LMUL=16 is not a legal vtype)")
+    rvv_ref.mx_check_legality(geom.w, geom.lmul, geom.sew, geom.lam, plan.bs)
+    width = geom.sew
+    _ewidth, fmt = rvv_ref.mx_legal_cell(geom.w, width, plan.altfmt)
+    alloc = VectorAlloc.allocate(geom, reserve_v0=True)
+    ref, elements = mx_element_plan(plan)
+    desc = plan.describe()
+
+    head = [
+        f"# {name}: {desc}",
+        "#",
+        "# Generated by ime_tests.py from rvv_ref.py -- do not edit by hand,",
+        "# and do not edit rvv_ref.py: it is the judge, not the defendant.",
+        "#",
+        f"# Round six, tier {plan.tier}: {plan.tag}.",
+        f"# Blocks: S_blocks={plan.blocks} at block_size="
+        f"{rvv_ref.mx_block_size(plan.bs)}; scale row stride R="
+        f"{rvv_ref.mx_scale_stride(geom.sew, geom.lam)}.",
+        f"# The paired E8M0 block scales are in v0 (spec 2129-2170), so the",
+        f"# A tile starts at v{alloc.a} rather than v0.",
+        "#",
+        f"# IME instructions are emitted as .insn (encodings from Zvvm "
+        f"v{ime.SPEC_VERSION}):",
+    ]
+    for mnemonic in (geom.load_mnemonic, geom.mnemonic, geom.store_mnemonic):
+        head.append(f"#   {mnemonic}")
+    head += [
+        "",
+        "    .text",
+        "    .balign 4",
+        "    .globl main",
+        "main:",
+        "    addi  sp, sp, -64",
+        "    sd    ra, 56(sp)",
+        "    sd    s1, 48(sp)         # carries the exit status past printf",
+        "    sd    s2, 40(sp)",
+        "    sd    s3, 32(sp)",
+        "    sd    s4, 24(sp)",
+        "    sd    s5, 16(sp)",
+        "    sd    s6, 8(sp)",
+        "    sd    s7, 0(sp)",
+        f"    li    t0, {MSTATUS_VS_INITIAL}",
+        "    csrs  mstatus, t0        # enable vector state",
+    ]
+    # No mstatus.FS: the reference path is integer throughout.  That is the
+    # point of the exactness construction, not an oversight -- see
+    # _mx_convert_path.
+
+    body = (_mx_ime_path(geom, alloc, altfmt=plan.altfmt, bs=plan.bs)
+            + _mx_dot_path(geom, elements)
+            + _mx_convert_path(geom, width, fmt)
+            + _compare(geom))
+
+    data = [
+        "", "    .data", "    .balign 8",
+        f'.Lfmt_pass:  .asciz "TITAN PASS {desc}\\n"',
+        f'.Lfmt_skip:  .asciz "TITAN SKIP lambda=%d (requested {geom.lam}) '
+        f'imm=%d {desc}\\n"',
+        f'.Lfmt_fail:  .asciz "TITAN FAIL row=%d col=%d {desc}\\n"',
+        f'.Lfmt_diff:  .asciz "TITAN DIFF r=%d c=%d '
+        f'exp={_hex_fmt(width)} got={_hex_fmt(width)}\\n"',
+        f'.Lfmt_cdump: .asciz "TITAN CDUMP r=%d:"',
+        f'.Lfmt_cref:  .asciz "TITAN CREF r=%d:"',
+        f'.Lfmt_elem:  .asciz " {_hex_fmt(width)}"',
+        '.Lfmt_nl:    .asciz "\\n"',
+        "    .balign 8",
+    ]
+    # Row-major sign-extended copies for the reference path's vmul.vv, and
+    # tile-layout copies for the tile loads -- the same two images every
+    # widening program carries, from the same rvv_ref authority.
+    data += _matrix_data("mat_a", plan.a, width)
+    data += _matrix_data("mat_b", plan.b, width)
+    data += _matrix_data("c_init", plan.c, width)
+    data += ["    .balign 8"] + _mx_tile_data("mat_a_tile", plan.a, geom)
+    data += ["    .balign 8"] + _mx_tile_data("mat_b_tile", plan.b, geom)
+    image = mx_scale_image(geom, plan.scales_a, plan.scales_b)
+    r = rvv_ref.mx_scale_stride(geom.sew, geom.lam)
+    data += [
+        "    .balign 8",
+        f"# v0: pair p = m*R + s, R={r}; low byte scale_A, high byte scale_B",
+        f"# (spec 2129-2170).  0x{MX_POISON_SCALE:02x} is the E8M0 NaN code "
+        f"and marks every",
+        "# position the architecture must never read -- padding at "
+        "s >= S_blocks",
+        "# (spec 2222-2224) and the scale_B field of a pair at m >= N "
+        "(spec 2176-2181).",
+    ]
+    data += _matrix_data("v0_scales",
+                         [image[i:i + r] for i in range(0, len(image), r)]
+                         if r > 1 else [image], 16)
+    # The three side tables the conversion loop reads, one entry per flat C
+    # tile element in c_rvv memory order.
+    modes, bumps, lits = [], [], []
+    for off in range(geom.m * geom.n_max):
+        modes.append(0)
+        bumps.append(0)
+        lits.append(0)
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            mode, _total, bump, lit = elements[(i, j)]
+            off = _c_off(geom, i, j)
+            modes[off], bumps[off], lits[off] = mode, bump, lit
+    data += ["    .balign 8"]
+    data += _matrix_data("ref_mode",
+                         [modes[i:i + geom.m]
+                          for i in range(0, len(modes), geom.m)], 8)
+    data += ["    .balign 8"] + _dword_table("ref_bump", bumps, geom.m)
+    data += ["    .balign 8"] + _dword_table("ref_lit", lits, geom.m)
+    data += ["    .balign 8", "ref_int:",
+             f"    .zero {geom.m * geom.n_max * 8}",
+             "    .balign 8", "c_ime:",
+             f"    .zero {geom.m * geom.m * width // 8}",
+             "    .balign 8", "c_rvv:",
+             f"    .zero {geom.m * geom.m * width // 8}"]
+
+    del ref
+    return "\n".join(head + body + data) + "\n"
+
+
+def _mx_emittable(geom: TileGeometry) -> bool:
+    """Can a round-six program be built for this geometry at all?
+
+    Two reasons it might not be, both of which ime_stress filters on too:
+    EMUL_C=16 has no single-instruction C tile transfer, and
+    ``VectorAlloc.allocate(reserve_v0=True)`` needs ``3*LMUL <= 32-EMUL_C``
+    because v0 is spoken for.  Neither is quietly swapped for a geometry
+    that does fit -- that would be testing something other than what was
+    asked for.
+    """
+    if geom.emul_c == 16:
+        return False
+    try:
+        VectorAlloc.allocate(geom, reserve_v0=True)
+    except ValueError:
+        return False
+    return True
+
+
+def _mx_scale_arrays(geom: TileGeometry, blocks: int, byte_a, byte_b):
+    """``(scales_a, scales_b)``, each the full M x R array with padding.
+
+    *byte_a* and *byte_b* are called as ``f(m, s)`` for the ``s <
+    S_blocks`` positions of each row.  Everything else -- the padding
+    columns, and the ``scale_B`` field of every pair at ``m >= N`` -- gets
+    :data:`MX_POISON_SCALE`.
+    """
+    r = rvv_ref.mx_scale_stride(geom.sew, geom.lam)
+    assert blocks <= r, (geom.describe(), blocks, r)
+    sa = [[MX_POISON_SCALE] * r for _ in range(geom.m)]
+    sb = [[MX_POISON_SCALE] * r for _ in range(geom.m)]
+    for m in range(geom.m):
+        for s in range(blocks):
+            sa[m][s] = byte_a(m, s)
+            if m < geom.n:
+                sb[m][s] = byte_b(m, s)
+    for row in sa + sb:
+        assert all(0 <= v <= 0xFF for v in row), row
+    return sa, sb
+
+
+def _mx_operands(geom: TileGeometry, altfmt: int, bs: int,
+                 rng: random.Random):
+    """Random A and B inside the exactness bound, and a C that is +0.0.
+
+    C is +0.0 in the active window because the closed form the reference
+    path implements starts from zero (see :func:`mx_element_plan`), and
+    deliberately *not* zero in the tail columns: those are the ones vta=0
+    must leave undisturbed, and a tail of zeros against a tile of zeros
+    would confirm nothing.
+    """
+    bound = _mx_operand_bound(geom, altfmt, bs)
+    a = [[rng.randint(-bound, bound) for _ in range(geom.k_eff)]
+         for _ in range(geom.m)]
+    b = [[rng.randint(-bound, bound) for _ in range(geom.k_eff)]
+         for _ in range(geom.n_max)]
+    mask = (1 << geom.sew) - 1
+    c = [[0 if j < geom.n else rng.randint(1, mask) for j in range(geom.n_max)]
+         for _ in range(geom.m)]
+    return a, b, c
+
+
+def _mx_geometries(vlen: int, blocks_wanted: str):
+    """``(geom, bs)`` pairs whose S_blocks is 1 ("one") or >= 2 ("many").
+
+    bs is enumerated inside the geometry loop rather than outside it because
+    it is a vtype bit, not a tile shape: the same geometry can be a
+    single-block program at bs=0 and a two-block one at bs=1, and both are
+    worth having.  ``mx_check_legality`` decides whether bs=1 is even legal
+    here (Sail 5156: ``W*LMUL <= SEW``), so the illegal combinations are
+    filtered by the architecture rather than by a hand-written list.
+    """
+    for geom in rvv_ref.mx_legal_configs(vlen, full_vl_only=True):
+        if not _mx_emittable(geom):
+            continue
+        for bs in (0, 1):
+            try:
+                rvv_ref.mx_check_legality(geom.w, geom.lmul, geom.sew,
+                                          geom.lam, bs)
+            except ValueError:
+                continue
+            blocks = rvv_ref.mx_block_count(geom.k_eff,
+                                            rvv_ref.mx_block_size(bs))
+            if (blocks == 1) == (blocks_wanted == "one"):
+                yield geom, bs
+
+
+def mx_exact_plans(vlen: int, seed: int = 0):
+    """The ``ime_mx_`` tier: one microscaling block, both scales 2**0.
+
+    With ``K_eff <= block_size`` there is exactly one block, and with both
+    E8M0 bytes at 0x7F the paired scale is 1.0 exactly, so Sail 5396-5399
+    reduces to ``acc = fp_add(+0.0, fp_mul(1.0, int_to_fp(dot)))`` =
+    ``int_to_fp(dot)``.  No floating-point rounding survives anywhere in the
+    architectural computation, which is the only reason a tier can cover the
+    binary16 and bfloat16 accumulator cells at all: the DUT has no scalar
+    arithmetic at those widths, and none is needed.
+
+    All seven cells of the encoding map are reached, because `altfmt` is
+    enumerated from :func:`rvv_ref.mx_altfmts` -- the table, not a list here.
+    """
+    rng = random.Random(seed)
+    partial_seen = set()
+    for geom, bs in _mx_geometries(vlen, "one"):
+        shapes = [geom]
+        # One partial-N program per (W, SEW, bs).  Two things exist only at
+        # N < N_max and are otherwise dead: the C tile tail columns, which
+        # vta=0 must leave undisturbed, and the scale_B fields at
+        # m >= N, which spec 2176-2181 says "are ignored and do not affect
+        # the result or fflags" -- and which these programs fill with the
+        # E8M0 NaN code, so "ignored" is a check rather than a claim.
+        key = (geom.w, geom.sew, bs)
+        if key not in partial_seen and geom.n_max > 1:
+            half = TileGeometry(vlen, geom.sew, geom.lam, geom.lmul,
+                                (geom.n_max // 2) * geom.lam * geom.lmul,
+                                geom.w, "op", "mx")
+            try:
+                half.validate()
+            except ValueError:
+                half = None
+            if half is not None and _mx_emittable(half):
+                partial_seen.add(key)
+                shapes.append(half)
+        for shape in shapes:
+            for altfmt in rvv_ref.mx_altfmts(shape.w, shape.sew):
+                a, b, c = _mx_operands(shape, altfmt, bs, rng)
+                sa, sb = _mx_scale_arrays(
+                    shape, 1,
+                    lambda m, s: rvv_ref.MX_E8M0_BIAS,
+                    lambda m, s: rvv_ref.MX_E8M0_BIAS)
+                yield MxPlan(shape, altfmt, bs, a, b, c, sa, sb, "mx",
+                             f"one block, both E8M0 scales 0x7f = 2**0"
+                             f"{'' if shape.n == shape.n_max else '; N < N_max, so the C tail and the inactive scale_B fields are live'}")
+
+
+def mx_scale_plans(vlen: int, seed: int = 100):
+    """The ``ime_mxs_`` tier: several blocks, scales 127 +/- small.
+
+    ``eA[i][s] = 127 + dA(i) + g(s)`` and ``eB[j][s] = 127 + dB(j) - g(s)``.
+    The ``g(s)`` term is the point: both scale arrays vary along *both* axes,
+    so an implementation that indexed v0 as ``s*R + m`` instead of
+    ``m*R + s`` reads a different byte and gets a different answer.  It
+    cancels in the combined exponent ``E = dA(i) + dB(j)``, which is what
+    keeps every block of one output element on the same exponent and
+    therefore keeps the whole accumulation exact -- the only way this tier
+    can compare bit-for-bit against an integer reference.
+
+    The windows are chosen for the narrowest accumulator, binary16 (5
+    exponent bits): ``dA + g`` and ``dB - g`` stay within [-14, 15] so each
+    decoded scale is a normal power of two, and ``E`` stays within [-2, 2]
+    so ``2**E * T`` with ``|T| <= 2**11`` is normal too.  Wider accumulators
+    have strictly more room; the tier does not widen the window for them
+    because the same numbers then exercise every cell identically and a
+    failure that appears only at binary16 is a range bug, not a layout one.
+    """
+    rng = random.Random(seed)
+    for geom, bs in _mx_geometries(vlen, "many"):
+        blocks = rvv_ref.mx_block_count(geom.k_eff,
+                                        rvv_ref.mx_block_size(bs))
+        mid = (blocks - 1) // 2
+        for altfmt in rvv_ref.mx_altfmts(geom.w, geom.sew):
+            a, b, c = _mx_operands(geom, altfmt, bs, rng)
+            sa, sb = _mx_scale_arrays(
+                geom, blocks,
+                lambda m, s: rvv_ref.MX_E8M0_BIAS + (m % 3) - 1 + (s - mid),
+                lambda m, s: rvv_ref.MX_E8M0_BIAS + (m % 3) - 1 - (s - mid))
+            yield MxPlan(geom, altfmt, bs, a, b, c, sa, sb, "mxs",
+                         f"{blocks} blocks, eA/eB = 127 +/- small with a "
+                         f"per-block term that cancels in E")
+
+
+def mx_nan_plans(vlen: int, seed: int = 200):
+    """The ``ime_mxn_`` tier: NaN block scales and the early exit.
+
+    Three plantings, each testing a different sentence of the spec:
+
+      * ``scale_A[i][0] = 0xFF``.  The first block's scale is the E8M0 NaN
+        encoding (spec 1993), so ``read_block_scales`` reports NaN, Sail
+        5390-5392 breaks out of the block loop and 5403-5406 writes
+        ``fp_defaultNaN``.  The whole of row i goes NaN; every other row is
+        untouched, which is the half of the claim that an implementation
+        which simply NaN-ed the tile would fail.
+      * ``scale_B[j][S_blocks-1] = 0xFF`` at a multi-block geometry.  Same
+        outcome, but the poisoned block is not the first one -- an
+        implementation that only checks block 0 passes the case above and
+        fails this one.  Column j goes NaN.
+      * a binary16 accumulator with ``eA = 0x00`` and ``eB = 0xFE``.  Both
+        are *finite* E8M0 codes (2**-127 and 2**127), but neither survives
+        conversion to binary16: one underflows to +0 and the other overflows
+        to +inf, and +0 x +inf is the default NaN with invalid raised --
+        spec 2021-2024, "even though both encoded E8M0 scales are finite".
+        A model that tests the two bytes for 0xFF instead of testing the
+        *product* calls this one wrong.
+
+    Everything the poison touches beyond the targeted element -- the +0 rows
+    and +-inf columns the third planting produces -- comes back from
+    :func:`rvv_ref.int_scaled_gemm_reference` as a literal, because no
+    baseline integer sequence recomputes an infinity.  That is named in the
+    program text rather than hidden: see MX_MODE_LITERAL.
+    """
+    rng = random.Random(seed)
+    seen = set()
+    for want in ("one", "many"):
+        for geom, bs in _mx_geometries(vlen, want):
+            for altfmt in rvv_ref.mx_altfmts(geom.w, geom.sew):
+                key = (geom.w, geom.sew, altfmt, want)
+                if key in seen:
+                    continue
+                seen.add(key)
+                blocks = rvv_ref.mx_block_count(
+                    geom.k_eff, rvv_ref.mx_block_size(bs))
+                fmt = rvv_ref.mx_legal_cell(geom.w, geom.sew, altfmt)[1]
+                ip, jp = geom.m // 2, geom.n // 2
+                variants = [
+                    ("a0", f"scale_A[{ip}][0] = 0xff: row {ip} is the "
+                           f"default NaN, the rest of the tile is not",
+                     {("a", ip, 0): rvv_ref.MX_E8M0_NAN}),
+                ]
+                if blocks >= 2:
+                    variants.append(
+                        ("bl", f"scale_B[{jp}][{blocks - 1}] = 0xff: the "
+                               f"poisoned block is not block 0",
+                         {("b", jp, blocks - 1): rvv_ref.MX_E8M0_NAN}))
+                if fmt == "binary16":
+                    variants.append(
+                        ("pm", f"eA=0x00, eB=0xfe at [{ip}][0] / [{jp}][0]: "
+                               f"+0 x +inf in binary16, both codes finite",
+                         {("a", ip, 0): 0x00, ("b", jp, 0): 0xFE}))
+                for suffix, tag, poison in variants:
+                    a, b, c = _mx_operands(geom, altfmt, bs, rng)
+
+                    def byte_a(m, s, _p=poison):
+                        return _p.get(("a", m, s), rvv_ref.MX_E8M0_BIAS)
+
+                    def byte_b(m, s, _p=poison):
+                        return _p.get(("b", m, s), rvv_ref.MX_E8M0_BIAS)
+
+                    sa, sb = _mx_scale_arrays(geom, blocks, byte_a, byte_b)
+                    yield suffix, MxPlan(geom, altfmt, bs, a, b, c, sa, sb,
+                                         "mxn", tag)
+
+
+# ---------------------------------------------------------------------------
+# round six: the legality tier
+# ---------------------------------------------------------------------------
+#
+# Every other tier in this file asks "is the answer right?".  This one asks
+# "does the instruction exist?", which needs a different program shape: the
+# outcome under test is an illegal-instruction *trap*, so the program
+# installs its own M-mode handler, runs each case, and checks whether the
+# trap fired.
+#
+# The reason it is worth a tier of its own is the last group of cases.  The
+# three round-six funct6 values are 0x39, 0x3a and 0x3b, and at vm=1 those
+# same encodings are vwmmacc.vv, vqmmacc.vv and v8wmmacc.vv -- instructions
+# rounds one to three already implement and the loop already passes.  A
+# decoder that routes on funct6 and forgets vm therefore breaks three green
+# instructions the moment the MX forms are added, and it breaks them
+# silently: the integer programs would start taking illegal-instruction
+# traps, which surfaces as a simulation that dies rather than as a
+# mismatch.  The vm=1 cases below are what catches that on the first
+# iteration instead of the tenth.
+
+#: Vector registers the legality tier names.  Fixed rather than allocated,
+#: because a case whose (W, SEW) cell is reserved has no legal geometry to
+#: allocate from -- and picking these three by hand is safe for every case
+#: the tier emits: v8 and v16 are 8-register aligned so they are legal
+#: vs1/vs2 groups at any LMUL <= 8, and v24 is 8-register aligned so it is a
+#: legal vd group at any EMUL_C <= 8.  The one exception is called out where
+#: it arises (SEW=8 with LAMBDA=1 gives EMUL_C = VLEN/8 = 32, which is not a
+#: legal C group anywhere).
+MXL_VD, MXL_VS1, MXL_VS2 = 24, 8, 16
+
+#: The integer multiply-accumulate that each round-six funct6 decodes to at
+#: vm=1.  Not a lookup table of its own: it is asserted against
+#: ime_encodings in :func:`mxl_cases`, which re-encodes both words and
+#: requires them to differ in exactly one bit.
+MXL_VM1_PEER = {"vfwimmacc.vv": "vwmmacc.vv",
+                "vfqimmacc.vv": "vqmmacc.vv",
+                "vf8wimmacc.vv": "v8wmmacc.vv"}
+
+#: The canonical legal cell each round-six mnemonic is exercised at, as
+#: (SEW, LAMBDA, LMUL).  LAMBDA is the smallest value that keeps EMUL_C at
+#: or below 8 so that :data:`MXL_VD` is a legal C group; LMUL is 1 except
+#: where a case needs it larger, and those cases carry their own.
+MXL_CELL = {2: (16, 2, 1), 4: (32, 1, 1), 8: (64, 1, 1)}
+
+
+@dataclass(frozen=True)
+class MxlCase:
+    """One (vtype, instruction word) probe and the outcome it must have."""
+
+    tag: str
+    geom: TileGeometry
+    vtype: int
+    word: int
+    mnemonic: str
+    vm: int
+    expect_trap: int
+    vl: int
+
+
+def _mxl_is_illegal(w: int, sew: int, lam: int, lmul: int, *, bs: int,
+                    altfmt: int, altfmt_a: int, altfmt_b: int) -> bool:
+    """Does the *vm=0* MX form raise Illegal_Instruction here?
+
+    Derived from rvv_ref, never hand-written, so that the tier and the
+    reference model cannot disagree about which cases are negative:
+
+      * ``altfmt_A`` or ``altfmt_B`` = 1 -- Sail 6045-6046 (vfwimmacc),
+        6162-6163 (vf8wimmacc), 6271-6272 (vfqimmacc).  MXINT is signed by
+        definition (spec 2335-2342), so "unsigned" has no meaning here and
+        the encoding is reserved rather than ignored;
+      * the (W, SEW, altfmt) cell -- :func:`rvv_ref.mx_legal_cell`, which is
+        tbl-intmx-encoding-map (spec 7469-7540) and the per-instruction SEW
+        guards read back the other way round;
+      * ``check_microscaling_legality`` -- :func:`rvv_ref.mx_check_legality`,
+        Sail 5151-5158.
+    """
+    if altfmt_a or altfmt_b:
+        return True
+    try:
+        rvv_ref.mx_legal_cell(w, sew, altfmt)
+    except ValueError:
+        return True
+    try:
+        rvv_ref.mx_check_legality(w, lmul, sew, lam, bs)
+    except ValueError:
+        return True
+    return False
+
+
+def mxl_cases(vlen: int, mnemonic: str) -> List[MxlCase]:
+    """Every legality probe for one round-six mnemonic, in emission order.
+
+    The case list is *derived*: `expect_trap` comes from
+    :func:`_mxl_is_illegal` for a vm=0 word and is unconditionally false for
+    a vm=1 word, whose legality is that of the already-implemented integer
+    form.  Nothing here hard-codes an outcome, so sabotaging the legality
+    rules in rvv_ref changes what the tier demands -- which is what the
+    negative control in :func:`check_mxl_emission` relies on.
+    """
+    w = {"vfwimmacc.vv": 2, "vfqimmacc.vv": 4, "vf8wimmacc.vv": 8}[mnemonic]
+    peer = MXL_VM1_PEER[mnemonic]
+    base_sew, base_lam, base_lmul = MXL_CELL[w]
+    cases: List[MxlCase] = []
+
+    def add(tag, sew, lam, lmul, *, bs=0, altfmt=0, altfmt_a=0, altfmt_b=0,
+            vm=0):
+        geom = TileGeometry(vlen, sew, lam, lmul, lam * lmul * (vlen // sew)
+                            // lam, w, "op", "int")
+        vtype = vtype_value(geom, lmul=lmul, bs=bs, altfmt=altfmt,
+                            altfmt_a=altfmt_a, altfmt_b=altfmt_b)
+        name = mnemonic if vm == 0 else peer
+        word = ime.encode(name, vd=MXL_VD, vs1=MXL_VS1, vs2=MXL_VS2)
+        back, ops = ime.decode(word)
+        assert back == name and ops["vd"] == MXL_VD, (name, back)
+        trap = (0 if vm else
+                int(_mxl_is_illegal(w, sew, lam, lmul, bs=bs, altfmt=altfmt,
+                                    altfmt_a=altfmt_a, altfmt_b=altfmt_b)))
+        cases.append(MxlCase(tag, geom, vtype, word, name, vm, trap,
+                             geom.elems_per_reg * lmul))
+
+    # 1. The positive control.  Without it a decoder that raised
+    #    Illegal_Instruction on all three funct6 values would pass every
+    #    negative case below and the tier would certify nothing.
+    add(f"{mnemonic} at its canonical legal cell must NOT trap",
+        base_sew, base_lam, base_lmul)
+
+    # 2. Reserved (W, SEW) cells -- the SEW guard of this instruction's Sail,
+    #    read out of tbl-intmx-encoding-map.  LAMBDA is 2 at SEW=8 so that
+    #    EMUL_C stays at 8 and the C register group is a legal one: the
+    #    reserved *cell* is then the only thing wrong with the encoding.
+    for sew in (8, 16, 32, 64):
+        if (w, sew) in rvv_ref.MX_CELLS:
+            continue
+        add(f"SEW={sew} is a reserved cell for {mnemonic} (spec 7469-7540)",
+            sew, 2 if sew == 8 else 1, 1)
+
+    # 3. Reserved altfmt at a legal (W, SEW) cell -- the C accumulator
+    #    format table, spec 1092-1106: altfmt=1 is reserved at SEW 32 and
+    #    64, and legal (bfloat16) at SEW=16.
+    for sew in sorted(s for (ww, s) in rvv_ref.MX_CELLS if ww == w):
+        if 1 in rvv_ref.mx_altfmts(w, sew):
+            continue
+        add(f"altfmt=1 is reserved at SEW={sew} (spec 1092-1106)",
+            sew, 2 if sew == 16 else 1, 1, altfmt=1)
+
+    # 4. altfmt_A / altfmt_B = 1.  MXINT inputs are signed unconditionally.
+    for field in ("altfmt_A", "altfmt_B"):
+        add(f"{field}=1 is reserved: MXINT inputs are signed "
+            f"(spec 2335-2342)",
+            base_sew, base_lam, base_lmul,
+            **{"altfmt_a" if field == "altfmt_A" else "altfmt_b": 1})
+
+    # 5. check_microscaling_legality, Sail 5151-5158.
+    #
+    #    5a. bs=1 with W*LMUL > SEW.  Reachable for W=4 and W=8; at W=2 the
+    #        only legal cell is SEW=16 and LMUL <= 8, so W*LMUL <= 16 = SEW
+    #        always and the rule cannot be violated.  The tier says so here
+    #        rather than silently emitting nothing.
+    for sew in sorted(s for (ww, s) in rvv_ref.MX_CELLS if ww == w):
+        lam = 2 if sew == 16 else 1
+        lmul = next((l for l in (2, 4, 8) if w * l > sew), None)
+        if lmul is None:
+            continue
+        probe = TileGeometry(vlen, sew, lam, lmul, lam * lmul, w, "op", "mx")
+        try:
+            probe.validate()
+        except ValueError:
+            continue
+        add(f"bs=1 with W*LMUL={w * lmul} > SEW={sew} (Sail 5156)",
+            sew, lam, lmul, bs=1)
+        break
+
+    #    5b. EEW_C * LAMBDA < pw, i.e. SEW*LAMBDA < 16.  At every (W, SEW)
+    #        cell this family defines, SEW is 16 or more and LAMBDA is at
+    #        least 1, so SEW*LAMBDA >= 16 and the rule is *unreachable in
+    #        isolation*: the only configuration that violates it is SEW=8,
+    #        which is a reserved cell for all three mnemonics anyway, and
+    #        where at VLEN=256 EMUL_C = VLEN/SEW = 32 is not a legal C
+    #        group either.  The case is emitted because the rule is real
+    #        and an implementation must trap; it is documented as
+    #        multiply-illegal because a green result here does not prove
+    #        that *this* check is the one that fired.
+    add("SEW*LAMBDA = 8 < pw = 16 (Sail 5155); also a reserved cell and "
+        "EMUL_C=32, so this only asserts that something traps",
+        8, 1, 1)
+
+    # 6. The vm=1 regression.  Same funct6, same vtype as case 4 -- which is
+    #    illegal for the MX form precisely because altfmt_A=1 -- but at vm=1
+    #    the encoding is the integer multiply-accumulate, for which
+    #    altfmt_A=1 means "read A as unsigned" and is perfectly legal (spec
+    #    1145-1155).  So the two words must behave differently, and the only
+    #    bit between them is vm.
+    add(f"vm=1 on the same funct6 is {peer}, which altfmt_A=1 does not make "
+        f"illegal (spec 1145-1155)",
+        base_sew, base_lam, base_lmul, altfmt_a=1, vm=1)
+    add(f"vm=1 on the same funct6 is {peer}, which bs is not even defined "
+        f"for (spec 1160-1176: bs is ignored at vm=1)",
+        base_sew, base_lam, base_lmul, bs=1, vm=1)
+
+    # The claim the previous two cases rest on, checked here rather than
+    # assumed: the MX word and its integer peer differ in exactly the vm bit.
+    mx_word = ime.encode(mnemonic, vd=MXL_VD, vs1=MXL_VS1, vs2=MXL_VS2)
+    int_word = ime.encode(peer, vd=MXL_VD, vs1=MXL_VS1, vs2=MXL_VS2)
+    assert mx_word ^ int_word == 1 << 25, (mnemonic, peer,
+                                           hex(mx_word), hex(int_word))
+    assert any(c.expect_trap for c in cases), mnemonic
+    assert any(not c.expect_trap for c in cases), mnemonic
+    return cases
+
+
+def emit_mxl_test(vlen: int, mnemonic: str, name: str = "ime_mxl") -> str:
+    """The legality probe program for one round-six mnemonic.
+
+    Non-differential by necessity: what it observes is whether an
+    instruction raised Illegal_Instruction, which no amount of recomputing a
+    tile can reveal.  The program installs its own M-mode trap handler,
+    which advances ``mepc`` past the faulting instruction and sets a flag,
+    runs each case, and compares the flag against what
+    :func:`_mxl_is_illegal` derived from rvv_ref.
+
+    The handler is installed and removed around the case list, and ``mtvec``
+    is restored before any ``printf`` -- the harness (htif_nano) has its own
+    handler and the verdict has to be printed through it, not through this
+    one.
+
+    Every case runs at the LAMBDA its cell needs, and each is preceded by the
+    usual read-back check: a DUT that clamps LAMBDA down is configured
+    differently from what the case assumed, so the program reports
+    ``TITAN SKIP`` rather than judging a geometry it did not get.
+    """
+    cases = mxl_cases(vlen, mnemonic)
+    w = {"vfwimmacc.vv": 2, "vfqimmacc.vv": 4, "vf8wimmacc.vv": 8}[mnemonic]
+    base_sew, base_lam, base_lmul = MXL_CELL[w]
+    shown = TileGeometry(vlen, base_sew, base_lam, base_lmul,
+                         base_lam * base_lmul * (vlen // base_sew)
+                         // base_lam, w, "op", "mx")
+    shown.validate()
+    desc = mx_describe(shown, 0, 0)
+
+    head = [
+        f"# {name}: legality probes for {mnemonic} at VLEN={vlen}",
+        "#",
+        "# Generated by ime_tests.py from rvv_ref.py -- do not edit by hand,",
+        "# and do not edit rvv_ref.py: it is the judge, not the defendant.",
+        "#",
+        "# Each case configures vtype with vsetvl, executes one .insn word,",
+        "# and checks whether an illegal-instruction trap fired.  A failing",
+        "# case reports its index as the TITAN FAIL row:",
+        "#",
+    ]
+    for index, case in enumerate(cases):
+        head.append(f"#   {index:2d}  {'trap' if case.expect_trap else 'run '}"
+                    f"  vm={case.vm}  {case.mnemonic}  "
+                    f"vtype=0x{case.vtype:x}  {case.tag}")
+    head += [
+        "#",
+        f"# Registers are fixed at vd=v{MXL_VD}, vs1=v{MXL_VS1}, "
+        f"vs2=v{MXL_VS2}: a reserved cell",
+        "# has no legal geometry to allocate from.  See MXL_VD.",
+        "",
+        "    .text",
+        "    .balign 4",
+        "    .globl main",
+        "main:",
+        "    addi  sp, sp, -80",
+        "    sd    ra, 72(sp)",
+        "    sd    s1, 64(sp)         # carries the exit status past printf",
+        "    sd    s2, 56(sp)",
+        "    sd    s3, 48(sp)",
+        "    sd    s4, 40(sp)",
+        "    sd    s5, 32(sp)",
+        "    sd    s6, 24(sp)",
+        "    sd    s7, 16(sp)",
+        "    sd    s8, 8(sp)          # the harness's mtvec",
+        "    sd    s9, 0(sp)          # the trap flag",
+        f"    li    t0, {MSTATUS_VS_INITIAL}",
+        "    csrs  mstatus, t0        # enable vector state",
+        "",
+        "    # install our own M-mode trap handler",
+        "    csrr  s8, mtvec",
+        "    la    t0, .Ltrap",
+        "    csrw  mtvec, t0",
+    ]
+
+    body: List[str] = []
+    for index, case in enumerate(cases):
+        body += [
+            "",
+            f"    # ---- case {index}: "
+            f"{'must trap' if case.expect_trap else 'must run'} -- "
+            f"{case.tag} ----",
+            "    li    s9, 0              # trap flag",
+            f"    li    t0, {case.vl}",
+            f"    li    t1, 0x{case.vtype:x}",
+            "    vsetvl x0, t0, t1",
+        ]
+        # Report WHICH case skipped.  _check_lambda_retained loads the
+        # DUT's lambda into a1 and jumps to .Lskip, whose format string
+        # names only the program's nominal geometry -- so a skip from case 3
+        # and a skip from case 0 print the same line.  In r19 that cost the
+        # Stage M agent an iteration: the verdict said "lambda=0 (requested
+        # 1)" against case 0's header while the real culprit was a reserved
+        # -altfmt case further down the list.  a2 carries the index so the
+        # two are distinguishable.
+        body.append(f"    li    a3, {index}       # case index, for TITAN SKIP")
+        body += _check_lambda_retained(case.geom)
+        body += [
+            f"    .insn 4, {case.word:#010x}"
+            f"    # {case.mnemonic} (vm={case.vm})",
+            f"    li    t0, {case.expect_trap}",
+            "    beq   s9, t0, 1f",
+            f"    li    a1, {index}",
+            f"    li    a2, {case.expect_trap}",
+            f"    li    s1, {EXIT_MISMATCH_BASE + index}",
+            "    j     .Lfail",
+            "1:",
+        ]
+
+    tail = [
+        "",
+        "    # ---- verdict ----",
+        "    csrw  mtvec, s8          # hand the harness its handler back",
+        "    la    a0, .Lfmt_pass",
+        "    call  printf",
+        f"    li    s1, {EXIT_PASS}",
+        "    j     .Lret",
+        "",
+        ".Lskip:",
+        "    csrw  mtvec, s8",
+        "    mv    a2, a1             # raw vtype.lambda[2:0] field",
+        "    li    a1, 0              # decoded: 0 means no selected lambda",
+        "    beqz  a2, 1f",
+        "    addi  t0, a2, -1",
+        "    li    t1, 1",
+        "    sll   a1, t1, t0         # lambda = 1 << (imm - 1)",
+        "1:",
+        "    la    a0, .Lfmt_skip",
+        "    call  printf",
+        f"    li    s1, {EXIT_UNSUPPORTED_GEOMETRY}",
+        "    j     .Lret",
+        "",
+        ".Lfail:",
+        "    csrw  mtvec, s8          # before printf: the harness traps too",
+        "    mv    s2, a1             # case index",
+        "    mv    s3, a2             # the outcome the case required",
+        "",
+        "    # ---- evidence: which case, what was required, what happened",
+        "    la    a0, .Lfmt_diff",
+        "    mv    a1, s2",
+        "    mv    a2, s3",
+        "    mv    a3, s3",
+        "    mv    a4, s9",
+        "    call  printf",
+        "",
+        "    # ---- verdict, last so a log tail keeps it ----",
+        "    la    a0, .Lfmt_fail",
+        "    mv    a1, s2",
+        "    mv    a2, s3",
+        "    call  printf",
+        "",
+        ".Lret:",
+        "    mv    a0, s1",
+        "    ld    s9, 0(sp)",
+        "    ld    s8, 8(sp)",
+        "    ld    s7, 16(sp)",
+        "    ld    s6, 24(sp)",
+        "    ld    s5, 32(sp)",
+        "    ld    s4, 40(sp)",
+        "    ld    s3, 48(sp)",
+        "    ld    s2, 56(sp)",
+        "    ld    s1, 64(sp)",
+        "    ld    ra, 72(sp)",
+        "    addi  sp, sp, 80",
+        "    ret",
+        "",
+        "    # The handler.  Placed after the return so control cannot fall",
+        "    # into it, and 4-byte aligned because mtvec's low bits are the",
+        "    # mode field.  Every probed instruction is 4 bytes (no",
+        "    # compressed encoding exists for .insn 4), so mepc+4 resumes at",
+        "    # the instruction after the faulting one.",
+        "    .balign 4",
+        ".Ltrap:",
+        "    csrr  t0, mepc",
+        "    addi  t0, t0, 4",
+        "    csrw  mepc, t0",
+        "    li    s9, 1",
+        "    mret",
+    ]
+
+    data = [
+        "", "    .data", "    .balign 8",
+        f'.Lfmt_pass:  .asciz "TITAN PASS {desc}\\n"',
+        f'.Lfmt_skip:  .asciz "TITAN SKIP lambda=%d (requested {shown.lam}) '
+        f'imm=%d case=%d {desc}\\n"',
+        f'.Lfmt_fail:  .asciz "TITAN FAIL row=%d col=%d {desc}\\n"',
+        '.Lfmt_diff:  .asciz "TITAN DIFF r=%d c=%d exp=0x%x got=0x%x\\n"',
+    ]
+    return "\n".join(head + body + tail + data) + "\n"
+
+
+
+def mx_legal_bs(geom: TileGeometry) -> Tuple[int, ...]:
+    """The block-size selectors legal at this geometry, in order.
+
+    bs=0 is always legal; bs=1 adds ``W*LMUL <= SEW`` (Sail 5156).  The
+    ``S_blocks <= R`` filter is belt-and-braces: the architecture already
+    guarantees it -- the scale array has R columns per row and S_blocks
+    blocks to name -- and :func:`_mx_scale_arrays` asserts it, so a geometry
+    that violated it would be a discovery about the spec rather than a case
+    to drop.  It is filtered here too so that a stress sampler cannot turn
+    that discovery into a crashed pool build.
+    """
+    out = []
+    r = rvv_ref.mx_scale_stride(geom.sew, geom.lam)
+    for bs in (0, 1):
+        try:
+            rvv_ref.mx_check_legality(geom.w, geom.lmul, geom.sew,
+                                      geom.lam, bs)
+        except ValueError:
+            continue
+        if rvv_ref.mx_block_count(geom.k_eff,
+                                  rvv_ref.mx_block_size(bs)) <= r:
+            out.append(bs)
+    return tuple(out)
+
+
+def mx_random_plan(geom: TileGeometry, rng: random.Random,
+                   bs: int = None, altfmt: int = None) -> MxPlan:
+    """A randomised round-six plan for *geom* -- the stress-pool entry point.
+
+    The scale construction is the ime_mxs_ one
+    (``eA[i][s] = 127 + dA(i) + g(s)``, ``eB[j][s] = 127 + dB(j) - g(s)``),
+    which degenerates gracefully to the ime_mx_ one when there is a single
+    block: ``g(0) = 0``, so the two scales are 127 +/- a small per-row term
+    and the combined exponent still varies across the tile.  Using one
+    construction for both means a stress program is never a *weaker* test
+    than a directed one at the same geometry -- it is the same arithmetic
+    with different numbers, which is what a stress pool is for.
+
+    ``bs`` and ``altfmt`` default to a random legal choice, so one pass of
+    the stress mix covers both block sizes and both accumulator formats at
+    the cells that have two.
+    """
+    if bs is None:
+        bs = rng.choice(mx_legal_bs(geom))
+    if altfmt is None:
+        altfmt = rng.choice(rvv_ref.mx_altfmts(geom.w, geom.sew))
+    blocks = rvv_ref.mx_block_count(geom.k_eff, rvv_ref.mx_block_size(bs))
+    mid = (blocks - 1) // 2
+    a, b, c = _mx_operands(geom, altfmt, bs, rng)
+    sa, sb = _mx_scale_arrays(
+        geom, blocks,
+        lambda m, s: rvv_ref.MX_E8M0_BIAS + (m % 3) - 1 + (s - mid),
+        lambda m, s: rvv_ref.MX_E8M0_BIAS + (m % 3) - 1 - (s - mid))
+    return MxPlan(geom, altfmt, bs, a, b, c, sa, sb, "mx",
+                  f"randomised, {blocks} block(s) at block_size="
+                  f"{rvv_ref.mx_block_size(bs)}")
+
+
+_MX_DIRECTIVE_WIDTH = {".byte": 8, ".half": 16, ".word": 32, ".dword": 64}
+
+
+def mx_parse_data(asm: str):
+    """``{label: [raw integers]}`` for every data label in an emitted program.
+
+    The point of reading a program's own ``.data`` back rather than trusting
+    the values that went into it is that the self-tests can then re-derive
+    the whole architectural answer *from the emitted text* -- the operands
+    the DUT will actually load, the v0 image it will actually read -- and
+    compare that against rvv_ref.  A generator bug that corrupts the image
+    on the way out is invisible to any check that only inspects its own
+    inputs.
+    """
+    out, label = {}, None
+    body = asm.split("    .data\n", 1)
+    if len(body) != 2:
+        return out
+    for line in body[1].splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.endswith(":"):
+            label = stripped[:-1]
+            out.setdefault(label, [])
+            continue
+        head, _, rest = stripped.partition(" ")
+        if head in _MX_DIRECTIVE_WIDTH and label is not None:
+            out[label].extend(int(tok, 0) for tok in rest.split(","))
+        elif head == ".zero" and label is not None:
+            out[label].extend([0] * int(rest, 0))
+        elif head in (".balign", ".globl", ".text"):
+            label = None
+    return out
+
+
+def _sext(value: int, width: int) -> int:
+    return value - (1 << width) if value >> (width - 1) else value
+
+
+def mx_reconstruct(asm: str, plan: MxPlan, *, pair_index=None, stride=None):
+    """Re-derive the whole architectural answer from an emitted program.
+
+    Reads ``mat_a``, ``mat_b``, ``c_init`` and ``v0_scales`` out of the
+    program's ``.data``, unpacks the v0 image with the spec's own index
+    functions, and runs :func:`rvv_ref.int_scaled_gemm_reference` on the
+    result.  Then it checks, element by element, that what the program will
+    *do* at run time -- copy c_init, load a literal, or convert
+    ``ref_int + ref_bump`` -- lands on that answer.
+
+    *pair_index* and *stride* default to rvv_ref's honest implementations
+    and are parameters so that a negative control can sabotage the
+    **generator**, re-emit, and then decode with the honest ones.  Patching
+    both sides at once would be a control with no teeth: the two errors
+    would cancel and the check would stay green, which is the exact failure
+    mode round five warned about.
+    """
+    pair_index = pair_index or rvv_ref.mx_pair_index
+    stride = stride or rvv_ref.mx_scale_stride
+    geom = plan.geom
+    width, fmt = geom.sew, plan.fmt
+    _ebits, prec, _bias, _emax = rvv_ref.fp_fields(width, fmt)
+    data = mx_parse_data(asm)
+
+    def matrix(label, rows, cols, element_width, signed):
+        flat = data[label]
+        assert len(flat) == rows * cols, (label, len(flat), rows * cols)
+        return [[_sext(v, element_width) if signed else v
+                 for v in flat[i * cols:(i + 1) * cols]] for i in range(rows)]
+
+    a = matrix("mat_a", geom.m, geom.k_eff, width, True)
+    b = matrix("mat_b", geom.n_max, geom.k_eff, width, True)
+    c = matrix("c_init", geom.m, geom.n_max, width, False)
+
+    r = stride(geom.sew, geom.lam)
+    image = data["v0_scales"]
+    assert len(image) == geom.vlen // rvv_ref.MX_PAIR_WIDTH, len(image)
+    scales_a = [[0] * r for _ in range(geom.m)]
+    scales_b = [[0] * r for _ in range(geom.m)]
+    for m in range(geom.m):
+        for s in range(r):
+            pair = image[pair_index(m, s, r)]
+            scales_a[m][s] = pair & 0xFF
+            scales_b[m][s] = (pair >> 8) & 0xFF
+
+    ref = rvv_ref.int_scaled_gemm_reference(a, b, c, scales_a, scales_b,
+                                            geom, bs=plan.bs,
+                                            altfmt=plan.altfmt)
+    block_size = rvv_ref.mx_block_size(plan.bs)
+    blocks = rvv_ref.mx_block_count(geom.k_eff, block_size)
+    modes, bumps, lits = data["ref_mode"], data["ref_bump"], data["ref_lit"]
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            off = _c_off(geom, i, j)
+            mode = modes[off]
+            want = ref[i][j]
+            if mode == MX_MODE_COPY:
+                assert j >= geom.n, (i, j)
+                assert want == c[i][j], (i, j, hex(want), hex(c[i][j]))
+            elif mode == MX_MODE_LITERAL:
+                assert lits[off] == want, (i, j, hex(lits[off]), hex(want))
+            else:
+                total = sum(
+                    rvv_ref.mx_int_block_dot(
+                        a, b, i, j,
+                        *rvv_ref.mx_block_interval(s, block_size, geom.k_eff))
+                    for s in range(blocks))
+                bits = rvv_ref.mx_int_to_fp(total, width, fmt)
+                if total:
+                    bits = (bits + _sext(bumps[off], 64)) & ((1 << width) - 1)
+                assert bits == want, (i, j, hex(bits), hex(want))
+    # ... and the tile-layout copies the IME path loads must carry the same
+    # matrices as the row-major copies the reference path loads.
+    for label, mat in (("mat_a_tile", a), ("mat_b_tile", b)):
+        expected = mx_parse_data(
+            "\n    .data\n" + "\n".join(_mx_tile_data(label, mat, geom))
+            + "\n")[label]
+        assert data[label] == expected, label
+    return ref, modes
+
+
+def _mx_name(prefix: str, plan: MxPlan, suffix: str = "") -> str:
+    geom = plan.geom
+    return (f"{prefix}sew{geom.sew}_lam{geom.lam}_lmul{geom.lmul}"
+            f"_w{geom.w}_n{geom.n}_af{plan.altfmt}_bs{plan.bs}{suffix}")
+
+
+def mx_directed_tiers(vlen: int, insns: Sequence[str], seed: int = 0
+                      ) -> List[Tuple[str, str, TileGeometry]]:
+    """Round six's four tiers, in order, for the mnemonics in *insns*.
+
+    Returned as a list rather than generated inline in
+    :func:`directed_suite` so that the self-tests can ask for the tiers
+    without asking for the 638 programs that precede them.  The order --
+    ime_mx_, ime_mxs_, ime_mxn_, ime_mxl_ -- is fixed for the same
+    append-don't-interleave reason every earlier round fixed its own: a tree
+    that passed round five must still see exactly the programs it saw,
+    in exactly the order, before any of these.
+    """
+    out: List[Tuple[str, str, TileGeometry]] = []
+    for plan in mx_exact_plans(vlen, seed):
+        if plan.geom.mnemonic not in insns:
+            continue
+        name = _mx_name("ime_mx_", plan)
+        out.append((name, emit_mx_test(plan, name), plan.geom))
+    for plan in mx_scale_plans(vlen, seed + 100):
+        if plan.geom.mnemonic not in insns:
+            continue
+        name = _mx_name("ime_mxs_", plan)
+        out.append((name, emit_mx_test(plan, name), plan.geom))
+    for suffix, plan in mx_nan_plans(vlen, seed + 200):
+        if plan.geom.mnemonic not in insns:
+            continue
+        name = _mx_name("ime_mxn_", plan, f"_{suffix}")
+        out.append((name, emit_mx_test(plan, name), plan.geom))
+    for mnemonic in ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv"):
+        if mnemonic not in insns:
+            continue
+        w = {"vfwimmacc.vv": 2, "vfqimmacc.vv": 4,
+             "vf8wimmacc.vv": 8}[mnemonic]
+        sew, lam, lmul = MXL_CELL[w]
+        geom = TileGeometry(vlen, sew, lam, lmul,
+                            lmul * (vlen // sew), w, "op", "mx")
+        name = f"ime_mxl_{mnemonic.split('.')[0]}"
+        out.append((name, emit_mxl_test(vlen, mnemonic, name), geom))
+    return out
+
+
 def directed_suite(vlen: int, seed: int = 0,
                    sews: Sequence[int] = (8, 16, 32, 64),
                    lmuls: Sequence[int] = (1, 2, 4, 8),
@@ -1425,6 +3141,18 @@ def directed_suite(vlen: int, seed: int = 0,
             asm = (emit_clayout_test(geom, name) if clayout
                    else emit_test(geom, rvv_ref.random_case(geom, rng), name))
             out.append((name, asm, geom))
+
+    # Round six, appended after every tier above and never interleaved into
+    # one, for the same byte-identity reason each earlier round was appended
+    # after its predecessors.  The four microscaled tiers do not go through
+    # the (prefix, sews, ws, tloads, kinds) table because they are not a
+    # sweep over it: each one picks its geometries by a property the table
+    # cannot express -- how many microscaling blocks the K interval has --
+    # and each carries its own operand construction.  See mx_directed_tiers.
+    round_six = [m for m in ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv")
+                 if m in insns]
+    if round_six:
+        out += mx_directed_tiers(vlen, round_six, seed)
     return out
 
 
@@ -2057,13 +3785,620 @@ def check_verdict_contract() -> None:
         assert helpers.classify_run(run).failed
 
 
+
+# ---------------------------------------------------------------------------
+# round six: self-tests
+# ---------------------------------------------------------------------------
+#
+# Every one of these carries at least one **negative control**: the model is
+# sabotaged in the one way the tier exists to catch, and the tier is
+# required to go red.  Round five's lesson, stated in its design note and
+# repeated here because it is the whole reason this section is longer than
+# the generator it tests: a tier that cannot fail is not a tier.
+#
+# The controls all sabotage the *generator* and then judge with the honest
+# model.  Patching both sides would let the two errors cancel -- which is
+# precisely how a transposed C tile survived four rounds of green.
+
+
+class _sabotage:
+    """Temporarily replace attributes, for a negative control."""
+
+    def __init__(self, module, **attrs):
+        self.module, self.attrs, self.saved = module, attrs, {}
+
+    def __enter__(self):
+        for name, value in self.attrs.items():
+            self.saved[name] = getattr(self.module, name)
+            setattr(self.module, name, value)
+        return self
+
+    def __exit__(self, *exc):
+        for name, value in self.saved.items():
+            setattr(self.module, name, value)
+        return False
+
+
+def _must_fail(what: str, fn) -> None:
+    """Assert *fn* raises -- the negative-control assertion itself."""
+    try:
+        fn()
+    except (AssertionError, ValueError, KeyError, IndexError):
+        return
+    raise AssertionError(f"negative control has no teeth: {what} passed")
+
+
+def check_mx_scale_image() -> None:
+    """The v0 paired-scale image must be the spec's, not a plausible one.
+
+    Three claims, and the third is the one with the history: the low byte is
+    scale_A and the high byte scale_B (spec 2161-2170); every pair position
+    is accounted for, because M*R == VLEN/pw exactly (spec 2192-2197); and
+    the pair index is ``m*R + s``, row stride outermost.
+
+    Negative control: swap the index to ``s*R + m``.  The image must change
+    at every geometry whose R is greater than 1 -- which is every geometry
+    with more than one block, i.e. exactly the ones the ime_mxs_ tier is
+    built from.
+    """
+    swapped_somewhere = False
+    for geom, _bs in _mx_geometries(256, "one"):
+        r = rvv_ref.mx_scale_stride(geom.sew, geom.lam)
+        sa = [[(m * 7 + s + 1) & 0x7F for s in range(r)]
+              for m in range(geom.m)]
+        sb = [[(m * 5 + s * 3 + 2) & 0x7F for s in range(r)]
+              for m in range(geom.m)]
+        image = mx_scale_image(geom, sa, sb)
+        assert len(image) == geom.vlen // rvv_ref.MX_PAIR_WIDTH
+        for m in range(geom.m):
+            for s in range(r):
+                pair = image[rvv_ref.mx_pair_index(m, s, r)]
+                assert pair & 0xFF == sa[m][s], (geom.describe(), m, s)
+                assert (pair >> 8) & 0xFF == sb[m][s], (geom.describe(), m, s)
+
+        def swapped(m, s, rr):
+            return s * rr + m
+
+        if r > 1:
+            # The swapped index either lands on a different byte or walks
+            # off the end of the array entirely (M=2, R=8 at SEW=64 puts
+            # s*R+m as high as 57 in a 16-element register).  Both are the
+            # control firing; only "same image" is the control being inert.
+            with _sabotage(rvv_ref, mx_pair_index=swapped):
+                try:
+                    other = mx_scale_image(geom, sa, sb)
+                except IndexError:
+                    other = None
+            assert other != image, geom.describe()
+            swapped_somewhere = True
+    assert swapped_somewhere, "no R > 1 geometry: the layout control is inert"
+
+    # The padding rule, as data rather than as prose: every position the
+    # architecture must not read carries the E8M0 NaN code.
+    geom, bs = next(g for g in _mx_geometries(256, "one")
+                    if rvv_ref.mx_scale_stride(g[0].sew, g[0].lam) > 1)
+    r = rvv_ref.mx_scale_stride(geom.sew, geom.lam)
+    sa, sb = _mx_scale_arrays(geom, 1, lambda m, s: rvv_ref.MX_E8M0_BIAS,
+                              lambda m, s: rvv_ref.MX_E8M0_BIAS)
+    assert all(row[s] == MX_POISON_SCALE for row in sa for s in range(1, r))
+    assert all(row[s] == MX_POISON_SCALE for row in sb for s in range(1, r))
+    # ... and the reference model really does ignore them: poisoning the
+    # padding must not change the answer.
+    a, b, c = _mx_operands(geom, 0, bs, random.Random(1))
+    clean_a = [[rvv_ref.MX_E8M0_BIAS] * r for _ in range(geom.m)]
+    clean_b = [[rvv_ref.MX_E8M0_BIAS] * r for _ in range(geom.m)]
+    poisoned = rvv_ref.int_scaled_gemm_reference(a, b, c, sa, sb, geom, bs=bs)
+    clean = rvv_ref.int_scaled_gemm_reference(a, b, c, clean_a, clean_b,
+                                              geom, bs=bs)
+    assert poisoned == clean, geom.describe()
+
+
+def _check_mx_program(plan: MxPlan, asm: str) -> None:
+    """The structural invariants every ime_mx_ / ime_mxs_ / ime_mxn_ has."""
+    geom = plan.geom
+    alloc = VectorAlloc.allocate(geom, reserve_v0=True)
+
+    # Five IME instructions, exactly as every pair program since round one:
+    # load C, load A, load B, multiply-accumulate, store C.
+    words = re.findall(r"\.insn 4, (0x[0-9a-f]+)", asm)
+    assert len(words) == 5, (plan.describe(), words)
+    assert ime.decode(int(words[3], 0))[0] == geom.mnemonic, words
+    assert ime.decode(int(words[3], 0))[1]["vd"] == alloc.c
+
+    # v0 holds the scales, so the A tile does not.
+    assert alloc.a != 0 and alloc.b != 0, plan.describe()
+    assert f"    vle16.v v0, (a0)" in asm, plan.describe()
+    assert f"    la    a0, v0_scales" in asm, plan.describe()
+    assert f"# {geom.load_mnemonic} v{alloc.a}, (a0), a1" in asm
+
+    # vtype carries bs and altfmt on every configuration.
+    for lmul in {geom.lmul, geom.lmul_c}:
+        want = vtype_value(geom, lmul=lmul, altfmt=plan.altfmt, bs=plan.bs)
+        assert f"    li    t1, 0x{want:x}" in asm, (plan.describe(), lmul)
+    if plan.bs:
+        offset, _width = ime.VTYPE_IME_FIELDS["bs"]
+        assert (vtype_value(geom, lmul=geom.lmul, bs=1) >> (64 - offset)) & 1
+    if plan.altfmt:
+        lsb, _width = ime.VTYPE_BASE_FIELDS["altfmt"]
+        assert (vtype_value(geom, lmul=geom.lmul, altfmt=1) >> lsb) & 1
+
+    # The reference path is integer end to end: no scalar FP unit is even
+    # enabled, which is what lets the tier cover binary16 and bfloat16.
+    assert f"li    t0, {MSTATUS_FS_INITIAL}" not in asm, plan.describe()
+    for banned in ("fmul.", "fadd.", "fmadd", "fcvt", "flw", "fld"):
+        assert banned not in asm, (banned, plan.describe())
+
+    # The comparison is the usual exact one over every physical element.
+    assert asm.count("beq   t4, t5, 1f") == geom.m * geom.n_max
+    assert "%f" not in asm and "%llx" not in asm
+
+    # The verdict line keeps helpers._GEOM_RE's three adjacent fields and
+    # names the accumulator format, which describe() cannot.
+    import helpers
+    line = f"TITAN PASS {plan.describe()}"
+    assert line in asm
+    match = helpers._GEOM_RE.search(line)
+    assert match and int(match.group("sew")) == geom.sew
+    assert f"MXC={plan.fmt}" in line and f"bs={plan.bs}" in line
+
+
+def check_mx_emission() -> None:
+    """Round six's exactness tier: every cell, every element differential.
+
+    The claims:
+
+      * all seven (W, SEW, altfmt) cells of tbl-intmx-encoding-map are
+        reached -- the tier enumerates `altfmt` from rvv_ref.mx_altfmts, so
+        "seven" is the table's number, not one written down here;
+      * every program is a single-block program with both scales 2**0;
+      * every *active* element is recomputed on the DUT.  Nothing falls back
+        to a literal, which is what "exact" means operationally: if the
+        operand bound stopped keeping the dot product inside the
+        significand, elements would start arriving as constants and this
+        would fail;
+      * and the whole answer re-derived from the emitted .data agrees with
+        rvv_ref.int_scaled_gemm_reference.
+
+    Two negative controls, each sabotaging the generator and judging with
+    the honest model:
+
+      * the v0 pair index becomes ``s*R + m`` -- the row-stride mistake
+        round6_design.md names as the most likely implementation bug;
+      * the operand bound is blown open to the full integer range, so the
+        dot product no longer fits the significand and int_to_fp starts
+        rounding.  The tier must notice that it has stopped being exact
+        rather than quietly emitting rounded constants.
+    """
+    cells, plans, tails = set(), [], 0
+    for plan in mx_exact_plans(256):
+        assert plan.blocks == 1, plan.describe()
+        assert all(b == rvv_ref.MX_E8M0_BIAS
+                   for row in plan.scales_a for b in row[:1])
+        asm = emit_mx_test(plan, "mx_probe")
+        _check_mx_program(plan, asm)
+        _ref, elements = mx_element_plan(plan)
+        for i in range(plan.geom.m):
+            for j in range(plan.geom.n):
+                assert elements[(i, j)][0] == MX_MODE_COMPUTE, \
+                    (plan.describe(), i, j)
+                assert elements[(i, j)][2] == 0, "2**0 needs no exponent bump"
+        if plan.geom.n < plan.geom.n_max:
+            # The two things that exist only at partial N.
+            tails += 1
+            assert any(elements[(i, j)][0] == MX_MODE_COPY
+                       for i in range(plan.geom.m)
+                       for j in range(plan.geom.n, plan.geom.n_max)), \
+                plan.describe()
+            assert any(plan.scales_b[m][0] == MX_POISON_SCALE
+                       for m in range(plan.geom.n, plan.geom.m)), \
+                plan.describe()
+        mx_reconstruct(asm, plan)
+        cells.add((plan.geom.w, plan.geom.sew, plan.altfmt))
+        plans.append(plan)
+    assert len(cells) == len(
+        [1 for (w, sew), (_e, fmts) in rvv_ref.MX_CELLS.items()
+         for _f in fmts]) == 7, sorted(cells)
+    assert tails, "the tier never reaches N < N_max: the C tail policy and " \
+                  "the inactive scale_B fields are untested"
+
+    # Negative control 1: the v0 row stride.
+    def swapped(m, s, r):
+        return s * r + m
+
+    victim = next(p for p in plans
+                  if rvv_ref.mx_scale_stride(p.geom.sew, p.geom.lam) > 1)
+    with _sabotage(rvv_ref, mx_pair_index=swapped):
+        bad = emit_mx_test(victim, "mx_probe")
+    _must_fail("v0 pair index s*R+m", lambda: mx_reconstruct(bad, victim))
+
+    # Negative control 2: exactness.  bfloat16 has 8 significand bits, so
+    # the full Int8 range overflows it by a mile.
+    bf16 = next(p for p in plans if p.fmt == "bfloat16")
+
+    def unbounded(geom, altfmt, bs):
+        return (1 << (rvv_ref.mx_legal_cell(geom.w, geom.sew,
+                                            altfmt)[0] - 1)) - 1
+
+    def rebuild():
+        with _sabotage(sys.modules[__name__],
+                       _mx_operand_bound=unbounded):
+            a, b, c = _mx_operands(bf16.geom, bf16.altfmt, bf16.bs,
+                                   random.Random(7))
+        loose = MxPlan(bf16.geom, bf16.altfmt, bf16.bs, a, b, c,
+                       bf16.scales_a, bf16.scales_b, "mx", "unbounded")
+        _ref, elements = mx_element_plan(loose)
+        for i in range(loose.geom.m):
+            for j in range(loose.geom.n):
+                assert elements[(i, j)][0] == MX_MODE_COMPUTE, (i, j)
+
+    _must_fail("operand bound blown open", rebuild)
+
+
+def check_mxs_emission() -> None:
+    """Round six's scale tier: the block loop and the R-strided v0 layout.
+
+    What this tier has that the exactness tier does not is *variation along
+    both axes of v0*.  Both scale arrays are a function of the row index and
+    of the block index, so reading the pair at ``s*R + m`` instead of
+    ``m*R + s`` lands on a different byte and produces a different exponent;
+    and both are checked here to actually vary, because a tier whose scale
+    array happened to be constant would be an exactness tier with extra
+    steps.
+
+    The combined exponent ``E = dA(i) + dB(j)`` is constant across blocks by
+    construction, which is what keeps the accumulation exact -- and is
+    asserted per element, not assumed, by mx_element_plan.
+
+    Negative controls:
+
+      * the v0 pair index swap again, which here bites at *every* geometry
+        rather than only at R > 1;
+      * ``read_block_scales`` reduced to reading scale_A and ignoring
+        scale_B -- a one-line implementation slip that the exactness tier,
+        where both bytes are 0x7F, cannot see at all.
+    """
+    plans, blocks_seen, bs_seen = [], set(), set()
+    for plan in mx_scale_plans(256):
+        assert plan.blocks >= 2, plan.describe()
+        geom = plan.geom
+        # Both arrays vary along both axes.
+        rows = {tuple(row[:plan.blocks]) for row in plan.scales_a}
+        assert len(rows) > 1, plan.describe()
+        assert any(len(set(row[:plan.blocks])) > 1 for row in plan.scales_a)
+        assert any(len(set(row[:plan.blocks])) > 1
+                   for row in plan.scales_b[:geom.n])
+        asm = emit_mx_test(plan, "mxs_probe")
+        _check_mx_program(plan, asm)
+        _ref, elements = mx_element_plan(plan)
+        bumps = set()
+        for i in range(geom.m):
+            for j in range(geom.n):
+                assert elements[(i, j)][0] == MX_MODE_COMPUTE, \
+                    (plan.describe(), i, j)
+                bumps.add(elements[(i, j)][2])
+        assert len(bumps) > 1, (plan.describe(),
+                                "every element has the same E: the exponent "
+                                "path is not being exercised")
+        mx_reconstruct(asm, plan)
+        plans.append(plan)
+        blocks_seen.add(plan.blocks)
+        bs_seen.add(plan.bs)
+    assert plans, "the scale tier is empty"
+    assert bs_seen == {0, 1}, sorted(bs_seen)
+    assert max(blocks_seen) >= 2, sorted(blocks_seen)
+
+    def swapped(m, s, r):
+        return s * r + m
+
+    victim = plans[0]
+    with _sabotage(rvv_ref, mx_pair_index=swapped):
+        bad = emit_mx_test(victim, "mxs_probe")
+    _must_fail("v0 pair index s*R+m", lambda: mx_reconstruct(bad, victim))
+
+    honest_scale = rvv_ref.mx_block_scale
+
+    def scale_a_only(scale_a, scale_b, width, fmt):
+        return honest_scale(scale_a, rvv_ref.MX_E8M0_BIAS, width, fmt)
+
+    with _sabotage(rvv_ref, mx_block_scale=scale_a_only):
+        bad = emit_mx_test(victim, "mxs_probe")
+    _must_fail("read_block_scales ignoring scale_B",
+               lambda: mx_reconstruct(bad, victim))
+
+
+def check_mxn_emission() -> None:
+    """Round six's NaN tier: the early exit and the finite +0 x +inf pair.
+
+    Three claims:
+
+      * a 0xFF scale byte makes exactly the row (or column) it belongs to
+        the default NaN, and leaves the rest of the tile alone.  Both halves
+        matter: an implementation that NaN-ed the whole tile would satisfy
+        the first and fail the second;
+      * the poison works at a block index other than zero, which is what
+        separates "checks every block's scale" from "checks block 0"; and
+      * a binary16 accumulator with the *finite* codes 0x00 and 0xFE
+        produces the default NaN, because the converted pair is +0 x +inf
+        (spec 2021-2024).  This is the case a model that tests the encoded
+        bytes for 0xFF instead of testing the product gets wrong.
+
+    Negative controls:
+
+      * ``read_block_scales`` never reporting NaN -- the early exit deleted.
+        Every planted element must stop being the default NaN;
+      * ``S_blocks`` forced to 1 -- an implementation that only looks at
+        block 0.  The later-block planting must stop producing a NaN.
+    """
+    variants, nan_plans = set(), []
+    for suffix, plan in mx_nan_plans(256):
+        geom = plan.geom
+        width, fmt = geom.sew, plan.fmt
+        nan = rvv_ref.fp_default_nan(width, fmt)
+        asm = emit_mx_test(plan, "mxn_probe")
+        _check_mx_program(plan, asm)
+        ref, elements = mx_element_plan(plan)
+        planted = [(i, j) for i in range(geom.m) for j in range(geom.n)
+                   if ref[i][j] == nan]
+        assert planted, (suffix, plan.describe())
+        clean = [(i, j) for i in range(geom.m) for j in range(geom.n)
+                 if elements[(i, j)][0] == MX_MODE_COMPUTE]
+        assert clean, (suffix, plan.describe(),
+                       "the whole tile went NaN: the poison is not localised")
+        for i, j in planted:
+            assert elements[(i, j)][0] == MX_MODE_LITERAL, (i, j)
+        mx_reconstruct(asm, plan)
+        variants.add(suffix)
+        nan_plans.append((suffix, plan, nan))
+    assert variants == {"a0", "bl", "pm"}, sorted(variants)
+
+    # The spec 2021-2024 case, spelled out: both bytes finite, product NaN.
+    suffix, plan, nan = next(t for t in nan_plans if t[0] == "pm")
+    assert plan.fmt == "binary16"
+    assert 0x00 in {b for row in plan.scales_a for b in row}
+    assert 0xFE in {b for row in plan.scales_b for b in row}
+    for byte in (0x00, 0xFE):
+        _bits, is_nan = rvv_ref.mx_decode_scale(byte, plan.geom.sew, "binary16")
+        assert not is_nan, hex(byte)
+    assert rvv_ref.mx_block_scale(0x00, 0xFE, plan.geom.sew, "binary16")[1]
+
+    # Negative control 1: 0xFF decoded as an ordinary value.
+    #
+    # Note what this control is *not*: it is not "delete the early exit".
+    # Sail 5390-5392's `break` is unobservable in the result -- a NaN block
+    # scale multiplies and adds into the accumulator as a NaN anyway, so the
+    # element comes out the default NaN with or without it, and only fflags
+    # (spec 1815-1824, out of scope) can tell the two apart.  Saying so here
+    # matters, because a control that "passes" for that reason would be
+    # exactly the toothless tier this section exists to prevent.
+    #
+    # What the tier does catch is an implementation that never recognises
+    # 0xFF at all -- the plausible RTL slip, since E8M0 has no other special
+    # code -- so that is what is sabotaged.
+    honest_decode = rvv_ref.mx_decode_scale
+
+    def nan_blind(byte, width, fmt):
+        if byte == rvv_ref.MX_E8M0_NAN:
+            return rvv_ref.fp_one(width, fmt), False
+        return honest_decode(byte, width, fmt)
+
+    def blind_to_the_nan_code():
+        for suffix, plan, nan in nan_plans:
+            with _sabotage(rvv_ref, mx_decode_scale=nan_blind):
+                ref, _elements = mx_element_plan(plan)
+            assert any(ref[i][j] == nan for i in range(plan.geom.m)
+                       for j in range(plan.geom.n)), (suffix,
+                                                      plan.describe())
+
+    _must_fail("0xFF decoded as an ordinary scale", blind_to_the_nan_code)
+
+    # Negative control 3: the paired scale computed by *adding exponents*
+    # instead of converting each byte to fmt_C and multiplying there.  That
+    # is the shortcut an RTL designer reaches for -- E8M0 is exponent-only,
+    # so why not? -- and spec 2008-2024 is the answer: 0x00 and 0xFE are
+    # 2**-127 and 2**127, which in binary16 are +0 and +inf, and their
+    # product is the default NaN even though the exponents sum to zero.
+    honest_scale = rvv_ref.mx_block_scale
+    suffix, pm_plan, pm_nan = next(t for t in nan_plans if t[0] == "pm")
+
+    def exponent_add(scale_a, scale_b, width, fmt):
+        if rvv_ref.MX_E8M0_NAN in (scale_a, scale_b):
+            return honest_scale(scale_a, scale_b, width, fmt)
+        bits = _pow2_bits((scale_a - rvv_ref.MX_E8M0_BIAS)
+                          + (scale_b - rvv_ref.MX_E8M0_BIAS), width, fmt)
+        if bits is None:
+            return honest_scale(scale_a, scale_b, width, fmt)
+        return bits, False
+
+    def scales_multiplied_in_fmt_c():
+        with _sabotage(rvv_ref, mx_block_scale=exponent_add):
+            ref, _elements = mx_element_plan(pm_plan)
+        assert any(ref[i][j] == pm_nan for i in range(pm_plan.geom.m)
+                   for j in range(pm_plan.geom.n)), pm_plan.describe()
+
+    _must_fail("block scale by exponent addition",
+               scales_multiplied_in_fmt_c)
+
+    # Negative control 2: only block 0 is inspected.
+    suffix, plan, nan = next(t for t in nan_plans if t[0] == "bl")
+
+    def one_block(k_eff, block_size):
+        return 1
+
+    def only_block_zero():
+        with _sabotage(rvv_ref, mx_block_count=one_block):
+            ref, _elements = mx_element_plan(plan)
+        assert any(ref[i][j] == nan for i in range(plan.geom.m)
+                   for j in range(plan.geom.n)), plan.describe()
+
+    _must_fail("only block 0 inspected", only_block_zero)
+
+
+def check_mxl_emission() -> None:
+    """Round six's legality tier, including the vm=1 regression guard.
+
+    The invariants, each of which is a different way for the tier to be
+    worthless:
+
+      * both polarities are present.  A tier of nothing but "must trap"
+        cases is passed by a decoder that traps on all three funct6 values,
+        which would break rounds one to three;
+      * every case whose vm is 1 is required *not* to trap, and its word
+        decodes to the already-implemented integer multiply-accumulate --
+        the MX word and the integer word differ in exactly bit 25;
+      * every reserved (W, SEW) cell of the encoding map is probed, and
+        every altfmt_A / altfmt_B = 1 case is required to trap;
+      * the program installs and restores a trap handler, and restores
+        mtvec on every exit path including the failing one -- the harness
+        has its own handler and printf runs through it.
+
+    Negative controls:
+
+      * ``check_microscaling_legality`` neutered.  The bs=1 case must stop
+        being a trap case, which the invariant catches;
+      * the vm=1 peer table pointed back at the MX mnemonic, so the two
+        words no longer differ in the vm bit.  Generation must refuse.
+    """
+    seen_reserved, polarity = set(), set()
+    for mnemonic in ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv"):
+        w = {"vfwimmacc.vv": 2, "vfqimmacc.vv": 4,
+             "vf8wimmacc.vv": 8}[mnemonic]
+        cases = mxl_cases(256, mnemonic)
+        asm = emit_mxl_test(256, mnemonic, "mxl_probe")
+        assert asm.count(".insn 4,") == len(cases), mnemonic
+        for index, case in enumerate(cases):
+            polarity.add(case.expect_trap)
+            back, ops = ime.decode(case.word)
+            assert back == case.mnemonic
+            assert ops == {"vd": MXL_VD, "vs1": MXL_VS1, "vs2": MXL_VS2}
+            if case.vm:
+                assert case.expect_trap == 0, (mnemonic, index)
+                assert case.mnemonic == MXL_VM1_PEER[mnemonic]
+                assert case.mnemonic in ("vwmmacc.vv", "vqmmacc.vv",
+                                         "v8wmmacc.vv")
+            else:
+                assert case.mnemonic == mnemonic
+            if (w, case.geom.sew) not in rvv_ref.MX_CELLS and not case.vm:
+                assert case.expect_trap == 1, (mnemonic, index)
+                seen_reserved.add((w, case.geom.sew))
+            assert f"    .insn 4, {case.word:#010x}" in asm
+            assert f"    li    t1, 0x{case.vtype:x}" in asm
+        # Exactly one case per mnemonic is the positive control at its own
+        # canonical cell, and it comes first so a total-trap decoder fails
+        # on case 0 rather than deep in the list.
+        assert cases[0].expect_trap == 0 and cases[0].vm == 0, mnemonic
+
+        # The handler, and mtvec discipline.
+        assert ".Ltrap:" in asm and "    mret" in asm
+        assert "    csrr  s8, mtvec" in asm
+        assert asm.count("    csrw  mtvec, s8") == 3, mnemonic
+        assert asm.index(".Ltrap:") > asm.index(".Lret:"), mnemonic
+        assert "TITAN PASS" in asm and "TITAN FAIL row=%d" in asm
+
+    # Every reserved cell in the table is probed by some program.
+    for w in (2, 4, 8):
+        for sew in (8, 16, 32, 64):
+            if (w, sew) not in rvv_ref.MX_CELLS:
+                assert (w, sew) in seen_reserved, (w, sew)
+    assert polarity == {0, 1}
+
+    # Negative control 1: neuter check_microscaling_legality.
+    def permissive(w, lmul, sew, lam, bs=0):
+        return None
+
+    def bs_case_still_traps():
+        with _sabotage(rvv_ref, mx_check_legality=permissive):
+            cases = mxl_cases(256, "vf8wimmacc.vv")
+        bs_cases = [c for c in cases if "W*LMUL" in c.tag]
+        assert bs_cases, "no bs=1 case at all"
+        assert all(c.expect_trap for c in bs_cases), \
+            "bs=1 with W*LMUL > SEW stopped being a trap case"
+
+    _must_fail("check_microscaling_legality neutered", bs_case_still_traps)
+
+    # Negative control 2: point the vm=1 peer back at the MX mnemonic.
+    def vm_confused():
+        with _sabotage(sys.modules[__name__],
+                       MXL_VM1_PEER={"vfwimmacc.vv": "vfwimmacc.vv",
+                                     "vfqimmacc.vv": "vfqimmacc.vv",
+                                     "vf8wimmacc.vv": "vf8wimmacc.vv"}):
+            mxl_cases(256, "vfwimmacc.vv")
+
+    _must_fail("vm=1 routed back to the MX form", vm_confused)
+
+
+def check_mx_verdict_contract() -> None:
+    """helpers.classify_run must read round six's verdicts too.
+
+    Same contract as rounds one to five -- the markers are deliberately
+    unchanged, so the loop's feedback machinery needs no round-six branch --
+    with one addition that has to be checked rather than hoped for: the
+    geometry clause now carries ``MXC=<format>`` after ``describe()``'s own
+    fields, and helpers._GEOM_RE scrapes ``VLEN= SEW= LAMBDA=`` as three
+    adjacent fields.  Appending would break that if it were inserted.
+    """
+    import helpers
+
+    class _Run:
+        def __init__(self, log):
+            self.log, self.success, self.returncode = log, True, 0
+
+    def expand(fmts, kind, *args):
+        text = fmts[kind].replace("\\n", "\n")
+        for value in args:
+            text = re.sub(r"%d", str(value), text, count=1)
+        return text
+
+    plan = next(iter(mx_exact_plans(256)))
+    asm = emit_mx_test(plan, "mx_probe")
+    fmts = dict(re.findall(r'^\.Lfmt_(\w+):\s+\.asciz "(.*)"$', asm, re.M))
+    assert set(fmts) == {"pass", "skip", "fail", "diff", "cdump", "cref",
+                         "elem", "nl"}, sorted(fmts)
+    assert helpers.classify_run(_Run(expand(fmts, "pass"))).kind == "pass"
+    failed = helpers.classify_run(_Run(expand(fmts, "fail", 3, 2)))
+    assert failed.kind == "mismatch" and failed.failed, failed
+    assert (failed.row, failed.col) == (3, 2), failed
+    assert failed.vlen == 256 and failed.sew == plan.geom.sew, failed
+    skipped = helpers.classify_run(_Run(expand(fmts, "skip", 1, 1)))
+    assert skipped.kind in ("skip", "bad_geometry"), skipped
+    assert skipped.requested_lambda == plan.geom.lam, skipped
+
+    mxl = emit_mxl_test(256, "vfwimmacc.vv", "mxl_probe")
+    fmts = dict(re.findall(r'^\.Lfmt_(\w+):\s+\.asciz "(.*)"$', mxl, re.M))
+    assert set(fmts) == {"pass", "skip", "fail", "diff"}, sorted(fmts)
+    assert helpers.classify_run(_Run(expand(fmts, "pass"))).kind == "pass"
+    failed = helpers.classify_run(_Run(expand(fmts, "fail", 5, 1)))
+    assert failed.kind == "mismatch" and failed.failed, failed
+    assert failed.row == 5, failed
+    for run in (_Run(""), _Run("unrelated simulator chatter")):
+        assert helpers.classify_run(run).failed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256)
     parser.add_argument(
         "--emit", metavar="SEW,LAMBDA,LMUL,N[,W][,op|t][,pair|clayout]",
         help="print one program instead of running self-tests")
+    parser.add_argument(
+        "--emit-mx", metavar="NAME",
+        help="print one round-six program by name (ime_mx_..., ime_mxs_..., "
+             "ime_mxn_..., ime_mxl_...), or list them all if NAME is 'list'")
     args = parser.parse_args()
+
+    if args.emit_mx:
+        tiers = mx_directed_tiers(
+            args.vlen, ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv"))
+        if args.emit_mx == "list":
+            for name, _asm, geom in tiers:
+                print(f"{name}  {geom.describe()}")
+            return 0
+        for name, asm, _geom in tiers:
+            if name == args.emit_mx:
+                print(asm)
+                return 0
+        print(f"no round-six program named {args.emit_mx!r}; "
+              f"--emit-mx list shows them all", file=sys.stderr)
+        return 1
 
     if args.emit:
         toks = args.emit.split(",")
@@ -2089,7 +4424,13 @@ def main() -> int:
                   check_round_four_emission,
                   check_clayout_emission,
                   check_verdict_contract,
-                  check_clayout_verdict_contract):
+                  check_clayout_verdict_contract,
+                  check_mx_scale_image,
+                  check_mx_emission,
+                  check_mxs_emission,
+                  check_mxn_emission,
+                  check_mxl_emission,
+                  check_mx_verdict_contract):
         check()
         print(f"  ok  {check.__name__}")
 
@@ -2104,6 +4445,18 @@ def main() -> int:
                                for (chk, kind, w, tl), n in sorted(tally.items()))
         print(f"\nVLEN={args.vlen} {label}: {len(suite)} programs "
               f"({breakdown}), {lines:,} lines of assembly")
+        # Round six's four tiers all land in the same (check, kind, W, tload)
+        # buckets as each other, so the line above cannot separate them.
+        # They are counted again by name prefix -- and only when there are
+        # any, so the output of a round one to five scope is unchanged.
+        tiers = {}
+        for name, _asm, _g in suite:
+            for prefix in ("ime_mx_", "ime_mxs_", "ime_mxn_", "ime_mxl_"):
+                if name.startswith(prefix):
+                    tiers[prefix] = tiers.get(prefix, 0) + 1
+        if tiers:
+            print("  round six by tier: "
+                  + " + ".join(f"{n} {p}" for p, n in sorted(tiers.items())))
     return 0
 
 

@@ -35,7 +35,7 @@ import random
 import struct
 from fractions import Fraction
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 # NOT named `encodings` -- CPython imports the stdlib `encodings` package
 # during interpreter startup, so it is already in sys.modules before any
@@ -176,7 +176,25 @@ class TileGeometry:
         table = {"int": {1: "vmmacc.vv", 2: "vwmmacc.vv",
                          4: "vqmmacc.vv", 8: "v8wmmacc.vv"},
                  "fp": {1: "vfmmacc.vv", 2: "vfwmmacc.vv",
-                        4: "vfqmmacc.vv", 8: "vf8wmmacc.vv"}}
+                        4: "vfqmmacc.vv", 8: "vf8wmmacc.vv"},
+                 # Round six: the MX integer-input / FP-accumulate forms.
+                 # They ride the *integer* funct6 run (OPIVV 0x39/0x3a/0x3b)
+                 # and are selected by vm=0 -- at vm=1 those same three
+                 # encodings are vwmmacc.vv / vqmmacc.vv / v8wmmacc.vv, which
+                 # rounds one to three already implement (Sail 5963-5975,
+                 # 6196-6205, 6082-6091).  There is no W=1 entry: vmmacc.vv
+                 # keeps vm=0 reserved (spec 2333).
+                 "mx": {2: "vfwimmacc.vv", 4: "vfqimmacc.vv",
+                        8: "vf8wimmacc.vv"},
+                 # Round seven: the widening floating-point forms.  Same
+                 # three mnemonics as the "fp" row at W>1 -- deliberately,
+                 # because they *are* the same encodings (OPFVV 0x15/0x16/
+                 # 0x17, spec 1336-1339).  The separate kind exists because
+                 # round four's kind='fp' carries a validate() that rejects
+                 # W>1, and relaxing that in place would change what an
+                 # existing round-four geometry accepts.
+                 "fpw": {2: "vfwmmacc.vv", 4: "vfqmmacc.vv",
+                         8: "vf8wmmacc.vv"}}
         try:
             return table[self.kind][self.w]
         except KeyError:
@@ -248,10 +266,13 @@ class TileGeometry:
             raise ValueError(
                 f"tload={self.tload!r}: expected 'op' (vmtl.v / vmts.v) or "
                 f"'t' (vmttl.v / vmtts.v)")
-        if self.kind not in ("int", "fp"):
+        if self.kind not in ("int", "fp", "mx", "fpw"):
             raise ValueError(
-                f"kind={self.kind!r}: expected 'int' (Zvvmm) or 'fp' "
-                f"(Zvvfmm)")
+                f"kind={self.kind!r}: expected 'int' (Zvvmm), 'fp' "
+                f"(Zvvfmm) or 'mx' (round six, the Zvvfmm integer-input "
+                f"microscaled forms) or 'fpw' (round seven, the widening "
+                f"floating-point forms vfwmmacc.vv / vfqmmacc.vv / "
+                f"vf8wmmacc.vv)")
         if self.check not in ("pair", "clayout"):
             raise ValueError(
                 f"check={self.check!r}: expected 'pair' (the differential "
@@ -289,6 +310,53 @@ class TileGeometry:
                     f"IEEE binary{{32,64}} accumulator widths only "
                     f"(binary16 / bfloat16 / OFP8 / OFP4 need the "
                     f"vtype.altfmt_A / altfmt_B format decode)")
+        if self.kind == "fpw":
+            # Round seven.  As with round six the legal cells are a table
+            # (tbl-fp-encoding-map, spec 7288-7370), so validate against it
+            # directly rather than against a rule the architecture does not
+            # state.  altfmt / altfmt_A / altfmt_B are not TileGeometry
+            # fields -- every row of a cell shares this geometry and the
+            # generator picks the format triple -- so only the cell's
+            # existence is checked here, via the row that every cell has.
+            _eew, _rows = FP_CELLS[(self.w, self.sew)] \
+                if (self.w, self.sew) in FP_CELLS else (None, None)
+            if _rows is None:
+                raise ValueError(
+                    f"kind='fpw' W={self.w} SEW={self.sew} is a reserved "
+                    f"encoding; legal cells are {sorted(FP_CELLS)} "
+                    f"(spec 7288-7370)")
+            if self.w == 1:
+                raise ValueError(
+                    "kind='fpw' is the *widening* floating-point family "
+                    "(W in {2,4,8}); vfmmacc.vv (W=1) is kind='fp'")
+            if self.tload != "op":
+                raise ValueError(
+                    f"kind='fpw' with tload={self.tload!r}: the transposing "
+                    f"pair is tested at kind='int', so that a layout "
+                    f"failure stays separable from an arithmetic one")
+            # Unscaled (vm=1) needs no microscaling rule; the vm=0 tier calls
+            # fpw_check_legality(..., vm=0) per program, because bs and LMUL
+            # are program properties rather than geometry ones.
+            fpw_check_legality(self.w, self.lmul, self.sew, self.lam, 0, 1)
+        if self.kind == "mx":
+            # Round six.  The legal (W, SEW) cells are a *table*
+            # (tbl-intmx-encoding-map, spec 7469-7540) rather than a rule,
+            # so validate against it directly; mx_legal_cell raises with the
+            # reserved-encoding reason.  altfmt is not a TileGeometry field
+            # -- both rows of a two-row cell share this geometry and the
+            # generator picks the accumulator format -- so only altfmt=0 is
+            # checked here, which every cell has.
+            mx_legal_cell(self.w, self.sew, 0)
+            if self.tload != "op":
+                raise ValueError(
+                    f"kind='mx' with tload={self.tload!r}: the transposing "
+                    f"pair is tested at kind='int', so that a layout "
+                    f"failure stays separable from an arithmetic one")
+            # The microscaling legality rule needs LAMBDA and LMUL, which
+            # the encoding-map table does not carry.  bs=0 (block size 32)
+            # is the unconditional case; bs=1 adds W*LMUL <= SEW and the
+            # generator checks that per program.
+            mx_check_legality(self.w, self.lmul, self.sew, self.lam, 0)
         if self.tload == "t" and self.w != 1:
             # Zvvmttls: "The transposing instructions vmttl.v and vmtts.v
             # transpose SEW-bit storage elements.  They do not unpack,
@@ -315,7 +383,7 @@ class TileGeometry:
                 raise ValueError(
                     f"W={self.w} with SEW={self.sew} is reserved "
                     f"(EEW = SEW/{self.w} < 4)")
-            if self.eew_ab < 8:
+            if self.eew_ab < 8 and self.kind not in ("mx", "fpw"):
                 raise ValueError(
                     f"W={self.w} with SEW={self.sew} gives EEW_A="
                     f"{self.eew_ab}; sub-byte (Int4) input tiles are not "
@@ -368,7 +436,15 @@ class TileGeometry:
         # scrapes `VLEN=(\d+) SEW=(\d+) LAMBDA=(\d+)` as three adjacent
         # fields, and an integer geometry must print byte-for-byte what
         # round three printed.
-        fp = "" if self.kind == "int" else f" FP=binary{self.sew}"
+        # kind='fpw' accumulators are not binary<SEW> -- vfwmmacc.vv at
+        # SEW=8 accumulates in E4M3 or E5M2 -- so the round-seven clause
+        # prints the cell rather than a width.  Every pre-round-seven kind
+        # keeps its exact previous string, which is what the byte-identical
+        # regression over rounds one to six rests on.
+        if self.kind == "fpw":
+            fp = f" FPW=W{self.w}/SEW{self.sew}"
+        else:
+            fp = "" if self.kind == "int" else f" FP=binary{self.sew}"
         # And the check clause last of all, for the same reason: a "pair"
         # geometry -- every geometry rounds one to four generate -- must
         # print byte-for-byte what round four printed.
@@ -1061,6 +1137,28 @@ def clayout_reg_image(c: Matrix, geom: TileGeometry) -> List[int]:
 #: design note.
 FP_FORMATS = {32: (8, 24), 64: (11, 53)}
 
+#: Round six needs a *second* key, because the accumulator format is no
+#: longer a function of the storage width: binary16 and bfloat16 are both 16
+#: bits wide and differ in where the exponent/significand split falls
+#: (spec 1399-1410 -- binary16 p=11, BFloat16 p=8).  vtype.altfmt selects
+#: between them (spec 1094-1106), so the Sail carries ``fmt_C`` as a value
+#: distinct from ``EEW_C`` and this module now does too.
+#:
+#: ``fp_fields`` and everything built on it take an optional ``fmt`` naming a
+#: row of this table.  When ``fmt`` is None the old width-keyed lookup runs
+#: unchanged, so every round one to five call site keeps its exact previous
+#: behaviour -- including the ValueError that :func:`fp_fields` raises for an
+#: unmodelled width.  That is deliberate: those tiers' generated programs are
+#: required to stay byte-identical across rounds.
+#:
+#: name -> (storage width, exponent bits, significand bits incl. hidden bit)
+FP_FORMATS_BY_NAME = {
+    "binary16": (16, 5, 11),
+    "bfloat16": (16, 8, 8),
+    "binary32": (32, 8, 24),
+    "binary64": (64, 11, 53),
+}
+
 #: The Titan implementation disclosure required by spec 1652-1656, as a
 #: mapping from (SEW, W, LAMBDA) to (G, psm, rnd).  Round four discloses one
 #: tuple for every geometry it implements:
@@ -1091,8 +1189,259 @@ FP_DISCLOSURE = {"G": 1, "psm": 0, "rnd": "frm"}
 FP_FRM = 0        # RNE, round to nearest, ties to even
 
 
-def fp_fields(width: int):
-    """(exponent bits, significand bits, bias, max biased exponent)."""
+#: Round seven's three widening floating-point multiply-accumulates need
+#: three element formats that this module has never modelled: OFP8 (E4M3 and
+#: E5M2) and OFP4 (E2M1).  They are declared here, and deliberately left
+#: *unpopulated*, because the IME specification does not define them.
+#:
+#: Spec 1908-1913 cites the OCP Microscaling Formats (MX) v1.0 specification
+#: normatively instead of restating it; spec 1400-1410 gives only the
+#: significand width p (E2M1 p=2, E4M3 p=4, E5M2 p=3); spec 1127-1140 and
+#: 1098-1108 name the formats without defining a single bit; and Sail
+#: 4831-4838 leaves ``fp_is_NaN``, ``fp_defaultNaN`` and ``fp_zero`` as
+#: undefined helpers that defer to that definition.  Contrast E8M0, which
+#: spec 1989-2026 restates in full -- which is exactly why round six needed
+#: no external document and round seven does.
+#:
+#: What is undecidable without the documents, and would corrupt this judge
+#: silently rather than loudly:
+#:
+#: * E4M3 has no infinity encoding, so RNE overflow to an E4M3 accumulator
+#:   cannot go to infinity the way :func:`fp_round` does at line ~1255.  The
+#:   pattern that would be written is an E4M3 NaN.  vfwmmacc.vv at SEW=8 has
+#:   E4M3 as a legal *accumulator* format (spec 1098-1099), so this is not a
+#:   corner: it is every SEW=8 geometry in the round.
+#: * E4M3's NaN set is not "exponent all ones and significand nonzero", so
+#:   :func:`fp_is_nan` is wrong for it by construction, and the E4M3
+#:   ``fp_defaultNaN`` bit pattern is not derivable from anything here.
+#: * E2M1 has neither infinities nor NaNs, so its overflow rule is spec text
+#:   rather than an IEEE consequence.
+#: * Spec 2010-2012 describes E8M0 scale conversion as yielding "the largest
+#:   finite positive value, or +inf", language that presumes an
+#:   infinity-capable fmt_C.  Resolving it for an E4M3 or E5M2 accumulator
+#:   needs the OFP8 definition.
+#:
+#: Two documents are required, not one: MX v1.0 defines E2M1, the block
+#: structure and E8M0, but for E4M3/E5M2 it refers to the separate OCP 8-bit
+#: Floating Point (OFP8) v1.0 specification.  Drop both into
+#: titan/ime-spec/ and populate the rows below from them.
+#:
+#: Secondary sources are explicitly *not* an acceptable substitute.  They
+#: disagree with each other in ways that are invisible unless you already
+#: know the answer: microsoft/microxcaling reports E4M3 as having five
+#: mantissa bits and E2M1 as having three, because it carries an internal
+#: ``mbits = m + 2`` convention.  A judge built from that would encode a
+#: wrong format and then attribute its own error to the RTL.
+#:
+#: name -> the reason it is not yet modelled.  Keys, not values, are the
+#: contract: :func:`fp_fields` consults this before
+#: :data:`FP_FORMATS_BY_NAME` so that a round-seven call site asking for a
+#: pending format gets a precise diagnosis instead of a KeyError that reads
+#: like a typo.
+OCP_PENDING_FORMATS = {
+    "e4m3": "OFP8 E4M3: needs OCP 8-bit Floating Point (OFP8) v1.0 "
+            "(no Inf encoding; NaN set and overflow rule not derivable)",
+    "e5m2": "OFP8 E5M2: needs OCP 8-bit Floating Point (OFP8) v1.0",
+    "e2m1": "OFP4 E2M1: needs OCP Microscaling Formats (MX) v1.0 "
+            "(no Inf, no NaN; overflow rule is spec text)",
+}
+
+
+class OCPSpecUnavailable(NotImplementedError):
+    """Raised where a decision needs a document that is not on disk.
+
+    A distinct type, not a bare NotImplementedError, so that a caller can
+    tell "this harness has not implemented X" from "this harness refuses to
+    guess X".  The second is a deliberate, recoverable state; the first is a
+    bug.  Round seven's generators are expected to let this propagate rather
+    than catch it and emit a reduced-coverage suite.
+    """
+
+
+@dataclass(frozen=True)
+class FpFormat:
+    """A floating-point element format, as data rather than as code.
+
+    Round seven's nine encoding-map cells span seven formats, three of which
+    (E4M3, E5M2, E2M1) are not IEEE-shaped and are not yet definable.  The
+    generators are written against *this* descriptor rather than against
+    ``fp_fields`` so that adding those three is filling in a table row, not
+    rewriting a code path -- which is the difference between a second pass
+    that is thin and one that rediscovers every decision.
+
+    Every field that an OFP format would make non-IEEE is carried here
+    explicitly, even though all three currently-resolved widening cells have
+    the IEEE answer for all of them:
+
+    ``has_inf``
+        Whether the format encodes infinities at all.  E4M3 and E2M1 do not.
+    ``nan_rule``
+        How NaNs are encoded.  ``"ieee"`` is exponent-all-ones with a nonzero
+        significand; the OFP8 E4M3 rule is a *single* pattern and E2M1 has no
+        NaN at all, so this cannot be a predicate hard-coded in one function.
+    ``overflow``
+        What a rounding that exceeds the format's range produces.  ``"inf"``
+        is the IEEE answer under RNE.  A format with no infinity cannot give
+        that answer, and which answer it does give is spec text.
+
+    ``None`` in any of those three means "the document that decides this is
+    not on disk".  :func:`fp_format` refuses such a descriptor by raising
+    :class:`OCPSpecUnavailable`, so a generator cannot reach a half-defined
+    format by accident -- it has to be handed one, and it cannot be.
+    """
+    name: str
+    width: int
+    ebits: int
+    prec: int                      # significand bits, hidden bit included
+    has_inf: Optional[bool] = None
+    nan_rule: Optional[str] = None
+    overflow: Optional[str] = None
+
+    @property
+    def resolved(self) -> bool:
+        return None not in (self.has_inf, self.nan_rule, self.overflow)
+
+    @property
+    def bias(self) -> int:
+        return (1 << (self.ebits - 1)) - 1
+
+    @property
+    def emax(self) -> int:
+        """Largest biased exponent field value (the all-ones pattern)."""
+        return (1 << self.ebits) - 1
+
+    @property
+    def sub_byte(self) -> bool:
+        """True where two elements share a byte (spec 1207-1219).
+
+        No currently-resolved format is sub-byte -- E2M1 is the only one --
+        but the packing path is written against this property rather than
+        against ``width == 4`` so that the OFP4 cells do not arrive needing a
+        new branch.  See :func:`fpw_pack_elements`.
+        """
+        return self.width < 8
+
+
+#: The seven element formats round seven's encoding map can name.
+#:
+#: The four resolved rows restate FP_FORMATS_BY_NAME and are checked against
+#: it in :func:`check_round_seven_format_table`, so the two cannot drift.
+#: The three unresolved rows carry their width and significand width -- which
+#: spec 1400-1410 does state -- and leave every behavioural field None.
+#:
+#: When the OCP documents land, this table is the edit: three rows gain
+#: ``has_inf`` / ``nan_rule`` / ``overflow``, OCP_PENDING_FORMATS empties,
+#: and nothing else in the round-seven path changes.  E4M3's row is the one
+#: to be careful with: ``has_inf=False`` and an ``overflow`` that is not
+#: ``"inf"``.
+FP_FORMAT_TABLE = {
+    "binary16": FpFormat("binary16", 16, 5, 11, True, "ieee", "inf"),
+    "bfloat16": FpFormat("bfloat16", 16, 8, 8, True, "ieee", "inf"),
+    "binary32": FpFormat("binary32", 32, 8, 24, True, "ieee", "inf"),
+    "binary64": FpFormat("binary64", 64, 11, 53, True, "ieee", "inf"),
+    # Widths and significands from spec 1400-1410; everything behavioural is
+    # deliberately absent.  See OCP_PENDING_FORMATS for what each needs.
+    "e4m3": FpFormat("e4m3", 8, 4, 4),
+    "e5m2": FpFormat("e5m2", 8, 5, 3),
+    "e2m1": FpFormat("e2m1", 4, 2, 2),
+}
+
+
+def fp_format(name: str) -> FpFormat:
+    """The descriptor for *name*, or raise if it is not yet definable."""
+    try:
+        fmt = FP_FORMAT_TABLE[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown floating-point format {name!r}; the round-seven "
+            f"encoding map names {sorted(FP_FORMAT_TABLE)}") from None
+    if not fmt.resolved:
+        raise OCPSpecUnavailable(
+            f"floating-point format {name!r} is declared but not modelled: "
+            f"{OCP_PENDING_FORMATS.get(name, 'no definition on disk')}.  The "
+            f"IME spec cites OCP normatively (1908-1913) rather than "
+            f"restating the encoding; fill in FP_FORMAT_TABLE from the "
+            f"documents, do not infer the fields from IEEE 754.")
+    return fmt
+
+
+def fpf_is_nan(bits: int, fmt: FpFormat) -> bool:
+    """NaN predicate driven by the descriptor, not by an IEEE assumption."""
+    if fmt.nan_rule == "ieee":
+        return ((bits >> (fmt.prec - 1)) & fmt.emax == fmt.emax
+                and bool(bits & ((1 << (fmt.prec - 1)) - 1)))
+    if fmt.nan_rule == "none":
+        return False
+    raise OCPSpecUnavailable(
+        f"NaN rule {fmt.nan_rule!r} for {fmt.name} is not modelled")
+
+
+def fpf_is_inf(bits: int, fmt: FpFormat) -> bool:
+    if not fmt.has_inf:
+        return False
+    return ((bits >> (fmt.prec - 1)) & fmt.emax == fmt.emax
+            and not bits & ((1 << (fmt.prec - 1)) - 1))
+
+
+def fpf_unpack(bits: int, fmt: FpFormat):
+    """``(kind, sign, Fraction)`` for *bits* read as *fmt*.
+
+    Delegates to :func:`fp_unpack` for the resolved IEEE-shaped formats,
+    which rounds four to six already exercise, rather than opening a second
+    implementation of the same decode.
+    """
+    if fmt.nan_rule != "ieee" or not fmt.has_inf:
+        raise OCPSpecUnavailable(
+            f"{fmt.name} is not IEEE-shaped; its decode is not modelled")
+    return fp_unpack(bits, fmt.width, fmt.name)
+
+
+def fpf_round(value: "Fraction", fmt: FpFormat, frm: int = 0) -> int:
+    """Round an exact value into *fmt*, per the descriptor's overflow rule."""
+    if fmt.overflow != "inf":
+        raise OCPSpecUnavailable(
+            f"{fmt.name} overflow rule {fmt.overflow!r} is not modelled; a "
+            f"format without infinities cannot use the IEEE overflow path")
+    if frm != FP_FRM:
+        raise ValueError(
+            f"frm={frm} is not modelled; round seven generates RNE only "
+            f"(FP_FRM), matching spec 1495 and the FP_DISCLOSURE tuple")
+    # fp_round takes a nonnegative magnitude plus a sign bit; round seven
+    # works in signed Fractions throughout, so the split happens here and
+    # nowhere else.  A negative value that rounds to zero must give -0.0,
+    # which is why the sign is taken before the magnitude and not from the
+    # rounded result.
+    sign = 1 if value < 0 else 0
+    return fp_round(sign, -value if sign else value, fmt.width, fmt.name)
+
+
+def fp_fields(width: int, fmt: Optional[str] = None):
+    """(exponent bits, significand bits, bias, max biased exponent).
+
+    *fmt* names a row of :data:`FP_FORMATS_BY_NAME` and is what round six
+    onwards passes; the storage width must agree with the name's, which is
+    checked rather than assumed so that a binary16/bfloat16 mix-up cannot
+    pass silently.  ``fmt=None`` keeps the round one to five width-keyed
+    lookup byte-for-byte, including the ValueError below.
+    """
+    if fmt is not None:
+        if fmt in OCP_PENDING_FORMATS:
+            raise OCPSpecUnavailable(
+                f"floating-point format {fmt!r} is declared but not "
+                f"modelled: {OCP_PENDING_FORMATS[fmt]}.  The IME spec cites "
+                f"OCP normatively (1908-1913) rather than restating the "
+                f"encoding, so there is nothing here to derive it from; see "
+                f"OCP_PENDING_FORMATS.")
+        try:
+            fwidth, ebits, prec = FP_FORMATS_BY_NAME[fmt]
+        except KeyError:
+            raise ValueError(
+                f"unknown floating-point format {fmt!r}; modelled formats "
+                f"are {sorted(FP_FORMATS_BY_NAME)}") from None
+        if fwidth != width:
+            raise ValueError(
+                f"format {fmt!r} is {fwidth} bits wide, called at {width}")
+        return ebits, prec, (1 << (ebits - 1)) - 1, (1 << ebits) - 1
     try:
         ebits, prec = FP_FORMATS[width]
     except KeyError:
@@ -1104,18 +1453,18 @@ def fp_fields(width: int):
     return ebits, prec, (1 << (ebits - 1)) - 1, (1 << ebits) - 1
 
 
-def fp_is_nan(bits: int, width: int) -> bool:
-    ebits, prec, _bias, emax = fp_fields(width)
+def fp_is_nan(bits: int, width: int, fmt: Optional[str] = None) -> bool:
+    ebits, prec, _bias, emax = fp_fields(width, fmt)
     return (bits >> (prec - 1)) & emax == emax and bits & ((1 << (prec - 1)) - 1)
 
 
-def fp_is_inf(bits: int, width: int) -> bool:
-    ebits, prec, _bias, emax = fp_fields(width)
+def fp_is_inf(bits: int, width: int, fmt: Optional[str] = None) -> bool:
+    ebits, prec, _bias, emax = fp_fields(width, fmt)
     return ((bits >> (prec - 1)) & emax == emax
             and not bits & ((1 << (prec - 1)) - 1))
 
 
-def fp_default_nan(width: int) -> int:
+def fp_default_nan(width: int, fmt: Optional[str] = None) -> int:
     """Sail ``fp_defaultNaN``: the canonical quiet NaN for *width*.
 
     Spec 1880-1886: "NaN payloads are not architecturally significant for IME
@@ -1125,18 +1474,18 @@ def fp_default_nan(width: int) -> int:
     single fixed bit pattern and compares bit-for-bit like any other value --
     which is why the harness needs no NaN-aware comparison.
     """
-    ebits, prec, _bias, emax = fp_fields(width)
+    ebits, prec, _bias, emax = fp_fields(width, fmt)
     return (emax << (prec - 1)) | (1 << (prec - 2))
 
 
-def fp_unpack(bits: int, width: int):
+def fp_unpack(bits: int, width: int, fmt: Optional[str] = None):
     """(kind, sign, value) with *value* an exact :class:`Fraction`.
 
     ``kind`` is ``"nan"``, ``"inf"`` or ``"num"``; ``sign`` is 0 or 1; for
     ``"num"`` the magnitude is exact and zero is representable (sign carries
     the -0.0 / +0.0 distinction, which the bitwise compare cares about).
     """
-    ebits, prec, bias, emax = fp_fields(width)
+    ebits, prec, bias, emax = fp_fields(width, fmt)
     sign = (bits >> (width - 1)) & 1
     exp = (bits >> (prec - 1)) & emax
     frac = bits & ((1 << (prec - 1)) - 1)
@@ -1152,7 +1501,8 @@ def _pow2(e: int) -> Fraction:
     return Fraction(1 << e) if e >= 0 else Fraction(1, 1 << -e)
 
 
-def fp_round(sign: int, value: Fraction, width: int) -> int:
+def fp_round(sign: int, value: Fraction, width: int,
+             fmt: Optional[str] = None) -> int:
     """Round an exact nonnegative rational to *width* bits, RNE.
 
     This is Sail ``fp_round_to_frm`` at ``frm = RNE``.  It implements the
@@ -1164,7 +1514,7 @@ def fp_round(sign: int, value: Fraction, width: int) -> int:
     *value* must be the exact magnitude; the caller supplies the sign.
     """
     assert value >= 0, value
-    ebits, prec, bias, emax = fp_fields(width)
+    ebits, prec, bias, emax = fp_fields(width, fmt)
     sbit = sign << (width - 1)
     if value == 0:
         return sbit
@@ -1198,41 +1548,41 @@ def _floor_log2(value: Fraction) -> int:
     return e
 
 
-def fp_mul(a: int, b: int, width: int) -> int:
+def fp_mul(a: int, b: int, width: int, fmt: Optional[str] = None) -> int:
     """Sail ``fp_mul``: exact product, one rounding to *width* under frm.
 
     Special values follow IEEE-754 and spec 1841-1848: an sNaN or qNaN
     operand, or 0 x inf, produces the *canonical* NaN -- never a propagated
     payload.
     """
-    ka, sa, va = fp_unpack(a, width)
-    kb, sb, vb = fp_unpack(b, width)
+    ka, sa, va = fp_unpack(a, width, fmt)
+    kb, sb, vb = fp_unpack(b, width, fmt)
     sign = sa ^ sb
     if ka == "nan" or kb == "nan":
-        return fp_default_nan(width)
+        return fp_default_nan(width, fmt)
     if ka == "inf" or kb == "inf":
         if (ka == "num" and va == 0) or (kb == "num" and vb == 0):
-            return fp_default_nan(width)      # 0 x inf: invalid
-        _, prec, _, emax = fp_fields(width)
+            return fp_default_nan(width, fmt)  # 0 x inf: invalid
+        _, prec, _, emax = fp_fields(width, fmt)
         return (sign << (width - 1)) | (emax << (prec - 1))
-    return fp_round(sign, va * vb, width)
+    return fp_round(sign, va * vb, width, fmt)
 
 
-def fp_add(a: int, b: int, width: int) -> int:
+def fp_add(a: int, b: int, width: int, fmt: Optional[str] = None) -> int:
     """Sail ``fp_add``: exact sum, one rounding to *width* under frm.
 
     inf + (-inf) is invalid and yields the canonical NaN (spec 1850-1856).
     The sign of an exact zero result is IEEE's: -0.0 only when both addends
     were -0.0 (RNE never produces -0.0 from a cancelling sum).
     """
-    ka, sa, va = fp_unpack(a, width)
-    kb, sb, vb = fp_unpack(b, width)
+    ka, sa, va = fp_unpack(a, width, fmt)
+    kb, sb, vb = fp_unpack(b, width, fmt)
     if ka == "nan" or kb == "nan":
-        return fp_default_nan(width)
-    _, prec, _, emax = fp_fields(width)
+        return fp_default_nan(width, fmt)
+    _, prec, _, emax = fp_fields(width, fmt)
     if ka == "inf" or kb == "inf":
         if ka == "inf" and kb == "inf" and sa != sb:
-            return fp_default_nan(width)
+            return fp_default_nan(width, fmt)
         sign = sa if ka == "inf" else sb
         return (sign << (width - 1)) | (emax << (prec - 1))
     total = (-va if sa else va) + (-vb if sb else vb)
@@ -1243,7 +1593,7 @@ def fp_add(a: int, b: int, width: int) -> int:
         if va == 0 and vb == 0 and sa == sb:
             return sa << (width - 1)
         return 0
-    return fp_round(1 if total < 0 else 0, abs(total), width)
+    return fp_round(1 if total < 0 else 0, abs(total), width, fmt)
 
 
 def fp_gemm_reference(a: Matrix, b: Matrix, c: Matrix,
@@ -1444,6 +1794,362 @@ def random_fp_case(geom: "TileGeometry", rng: random.Random):
 
 
 # ---------------------------------------------------------------------------
+# round six: the MX integer-input, FP-accumulate family
+# ---------------------------------------------------------------------------
+#
+# vfwimmacc.vv / vfqimmacc.vv / vf8wimmacc.vv.  Sail `int_scaled_gemm`
+# (spec 5373-5410) is the whole architecture, and two things about it decide
+# the shape of everything below.
+#
+# 1. It never calls get_fp_grouping / get_fp_psm / get_fp_rnd, and it has no
+#    `G` legality check -- contrast `fp_gemm` at 5238-5242.  Spec 1283-1287
+#    and 1645-1652 say so in prose: this path "uses the separately specified
+#    exact integer block-dot-product path and is not governed by G, psm, or
+#    rnd".  So there is no implementation disclosure to model, and no
+#    `rnd`/`psm` parameter anywhere in this section.
+#
+# 2. Its loop nest is j / i / s only -- there is *no* LMUL step loop.  The
+#    block-and-step intersection, `subdot_lo/hi` and the shortened-group
+#    machinery of spec 2030-2060 belong to `fp_scaled_gemm`, not here;
+#    `int_block_dot` is handed the whole block interval.  Copying the
+#    group-A intersection logic into this model would be a judge bug that
+#    presents as an RTL bug, so it is called out here and asserted in
+#    :func:`check_round_six_block_intervals`.
+
+#: Scale format.  Spec 2128: every microscaling extension in v0.9.0 uses
+#: E8M0, so sw = 8 and the *pair* width pw = 2 * sw = 16.
+MX_SCALE_WIDTH = 8
+MX_PAIR_WIDTH = 2 * MX_SCALE_WIDTH
+
+#: E8M0, spec 1990-1993, normatively referencing the OCP Microscaling
+#: Formats (MX) v1.0 specification: an 8-bit exponent-only format, bias 127,
+#: representing 2**-127 .. 2**127, with 0xFF encoding NaN.
+#:
+#: Read the value range carefully, because it is what makes this format
+#: unlike every IEEE one modelled above: there is no zero encoding, no
+#: infinity encoding and no subnormal encoding.  Byte 0x00 is 2**-127 (a
+#: perfectly ordinary finite value), byte 0xFE is 2**127, and 0xFF is the
+#: *only* non-finite code.  A model that treats 0x00 as zero -- the obvious
+#: IEEE reflex -- is wrong, and wrong in a direction that silently produces
+#: plausible numbers.
+MX_E8M0_BIAS = 127
+MX_E8M0_NAN = 0xFF
+
+#: (W, SEW) -> (integer input width, {altfmt: accumulator format name}).
+#: The normative table is `tbl-intmx-encoding-map`, spec 7469-7540; the SEW
+#: guards are in each instruction's Sail (vfwimmacc 6035-6038, vfqimmacc
+#: 6266-6270, vf8wimmacc 6151).  Absent keys are reserved encodings, which is
+#: what :func:`mx_legal_cell` reports.
+#:
+#: altfmt_A and altfmt_B are *not* in this table: spec 2335-2342 makes MXINT
+#: signed unconditionally and the Sail raises Illegal_Instruction when either
+#: is 1 (6045-6046 / 6162-6163 / 6277-6278).  Only vtype.altfmt, which picks
+#: the C accumulator format, is free -- and only where the table gives two
+#: rows; at SEW 32 and 64 altfmt=1 is reserved.
+MX_CELLS = {
+    (2, 16): (8, {0: "binary16", 1: "bfloat16"}),   # vfwimmacc,  MXINT8
+    (4, 16): (4, {0: "binary16", 1: "bfloat16"}),   # vfqimmacc,  MXINT4
+    (4, 32): (8, {0: "binary32"}),                  # vfqimmacc,  MXINT8
+    (8, 32): (4, {0: "binary32"}),                  # vf8wimmacc, MXINT4
+    (8, 64): (8, {0: "binary64"}),                  # vf8wimmacc, MXINT8
+}
+
+
+def mx_legal_cell(w: int, sew: int, altfmt: int = 0):
+    """``(input width, accumulator format)`` for a legal cell, else raise.
+
+    The single place this module decides whether an (W, SEW, altfmt) triple
+    is architecture or is a reserved encoding.
+    """
+    try:
+        ewidth, fmts = MX_CELLS[(w, sew)]
+    except KeyError:
+        raise ValueError(
+            f"W={w} SEW={sew} is a reserved encoding for the MX integer-input "
+            f"family; legal (W, SEW) cells are {sorted(MX_CELLS)} "
+            f"(spec 7469-7540)") from None
+    try:
+        return ewidth, fmts[altfmt]
+    except KeyError:
+        raise ValueError(
+            f"W={w} SEW={sew} altfmt={altfmt} is reserved; the C accumulator "
+            f"format table offers {sorted(fmts)} here (spec 7469-7540)"
+        ) from None
+
+
+def mx_block_size(bs: int) -> int:
+    """Spec 1166-1172 and Sail 5379: bs=0 -> 32 elements, bs=1 -> 16."""
+    if bs not in (0, 1):
+        raise ValueError(f"bs is one bit, got {bs}")
+    return 16 if bs else 32
+
+
+def mx_check_legality(w: int, lmul: int, sew: int, lam: int,
+                      bs: int = 0) -> None:
+    """Sail ``check_microscaling_legality`` (5151-5158), verbatim::
+
+        if EEW_C * lambda < pw then return Illegal_Instruction();
+        if vtype[bs] == 0b1 & (W * LMUL > EEW_C) then return Illegal_Instruction()
+
+    Raises :class:`ValueError` where the Sail raises Illegal_Instruction, so
+    the generator can enumerate the negative cases from the same rule that
+    decides the positive ones.
+    """
+    if sew * lam < MX_PAIR_WIDTH:
+        raise ValueError(
+            f"SEW*LAMBDA = {sew * lam} < pw = {MX_PAIR_WIDTH}: the paired "
+            f"scale elements do not fit in v0 (spec 2343-2347, Sail 5155)")
+    if bs == 1 and w * lmul > sew:
+        raise ValueError(
+            f"bs=1 requires W*LMUL <= SEW, got {w}*{lmul} > {sew} "
+            f"(Sail 5156)")
+
+
+def mx_scale_stride(sew: int, lam: int) -> int:
+    """Row stride ``R = LAMBDA * SEW / pw`` (spec 2139, Sail 5381)."""
+    r, rem = divmod(lam * sew, MX_PAIR_WIDTH)
+    assert rem == 0, (sew, lam)
+    return r
+
+
+def mx_block_count(k_eff: int, block_size: int) -> int:
+    """``S_blocks = ceil(K_eff / block_size)`` (spec 2166, Sail 5380)."""
+    return -(-k_eff // block_size)
+
+
+def mx_block_interval(s: int, block_size: int, k_eff: int):
+    """``(k_lo, k_hi)`` for block *s*, Sail 5396-5397.
+
+    ``k_hi = min(k_lo + block_size, K_eff) - 1`` -- the final block may be
+    short.  Note what is *absent*: no LMUL step is involved.  See the section
+    preamble.
+    """
+    k_lo = s * block_size
+    return k_lo, min(k_lo + block_size, k_eff) - 1
+
+
+def mx_pair_index(m: int, s: int, r: int) -> int:
+    """Index of the 16-bit scale-pair element in ``v0`` (spec 2161-2170).
+
+    ``p = m * R + s``.  Sail ``read_block_scales`` (5110-5117) reads the A
+    scale at ``i * R + s`` and the B scale at ``j * R + s`` -- the same
+    function of a row/column index and a block index, out of the *same*
+    register.  Getting the two factors the wrong way round (``s * R + m``) is
+    the most likely implementation bug in the whole round, which is why a
+    negative control sabotages exactly this.
+    """
+    return m * r + s
+
+
+def mx_decode_scale(byte: int, width: int, fmt: str):
+    """E8M0 byte -> ``(bits in fmt, is_nan)``.  Spec 2008-2019.
+
+    "Conversion of each non-NaN E8M0 scale value to the accumulator FP format
+    uses `frm`.  The converted value and accrued exception flags are those of
+    a normal conversion to `fmt_C` under that rounding mode.  Depending on
+    `fmt_C`, `frm`, and the scale value, range conversion may produce a
+    finite normal or subnormal value, +0, the largest finite positive value,
+    or +inf."
+
+    So this is *not* an exponent splice: 2**127 is unrepresentable in
+    binary16 and must go through the ordinary rounding path (spec 2013-2016
+    gives exactly that example).  :func:`fp_round` at RNE overflows to
+    infinity and underflows into the subnormals, which is the frm=RNE column
+    of that sentence.
+    """
+    if not 0 <= byte <= 0xFF:
+        raise ValueError(f"E8M0 scale is one byte, got {byte}")
+    if byte == MX_E8M0_NAN:
+        return fp_default_nan(width, fmt), True
+    return fp_round(0, _pow2(byte - MX_E8M0_BIAS), width, fmt), False
+
+
+def mx_block_scale(scale_a: int, scale_b: int, width: int, fmt: str):
+    """Sail ``read_block_scales`` (5097-5122) -> ``(blk_scale, is_nan)``.
+
+    Both bytes are decoded into ``fmt_C`` and multiplied there::
+
+        let blk_scale : bits(EEW_C) = fp_mul(sA, sB, EEW_C, fmt_C, rm);
+        (blk_scale, fp_is_NaN(blk_scale, EEW_C, fmt_C))
+
+    The NaN test is on the *product*, not on either byte, and that
+    distinction carries real cases: spec 2021-2024 says that if one converted
+    scale is +0 and the other +inf the paired multiplication "produces the
+    default NaN and raises the invalid-operation flag, even though both
+    encoded E8M0 scales are finite".  A model that only checks for 0xFF
+    misses those and calls a correct implementation wrong.
+    """
+    sa, nan_a = mx_decode_scale(scale_a, width, fmt)
+    sb, nan_b = mx_decode_scale(scale_b, width, fmt)
+    blk = fp_mul(sa, sb, width, fmt)
+    del nan_a, nan_b          # subsumed: a NaN operand makes fp_mul NaN
+    return blk, fp_is_nan(blk, width, fmt)
+
+
+def mx_int_block_dot(a: Matrix, b: Matrix, i: int, j: int,
+                     k_lo: int, k_hi: int) -> int:
+    """Sail ``int_block_dot`` (5128-5147): an exact, unbounded integer.
+
+    Both operands are read *signed* -- the Sail passes ``signed_A`` and
+    ``signed_B`` as the literals ``true`` at 5397, independent of
+    altfmt_A/altfmt_B (which are forced to 0 for this family anyway).
+
+    There is no modular reduction here and none afterwards: unlike
+    ``int_gemm``, whose whole sum is wrapped once at EEW_C, this value feeds
+    ``int_to_fp`` as a mathematical integer.  :func:`reference_gemm`'s
+    ``_wrap`` has no counterpart in this path.
+    """
+    return sum(a[i][k] * b[j][k] for k in range(k_lo, k_hi + 1))
+
+
+def mx_int_to_fp(value: int, width: int, fmt: str) -> int:
+    """Sail ``int_to_fp``: one correctly-rounded conversion under frm."""
+    return fp_round(1 if value < 0 else 0, Fraction(abs(value)), width, fmt)
+
+
+def fp_one(width: int, fmt: str) -> int:
+    """Sail ``fp_one``: +1.0 in *fmt*."""
+    _ebits, prec, bias, _emax = fp_fields(width, fmt)
+    return bias << (prec - 1)
+
+
+def int_scaled_gemm_reference(a: Matrix, b: Matrix, c: Matrix,
+                              scales_a: Sequence[Sequence[int]],
+                              scales_b: Sequence[Sequence[int]],
+                              geom: "TileGeometry", *,
+                              bs: int = 0, altfmt: int = 0) -> Matrix:
+    """Sail ``int_scaled_gemm`` (5373-5410), transcribed.
+
+    *a* is the M x K_eff A tile and *b* the N x K_eff B tile, both as signed
+    Python ints of the cell's integer input width (the caller sign-extends,
+    exactly as for :func:`reference_gemm` at W > 1).  *c* is the M x N
+    accumulator tile as raw ``fmt_C`` bit patterns.
+
+    *scales_a* is indexed ``[i][s]`` and *scales_b* ``[j][s]``, each an E8M0
+    byte.  They are separate arguments here although the architecture folds
+    both into one ``v0``: the folding is a *layout* question that
+    :func:`mx_pair_index` owns and that ime_tests materialises, and keeping
+    it out of the arithmetic means a layout bug and an arithmetic bug cannot
+    cancel.
+
+    Returns the new C tile as bit patterns.  Columns j >= N are untouched
+    (vta=0, spec 1811-1813).
+    """
+    width = geom.sew
+    _ewidth, fmt = mx_legal_cell(geom.w, geom.sew, altfmt)
+    mx_check_legality(geom.w, geom.lmul, geom.sew, geom.lam, bs)
+    block_size = mx_block_size(bs)
+    blocks = mx_block_count(geom.k_eff, block_size)
+
+    out = [row[:] for row in c]
+    for j in range(geom.n):
+        for i in range(geom.m):
+            acc = out[i][j]
+            nan_out = False
+            for s in range(blocks):
+                blk_scale, is_nan = mx_block_scale(
+                    scales_a[i][s], scales_b[j][s], width, fmt)
+                if is_nan:
+                    # Sail 5392: `break` -- this block's products and every
+                    # later block contribute nothing (spec 1815-1824).
+                    nan_out = True
+                    break
+                k_lo, k_hi = mx_block_interval(s, block_size, geom.k_eff)
+                dot = mx_int_block_dot(a, b, i, j, k_lo, k_hi)
+                fp_sum = mx_int_to_fp(dot, width, fmt)
+                acc = fp_add(acc, fp_mul(blk_scale, fp_sum, width, fmt),
+                             width, fmt)
+            out[i][j] = fp_default_nan(width, fmt) if nan_out else acc
+    return out
+
+
+def mx_exact_dot_bound(w: int, sew: int, altfmt: int = 0,
+                       bs: int = 0) -> int:
+    """Largest ``|dot|`` a block can hold with the result still exact.
+
+    Every integer with ``|x| <= 2**prec`` is representable in a format of
+    ``prec`` significand bits, so ``int_to_fp`` is exact below this bound and
+    the whole per-block computation is exact when the scales are 1.0.  The
+    directed generator uses this to pick operand magnitudes; see
+    :func:`mx_exact_operand_bound`.
+    """
+    _ewidth, fmt = mx_legal_cell(w, sew, altfmt)
+    _ebits, prec, _bias, _emax = fp_fields(sew, fmt)
+    del bs
+    return 1 << prec
+
+
+def mx_exact_operand_bound(w: int, sew: int, altfmt: int = 0,
+                           bs: int = 0) -> int:
+    """Largest ``|a|``, ``|b|`` keeping a whole block's dot product exact.
+
+    ``|dot| <= block_size * bound**2`` must stay within
+    :func:`mx_exact_dot_bound`.  Returns the largest such bound, clamped to
+    the cell's integer range (Int8: 127, Int4: 7 -- the negative extreme is
+    one larger in two's complement but the symmetric bound is what the
+    generator wants).
+
+    Four of the seven cells come out unclamped at the full integer range, so
+    for those this is not a restriction at all; the BF16 accumulator cells
+    are where it bites.  The table is in titan_runs/round6_design.md.
+    """
+    ewidth, _fmt = mx_legal_cell(w, sew, altfmt)
+    block_size = mx_block_size(bs)
+    limit = mx_exact_dot_bound(w, sew, altfmt, bs)
+    native = (1 << (ewidth - 1)) - 1
+    bound = 0
+    while (bound + 1) <= native and block_size * (bound + 1) ** 2 <= limit:
+        bound += 1
+    if bound == 0:
+        raise ValueError(
+            f"W={w} SEW={sew} altfmt={altfmt} bs={bs}: no nonzero operand "
+            f"bound keeps a block exact")
+    return bound
+
+
+#: W -> the SEWs the MX integer-input family is defined at, derived from
+#: MX_CELLS so the two cannot drift.  Mirrors WIDENING_SEWS_BY_W.
+MX_SEWS_BY_W = {w: tuple(sorted(sew for (ww, sew) in MX_CELLS if ww == w))
+                for w in sorted({w for (w, _s) in MX_CELLS})}
+
+
+def mx_legal_configs(vlen: int, **kwargs) -> Iterator["TileGeometry"]:
+    """Every round-six geometry, in W order.
+
+    A thin ordering over :func:`ime_legal_configs` -- the legality rules all
+    live in :meth:`TileGeometry.validate`, which now knows ``kind='mx'``, so
+    this adds only the per-W SEW restriction that the encoding map imposes.
+    W is the outer loop for the same append-don't-interleave reason every
+    other tier has.
+    """
+    for w in sorted(MX_SEWS_BY_W):
+        yield from ime_legal_configs(vlen, sews=MX_SEWS_BY_W[w], ws=(w,),
+                                     kinds=("mx",), **kwargs)
+
+
+def mx_altfmts(w: int, sew: int) -> Tuple[int, ...]:
+    """The accumulator-format selectors legal at this cell (spec 7469-7540)."""
+    _ewidth, fmts = MX_CELLS[(w, sew)]
+    return tuple(sorted(fmts))
+
+
+def mx_pack_int4(values: Sequence[int]) -> List[int]:
+    """Pack signed 4-bit elements two per byte, even index in the low nibble.
+
+    Spec 1206-1219.  MXINT4 is "4-bit signed two's-complement elements"
+    (spec 2337-2342), defined by this specification rather than by OCP, so
+    there are no special values to model -- every one of the 16 codes is an
+    ordinary integer in [-8, 7].
+    """
+    if len(values) % 2:
+        raise ValueError("int4 elements are packed in pairs")
+    out = []
+    for lo, hi in zip(values[0::2], values[1::2]):
+        out.append((lo & 0xF) | ((hi & 0xF) << 4))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # checksums
 # ---------------------------------------------------------------------------
 
@@ -1496,6 +2202,427 @@ WIDENING_SEWS = (32,)
 #: SEW=64 at W=2/W=4 works through the same machinery and is enumerable by
 #: passing it explicitly; it is left out of the default tiers because it
 #: adds programs without adding a distinct EEW_A the suite has not seen.
+# --- round seven: the widening floating-point encoding map -----------------
+#
+# tbl-fp-encoding-map, spec 7288-7370.  This is a *table*, not a rule, and it
+# is transcribed row for row rather than generated, because two of its
+# regularities are not regular:
+#
+#   * At (W=2, SEW=16) all eight OFP8 input pairs are legal at BOTH accumulator
+#     formats (FP16 and BF16) -- sixteen rows.  At (W=4, SEW=32) and
+#     (W=8, SEW=64) the same eight input pairs exist but altfmt=1 is reserved,
+#     so only six rows survive (the four same-format rows lose their altfmt=1
+#     partner, and the mixed rows appear at altfmt=0 only).
+#   * At EEW=4, altfmt_A=1 is reserved (spec 1442-1443), so OFP4 has exactly
+#     one input pair and never mixes.  At EEW>=32 altfmt_A/altfmt_B are
+#     ignored entirely (spec 1490-1493), which is written here as None rather
+#     than as 0 so that a generator cannot accidentally treat "ignored" as
+#     "must be zero" and stop exercising the other encoding.
+#
+# Deriving these from a formula is how a judge acquires a rule the
+# architecture does not have.  The table is ~40 lines; the formula would be a
+# guess.
+#
+# Key:   (W, SEW) -> (EEW_AB, rows)
+# Row:   (altfmt_A, altfmt_B, altfmt) -> (fmt_A, fmt_B, fmt_C, mx_allowed)
+#        altfmt_A / altfmt_B of None means "ignored at this width".
+#        mx_allowed is True where the row's MX cells name extensions, i.e.
+#        where vm=0 is an encoding at all (spec 7270-7286).
+_OFP8 = {0: "e4m3", 1: "e5m2"}
+_F16 = {0: "binary16", 1: "bfloat16"}
+
+
+def _ofp8_rows(fmt_c_by_altfmt, mx):
+    """The eight OFP8 input pairs crossed with the legal accumulator formats."""
+    rows = {}
+    for a in (0, 1):
+        for b in (0, 1):
+            for altfmt, fmt_c in fmt_c_by_altfmt.items():
+                rows[(a, b, altfmt)] = (_OFP8[a], _OFP8[b], fmt_c, mx)
+    return rows
+
+
+def _f16_rows(fmt_c, mx=False):
+    """The four FP16/BF16 input pairs; the accumulator is altfmt=0 only."""
+    return {(a, b, 0): (_F16[a], _F16[b], fmt_c, mx)
+            for a in (0, 1) for b in (0, 1)}
+
+
+FP_CELLS = {
+    # vfwmmacc.vv (W=2), spec 7319-7336.
+    (2, 8):  (4, {(0, 0, 0): ("e2m1", "e2m1", "e4m3", True),
+                  (0, 0, 1): ("e2m1", "e2m1", "e5m2", True)}),
+    (2, 16): (8, _ofp8_rows({0: "binary16", 1: "bfloat16"}, mx=False)),
+    (2, 32): (16, _f16_rows("binary32")),
+    (2, 64): (32, {(None, None, 0): ("binary32", "binary32",
+                                     "binary64", False)}),
+    # vfqmmacc.vv (W=4), spec 7340-7356.  SEW=8 (EEW=2) is reserved.
+    (4, 16): (4, {(0, 0, 0): ("e2m1", "e2m1", "binary16", True),
+                  (0, 0, 1): ("e2m1", "e2m1", "bfloat16", True)}),
+    (4, 32): (8, _ofp8_rows({0: "binary32"}, mx=True)),
+    (4, 64): (16, _f16_rows("binary64")),
+    # vf8wmmacc.vv (W=8), spec 7360-7370.  SEW=8 and 16 are reserved.
+    (8, 32): (4, {(0, 0, 0): ("e2m1", "e2m1", "binary32", True)}),
+    (8, 64): (8, _ofp8_rows({0: "binary64"}, mx=True)),
+}
+
+#: W -> the SEWs the widening FP family is defined at, derived from FP_CELLS
+#: so the two cannot drift.  Mirrors MX_SEWS_BY_W and WIDENING_SEWS_BY_W.
+FP_SEWS_BY_W = {w: tuple(sorted(sew for (ww, sew) in FP_CELLS if ww == w))
+                for w in sorted({w for (w, _s) in FP_CELLS})}
+
+
+def fpw_legal_row(w, sew, altfmt=0, altfmt_a=0, altfmt_b=0):
+    """``(fmt_A, fmt_B, fmt_C, mx_allowed)`` for a legal row, else raise.
+
+    The single place this module decides whether a widening floating-point
+    ``(W, SEW, altfmt_A, altfmt_B, altfmt)`` tuple is architecture or is a
+    reserved encoding, the way :func:`mx_legal_cell` is for round six.
+
+    Where the width ignores altfmt_A/altfmt_B (spec 1490-1493), *both*
+    encodings select the same row, so 0 and 1 are accepted and neither is
+    silently normalised away.
+    """
+    try:
+        _eew, rows = FP_CELLS[(w, sew)]
+    except KeyError:
+        raise ValueError(
+            f"W={w} SEW={sew} is a reserved encoding for the widening "
+            f"floating-point family; legal (W, SEW) cells are "
+            f"{sorted(FP_CELLS)} (spec 7288-7370)") from None
+    key = (altfmt_a, altfmt_b, altfmt)
+    if key not in rows and (None, None, altfmt) in rows:
+        key = (None, None, altfmt)      # altfmt_A / altfmt_B ignored here
+    try:
+        return rows[key]
+    except KeyError:
+        raise ValueError(
+            f"W={w} SEW={sew} altfmt_A={altfmt_a} altfmt_B={altfmt_b} "
+            f"altfmt={altfmt} is reserved; the legal rows at this cell are "
+            f"{sorted(rows)} (spec 7288-7370)") from None
+
+
+def fpw_eew_ab(w: int, sew: int) -> int:
+    """Input element width at a legal cell.  Always SEW/W; asserted, not assumed."""
+    eew, _rows = FP_CELLS[(w, sew)]
+    assert eew == sew // w, (w, sew, eew)
+    return eew
+
+
+def fpw_mixed_rows(w: int, sew: int):
+    """The rows whose two input formats differ, as a sorted key list.
+
+    Round seven keeps mixed-format programs in their own tier.  Sharing a
+    tier with the same-format rows would make a failure unattributable
+    between the mixing logic and the per-format decode -- the two things this
+    round adds at once.  This is the selector that tier uses.
+    """
+    _eew, rows = FP_CELLS[(w, sew)]
+    return sorted(k for k, v in rows.items() if v[0] != v[1])
+
+
+def fpw_check_legality(w: int, lmul: int, sew: int, lam: int,
+                       bs: int = 0, vm: int = 1) -> None:
+    """Legality for a widening FP multiply-accumulate at this geometry.
+
+    ``vm=1`` (unscaled) adds nothing beyond the encoding-map row, which
+    :func:`fpw_legal_row` decides.  ``vm=0`` (microscaled) additionally
+    requires the row to have MX cells, and then reuses round six's
+    ``check_microscaling_legality`` verbatim -- spec 2343-2347 (SEW*LAMBDA >=
+    pw) and Sail 5151-5158 (at bs=1, W*LMUL <= SEW).  The same rule, not a
+    parallel copy of it: round seven's vm=0 path is the *same* Sail function
+    round six already exercises, and a second transcription is a second place
+    to get it wrong.
+    """
+    if vm not in (0, 1):
+        raise ValueError(f"vm is one bit, got {vm}")
+    if vm == 0:
+        mx_check_legality(w, lmul, sew, lam, bs)
+
+
+def fpw_pack_elements(values: Sequence[int], fmt: FpFormat) -> List[int]:
+    """Pack element bit patterns into bytes, little-endian, for any width.
+
+    Written against ``fmt.sub_byte`` rather than against a width test, and
+    built now even though no currently-resolved format reaches the sub-byte
+    branch.  The three cells round seven can implement today have EEW_AB of
+    16, 32 and 16 -- all byte-or-wider -- so this branch is dead code until
+    the OCP documents land.  It is written anyway, because the sub-byte path
+    is one of the two main risk surfaces in the six cells that remain, and
+    letting the easy three dictate the shape of the packer is exactly how the
+    second pass turns into a rewrite.
+
+    The sub-byte order is spec 1207-1219: element 2n in the LOW nibble of
+    byte n, element 2n+1 in the HIGH nibble.  Getting it backwards transposes
+    every pair of K elements and reads as an arithmetic bug rather than a
+    layout one, which is why round six's Machine.vget carries the same rule
+    and :func:`check_round_seven_packing` checks the two against each other.
+    """
+    if fmt.sub_byte:
+        if fmt.width != 4:
+            raise ValueError(
+                f"{fmt.name}: only 4-bit sub-byte packing is modelled "
+                f"(spec 1207-1219 defines EEW=4 and nothing narrower)")
+        if len(values) % 2:
+            raise ValueError("4-bit elements are packed in pairs")
+        return [(lo & 0xF) | ((hi & 0xF) << 4)
+                for lo, hi in zip(values[0::2], values[1::2])]
+    nbytes = fmt.width // 8
+    out: List[int] = []
+    for v in values:
+        out.extend((v & ((1 << fmt.width) - 1)).to_bytes(nbytes, "little"))
+    return out
+
+
+def fpw_unpack_elements(data: Sequence[int], count: int,
+                        fmt: FpFormat) -> List[int]:
+    """Inverse of :func:`fpw_pack_elements`; round-trips for every width."""
+    if fmt.sub_byte:
+        out = []
+        for n in range((count + 1) // 2):
+            out.append(data[n] & 0xF)
+            out.append((data[n] >> 4) & 0xF)
+        return out[:count]
+    nbytes = fmt.width // 8
+    return [int.from_bytes(bytes(data[i * nbytes:(i + 1) * nbytes]), "little")
+            for i in range(count)]
+
+
+def _fpw_mul_exact(a_bits: int, fmt_a: FpFormat, b_bits: int,
+                   fmt_b: FpFormat):
+    """One A x B product, exactly.  ``("nan",)`` / ``("inf", s)`` / ``("num", q)``.
+
+    Spec 1384: "Each A x B element product is defined by the exact
+    mathematical product of the corresponding input values, regardless of
+    whether `fmt_A` equals `fmt_B`."  No rounding happens here; the product
+    is a Fraction with as many significand bits as it needs (spec 1391-1397
+    bounds that at p_A + p_B).
+
+    Mixed formats are not a special case in this function, and that is the
+    point: the mixed cells differ from the same-format ones only in which
+    descriptor each operand is decoded with.
+    """
+    ka, sa, va = fpf_unpack(a_bits, fmt_a)
+    kb, sb, vb = fpf_unpack(b_bits, fmt_b)
+    if ka == "nan" or kb == "nan":
+        return ("nan",)
+    sign = sa ^ sb
+    if ka == "inf" or kb == "inf":
+        # Spec 1839-1841: zero multiplied by infinity is an invalid
+        # operation producing an internal NaN.
+        other_zero = (kb == "num" and vb == 0) if ka == "inf" else (va == 0)
+        if other_zero:
+            return ("nan",)
+        return ("inf", sign)
+    return ("num", (-va if sa else va) * (-vb if sb else vb))
+
+
+def _fpw_sum_exact(terms):
+    """Exact sum of product terms.  Infinities of opposite sign give NaN."""
+    total = Fraction(0)
+    inf_sign = None
+    for t in terms:
+        if t[0] == "nan":
+            return ("nan",)
+        if t[0] == "inf":
+            if inf_sign is not None and inf_sign != t[1]:
+                # Spec 1846-1849: adding infinities of opposite signs raises
+                # invalid and produces an internal NaN.
+                return ("nan",)
+            inf_sign = t[1]
+        else:
+            total += t[1]
+    if inf_sign is not None:
+        return ("inf", inf_sign)
+    return ("num", total)
+
+
+def _fpw_materialise(value, fmt: FpFormat) -> int:
+    """Turn an exact result into *fmt* bits, rounding per frm.
+
+    NaN becomes the format's default NaN (spec 1872-1878: "whenever a shared
+    floating-point helper materializes a NaN result in a concrete
+    floating-point format, it shall return the default canonical NaN for that
+    format").  Infinity is only reachable in a format that has one --
+    :func:`fpf_round` refuses the others rather than inventing a pattern.
+    """
+    if value[0] == "nan":
+        return fp_default_nan(fmt.width, fmt.name)
+    if value[0] == "inf":
+        if not fmt.has_inf:
+            raise OCPSpecUnavailable(
+                f"an infinite result in {fmt.name}, which encodes no "
+                f"infinity; the OCP document decides what this produces")
+        return ((1 << (fmt.width - 1)) if value[1] else 0) | \
+               (fmt.emax << (fmt.prec - 1))
+    return fpf_round(value[1], fmt, FP_FRM)
+
+
+def _fpw_add_into(acc_bits: int, addend, fmt: FpFormat) -> int:
+    """``C <- round_frm(C + S)`` (spec 1591-1593), with C read back as bits."""
+    kind, sign, mag = fpf_unpack(acc_bits, fmt)
+    if kind == "nan":
+        return fp_default_nan(fmt.width, fmt.name)
+    acc = ("inf", sign) if kind == "inf" else ("num", -mag if sign else mag)
+    return _fpw_materialise(_fpw_sum_exact([acc, addend]), fmt)
+
+
+def fpw_reference_gemm(geom: "TileGeometry", a, b, c,
+                       fmt_a: FpFormat, fmt_b: FpFormat, fmt_c: FpFormat):
+    """The architectural result of one widening FP multiply-accumulate.
+
+    Implements the disclosed tuple :data:`FP_DISCLOSURE` -- G=1, psm=0,
+    rnd=frm -- for any W, and is therefore format-agnostic by construction:
+    the only thing the three descriptors change is how operands decode and
+    how results round.
+
+    The reduction, from spec 1552-1593 and 1747-1752:
+
+    * The K dimension splits into ``LAMBDA * LMUL`` groups (the number of
+      group updates per output element is ``(LAMBDA * LMUL) / G`` and G=1).
+    * Each group is one sub-dot-product, so it holds ``G * W = W`` products,
+      at W consecutive logical K indices in increasing order (spec 1679-1684).
+    * psm=0: the group's partial sum S is formed exactly, with no rounding to
+      fmt_C (spec 1565).
+    * rnd=frm: S is then rounded to fmt_C under frm (spec 1584).
+    * The group update is ``C <- round_frm(C + S_rounded)`` (spec 1591-1593).
+
+    Note what this is *not*: a fused multiply-add per k, and not an exact dot
+    product over all of K.  There are exactly two rounding points per group,
+    and a model that collapses them to one agrees with this everywhere the
+    partial sums happen to be exact -- which is precisely the region the
+    exactly-representable self-check tier lives in, and precisely why that
+    tier cannot be the only check.  See :func:`fpw_selfcheck_exact`.
+    """
+    w, groups = geom.w, geom.lam * geom.lmul
+    assert geom.k_eff == groups * w, (geom.k_eff, groups, w)
+    out = [[0] * geom.n for _ in range(geom.m)]
+    for i in range(geom.m):
+        for j in range(geom.n):
+            acc = c[i][j]
+            for g in range(groups):
+                products = [_fpw_mul_exact(a[i][k], fmt_a, b[j][k], fmt_b)
+                            for k in range(g * w, (g + 1) * w)]
+                s = _fpw_sum_exact(products)
+                acc = _fpw_add_into(acc, _fpw_reround(s, fmt_c), fmt_c)
+            out[i][j] = acc
+    return out
+
+
+def _fpw_reround(s, fmt_c: FpFormat):
+    """rnd=frm: round the partial sum to fmt_C before accumulating it.
+
+    Kept as its own function because it is the single line that distinguishes
+    the disclosed tuple from ``rnd=xct``, and the negative control
+    :func:`check_round_seven_negative_controls` sabotages exactly it.
+    """
+    if s[0] != "num":
+        return s
+    bits = _fpw_materialise(s, fmt_c)
+    kind, sign, mag = fpf_unpack(bits, fmt_c)
+    if kind == "nan":
+        return ("nan",)
+    if kind == "inf":
+        return ("inf", sign)
+    return ("num", -mag if sign else mag)
+
+
+def fpw_golden_bytes(geom: "TileGeometry", tile, fmt_c: FpFormat) -> List[int]:
+    """The C tile as the bytes a program embeds and memcmps against.
+
+    This is the artefact that makes the reference model the sole source of
+    truth for a narrow accumulator, and therefore the artefact whose
+    correctness the negative controls and the self-check tier exist to
+    police.  Row-major, at all LMUL (spec: memory is row-major everywhere),
+    over the *physical* M x M tile rather than the active M x N one, because
+    that is what a C transfer moves.
+    """
+    out: List[int] = []
+    nbytes = fmt_c.width // 8
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            v = tile[i][j] if j < geom.n else 0
+            out.extend((v & ((1 << fmt_c.width) - 1)).to_bytes(nbytes,
+                                                               "little"))
+    return out
+
+
+def fpw_selfcheck_exact(geom: "TileGeometry", a, b, c,
+                        fmt_a: FpFormat, fmt_b: FpFormat,
+                        fmt_c: FpFormat) -> bool:
+    """True where this case's result is independent of every rounding choice.
+
+    The cross-check tier: a case for which the exact mathematical result is
+    representable in fmt_C at every intermediate step is one the *program*
+    can verify on the DUT without trusting the reference model, because any
+    conforming (G, psm, rnd) tuple produces the same bits.
+
+    It is deliberately a predicate over a case rather than a restriction on
+    how cases are generated.  Generating only exactly-representable cases
+    would narrow coverage away from rounding, which is the round's new risk
+    surface; classifying cases instead means the golden-bytes tier keeps the
+    full range and the self-checking tier is a *subset* of the same
+    population.  That subset relationship is what makes the two tiers a
+    cross-check rather than two disjoint samples that can never disagree --
+    see :func:`check_round_seven_tier_overlap`.
+    """
+    w, groups = geom.w, geom.lam * geom.lmul
+    for i in range(geom.m):
+        for j in range(geom.n):
+            acc = fpf_unpack(c[i][j], fmt_c)
+            if acc[0] != "num":
+                return False
+            running = -acc[2] if acc[1] else acc[2]
+            for g in range(groups):
+                terms = [_fpw_mul_exact(a[i][k], fmt_a, b[j][k], fmt_b)
+                         for k in range(g * w, (g + 1) * w)]
+                s = _fpw_sum_exact(terms)
+                if s[0] != "num":
+                    return False
+                # S must be exactly representable, and so must C + S.
+                if not _fpw_exact_in(s[1], fmt_c):
+                    return False
+                running += s[1]
+                if not _fpw_exact_in(running, fmt_c):
+                    return False
+    return True
+
+
+def _fpw_exact_in(value: "Fraction", fmt: FpFormat) -> bool:
+    """Is *value* representable in *fmt* with no rounding at all?"""
+    bits = fpf_round(value, fmt, FP_FRM)
+    kind, sign, mag = fpf_unpack(bits, fmt)
+    if kind != "num":
+        return False
+    return (-mag if sign else mag) == value
+
+
+def fpw_legal_configs(vlen: int, **kwargs):
+    """Every round-seven geometry, in W order.
+
+    A thin ordering over :func:`ime_legal_configs`, exactly as
+    :func:`mx_legal_configs` is for round six: the legality lives in
+    :meth:`TileGeometry.validate`, which now knows ``kind='fpw'``, so this
+    adds only the per-W SEW restriction the encoding map imposes.  W is the
+    outer loop for the same append-don't-interleave reason every other tier
+    has.
+    """
+    for w in sorted(FP_SEWS_BY_W):
+        yield from ime_legal_configs(vlen, sews=FP_SEWS_BY_W[w], ws=(w,),
+                                     kinds=("fpw",), **kwargs)
+
+
+def fpw_mx_max_lmul(w: int, sew: int) -> int:
+    """Largest LMUL in {1,2,4,8} permitted at bs=1, spec 2285-2320.
+
+    The spec states this as a table; it is computed here from the rule the
+    table summarises (W*LMUL <= SEW) and the table is checked against it in
+    :func:`check_round_seven_mx_lmul_table`, so a transcription error in
+    either one is caught by the other.
+    """
+    return max(l for l in (1, 2, 4, 8) if w * l <= sew)
+
+
 WIDENING_SEWS_BY_W = {2: (16, 32), 4: WIDENING_SEWS, 8: (64,)}
 
 
@@ -2492,6 +3619,977 @@ def clayout_geometries(vlen: int, sews: Sequence[int] = (8, 16, 32, 64),
     return out
 
 
+def _mx_geometries(vlen: int = 256):
+    """Every round-six (geometry, altfmt) pair at *vlen*."""
+    return [(geom, altfmt)
+            for geom in mx_legal_configs(vlen)
+            for altfmt in mx_altfmts(geom.w, geom.sew)]
+
+
+def check_round_six_encoding_map() -> None:
+    """MX_CELLS is the Sail's SEW guards, read back the other way round.
+
+    The table at spec 7469-7540 and the per-instruction guards (vfwimmacc
+    6035-6038, vfqimmacc 6266-6270, vf8wimmacc 6151) are two statements of
+    the same fact, so they can be checked against each other.
+    """
+    guards = {                       # mnemonic -> the SEWs its Sail accepts
+        "vfwimmacc.vv": {16},        # rejects 8, 32, 64
+        "vfqimmacc.vv": {16, 32},    # rejects 8 and 64
+        "vf8wimmacc.vv": {32, 64},   # rejects < 32
+    }
+    by_mnemonic: Dict[str, set] = {name: set() for name in guards}
+    for (w, sew) in MX_CELLS:
+        name = TileGeometry(256, sew, 1, 1, 1, w, kind="mx").mnemonic
+        by_mnemonic[name].add(sew)
+    assert by_mnemonic == guards, (by_mnemonic, guards)
+
+    # altfmt=1 is reserved wherever the accumulator is 32 or 64 bits wide.
+    for (w, sew), (_ew, fmts) in MX_CELLS.items():
+        if sew >= 32:
+            assert set(fmts) == {0}, (w, sew, fmts)
+        else:
+            assert set(fmts) == {0, 1}, (w, sew, fmts)
+
+    # Reserved cells raise rather than silently modelling something.
+    for w, sew in ((2, 8), (2, 32), (2, 64), (4, 8), (4, 64), (8, 8), (8, 16)):
+        try:
+            mx_legal_cell(w, sew)
+        except ValueError:
+            continue
+        raise AssertionError(f"W={w} SEW={sew} should be reserved")
+
+    # The integer input width is SEW/W in every cell -- the family's own
+    # EEW_A = SEW/W rule (Sail 4885-4918), not an independent table.
+    for (w, sew), (ewidth, _fmts) in MX_CELLS.items():
+        assert ewidth == sew // w, (w, sew, ewidth)
+
+
+def check_round_six_e8m0() -> None:
+    """E8M0 decode, against the worked cases the spec states in prose."""
+    # 0x7F is 2**0 = 1.0 in every accumulator format.
+    for width, fmt in ((16, "binary16"), (16, "bfloat16"),
+                       (32, "binary32"), (64, "binary64")):
+        bits, is_nan = mx_decode_scale(0x7F, width, fmt)
+        assert not is_nan and bits == fp_one(width, fmt), (fmt, bits)
+
+    # 0xFF is the one and only NaN code (spec 1993).
+    for width, fmt in ((16, "binary16"), (32, "binary32")):
+        bits, is_nan = mx_decode_scale(0xFF, width, fmt)
+        assert is_nan and bits == fp_default_nan(width, fmt), fmt
+
+    # Every other code is finite -- there is no zero, infinity or subnormal
+    # *encoding*.  0x00 is 2**-127, an ordinary value.
+    for byte in (0x00, 0x01, 0x7E, 0x80, 0xFE):
+        _bits, is_nan = mx_decode_scale(byte, 64, "binary64")
+        assert not is_nan, byte
+    assert fp_unpack(mx_decode_scale(0x00, 64, "binary64")[0],
+                     64, "binary64")[2] == _pow2(-127)
+    assert fp_unpack(mx_decode_scale(0xFE, 64, "binary64")[0],
+                     64, "binary64")[2] == _pow2(127)
+
+    # Spec 2013-2016, stated as an example in the text: "the E8M0 scale value
+    # 2^127 cannot be represented as a finite IEEE binary16 value and,
+    # depending on `frm`, converts to either +inf or the largest finite
+    # positive binary16 value".  At frm=RNE it is +inf.
+    bits, is_nan = mx_decode_scale(0xFE, 16, "binary16")
+    assert not is_nan and fp_is_inf(bits, 16, "binary16"), hex(bits)
+    # ... and "a sufficiently small positive E8M0 value may similarly convert
+    # to either +0 or the minimum positive subnormal value".  2**-127 is far
+    # below binary16's 2**-24 minimum subnormal, so RNE gives +0.
+    bits, _ = mx_decode_scale(0x00, 16, "binary16")
+    assert bits == 0, hex(bits)
+    # bfloat16 has binary32's exponent range, so the same two bytes are
+    # finite there -- which is exactly why the accumulator format, not the
+    # storage width, has to key the decode.
+    assert not fp_is_inf(mx_decode_scale(0xFE, 16, "bfloat16")[0],
+                         16, "bfloat16")
+    assert mx_decode_scale(0x00, 16, "bfloat16")[0] != 0
+
+    # Spec 2021-2024: +0 x +inf from two *finite* encoded scales is the
+    # default NaN.  binary16 supplies both ends at once.
+    blk, is_nan = mx_block_scale(0x00, 0xFE, 16, "binary16")
+    assert is_nan and blk == fp_default_nan(16, "binary16"), hex(blk)
+    # And a 0xFF byte alone is enough, in any format.
+    for scales in ((0xFF, 0x7F), (0x7F, 0xFF), (0xFF, 0xFF)):
+        assert mx_block_scale(*scales, 32, "binary32")[1], scales
+
+
+def check_round_six_block_intervals() -> None:
+    """The block intervals tile [0, K_eff) exactly, and ignore LMUL.
+
+    Sail ``int_scaled_gemm`` has no LMUL step loop; the block/step
+    intersection of spec 2030-2060 belongs to ``fp_scaled_gemm``.  Asserting
+    the partition here is what stops a future round pasting the group-A
+    logic into the group-B judge.
+    """
+    for geom, _altfmt in _mx_geometries():
+        for bs in (0, 1):
+            try:
+                mx_check_legality(geom.w, geom.lmul, geom.sew, geom.lam, bs)
+            except ValueError:
+                continue
+            block_size = mx_block_size(bs)
+            blocks = mx_block_count(geom.k_eff, block_size)
+            covered = []
+            for s in range(blocks):
+                k_lo, k_hi = mx_block_interval(s, block_size, geom.k_eff)
+                assert k_lo <= k_hi, (geom.describe(), s)
+                covered.extend(range(k_lo, k_hi + 1))
+            assert covered == list(range(geom.k_eff)), geom.describe()
+            # Only the final block may be short.
+            lens = [mx_block_interval(s, block_size, geom.k_eff)[1]
+                    - mx_block_interval(s, block_size, geom.k_eff)[0] + 1
+                    for s in range(blocks)]
+            assert all(n == block_size for n in lens[:-1]), geom.describe()
+            assert 1 <= lens[-1] <= block_size, geom.describe()
+
+
+def check_round_six_scale_layout() -> None:
+    """The v0 paired-scale layout closes: M * R == VLEN / pw (spec 2192-2197).
+
+    And the pair index is a bijection from (row, block) onto the positions a
+    row actually uses, which is what makes ``i * R + s`` checkable without
+    reference to the implementation.
+    """
+    for geom, _altfmt in _mx_geometries():
+        r = mx_scale_stride(geom.sew, geom.lam)
+        assert geom.m * r == geom.vlen // MX_PAIR_WIDTH, geom.describe()
+        for bs in (0, 1):
+            try:
+                mx_check_legality(geom.w, geom.lmul, geom.sew, geom.lam, bs)
+            except ValueError:
+                continue
+            blocks = mx_block_count(geom.k_eff, mx_block_size(bs))
+            # Spec 2343-2347 / Sail 5155 exist precisely to guarantee this:
+            # every block a row needs has a slot inside that row's stride.
+            assert blocks <= r, (geom.describe(), bs, blocks, r)
+            seen = set()
+            for m in range(geom.m):
+                for s in range(blocks):
+                    p = mx_pair_index(m, s, r)
+                    assert p not in seen, (geom.describe(), m, s)
+                    seen.add(p)
+                    assert 0 <= p < geom.vlen // MX_PAIR_WIDTH
+
+
+def _mx_exact_case(geom: "TileGeometry", altfmt: int, bs: int,
+                   seed: int = 0):
+    """An all-scales-1.0, C=+0.0 case whose result is exact by construction."""
+    rng = random.Random(seed)
+    bound = mx_exact_operand_bound(geom.w, geom.sew, altfmt, bs)
+    a = [[rng.randint(-bound, bound) for _ in range(geom.k_eff)]
+         for _ in range(geom.m)]
+    b = [[rng.randint(-bound, bound) for _ in range(geom.k_eff)]
+         for _ in range(geom.n)]
+    c = [[0 for _ in range(geom.n)] for _ in range(geom.m)]   # +0.0
+    blocks = mx_block_count(geom.k_eff, mx_block_size(bs))
+    ones_a = [[0x7F] * blocks for _ in range(geom.m)]
+    ones_b = [[0x7F] * blocks for _ in range(geom.n)]
+    return a, b, c, ones_a, ones_b
+
+
+def check_round_six_exactness() -> None:
+    """With scales 1.0 and C = +0.0 the result is literally int_to_fp(dot).
+
+    This is the property the ``ime_mx_`` directed tier rests on: the on-DUT
+    reference is an integer dot product and one ``fcvt``, with no FP rounding
+    to reproduce -- so the tier works even where the accumulator is binary16
+    or bfloat16, which baseline rv64imafd cannot round to.
+    """
+    checked = 0
+    for geom, altfmt in _mx_geometries():
+        for bs in (0, 1):
+            try:
+                mx_check_legality(geom.w, geom.lmul, geom.sew, geom.lam, bs)
+            except ValueError:
+                continue
+            a, b, c, sa, sb = _mx_exact_case(geom, altfmt, bs, seed=geom.k_eff)
+            out = int_scaled_gemm_reference(a, b, c, sa, sb, geom,
+                                            bs=bs, altfmt=altfmt)
+            block_size = mx_block_size(bs)
+            blocks = mx_block_count(geom.k_eff, block_size)
+            _ew, fmt = mx_legal_cell(geom.w, geom.sew, altfmt)
+            for i in range(geom.m):
+                for j in range(geom.n):
+                    # The architectural value, recomputed as a sum of exact
+                    # per-block integers -- the shape the DUT program uses.
+                    total = 0
+                    for s in range(blocks):
+                        k_lo, k_hi = mx_block_interval(s, block_size,
+                                                       geom.k_eff)
+                        total += mx_int_block_dot(a, b, i, j, k_lo, k_hi)
+                    got = fp_unpack(out[i][j], geom.sew, fmt)
+                    assert got[0] == "num", (geom.describe(), i, j, got)
+                    value = -got[2] if got[1] else got[2]
+                    assert value == total, (geom.describe(), altfmt, bs,
+                                            i, j, value, total)
+                    checked += 1
+    assert checked > 500, checked
+
+
+def check_round_six_operand_bounds() -> None:
+    """The published exactness bounds are the largest ones that hold.
+
+    titan_runs/round6_design.md tabulates which cells are exact with
+    unconstrained operands; that claim is checked here rather than trusted,
+    and the bound is checked to be *tight* (one more overflows the
+    significand) so a needlessly small bound cannot hide a modelling error.
+    """
+    unconstrained = {(4, 16, 0), (4, 32, 0), (8, 32, 0), (8, 64, 0)}
+    for (w, sew), (ewidth, fmts) in sorted(MX_CELLS.items()):
+        for altfmt in sorted(fmts):
+            native = (1 << (ewidth - 1)) - 1
+            bound = mx_exact_operand_bound(w, sew, altfmt, bs=0)
+            limit = mx_exact_dot_bound(w, sew, altfmt, bs=0)
+            assert 32 * bound ** 2 <= limit, (w, sew, altfmt)
+            if bound < native:
+                assert 32 * (bound + 1) ** 2 > limit, (w, sew, altfmt, bound)
+            assert ((w, sew, altfmt) in unconstrained) == (bound == native), \
+                (w, sew, altfmt, bound, native)
+            # bs=1 halves the block, so the bound may only ever grow.
+            assert mx_exact_operand_bound(w, sew, altfmt, bs=1) >= bound
+
+
+def check_round_six_nan_exit() -> None:
+    """A NaN block scale zeroes out every later block and yields default NaN.
+
+    Sail 5390-5392 breaks out of the block loop, and 5403-5406 writes
+    ``fp_defaultNaN``.  The test plants the NaN in the *first* block and in a
+    *later* one, because an implementation that evaluates all blocks and then
+    checks would still pass the first case.
+    """
+    bs = 0
+    block_size = mx_block_size(bs)
+    # Needs >= 2 blocks (so "break out of the loop early" is observable),
+    # and >= 2 rows and columns (so the *unpoisoned* elements witness that
+    # the early exit is per output element, not per instruction).
+    choice = None
+    for cand, altfmt in _mx_geometries():
+        if altfmt != 0:
+            continue
+        if mx_block_count(cand.k_eff, block_size) >= 2 \
+                and cand.m >= 2 and cand.n >= 2:
+            choice = cand
+            break
+    assert choice is not None, "no round-six geometry spans two blocks"
+    geom = choice
+    blocks = mx_block_count(geom.k_eff, block_size)
+    _ew, fmt = mx_legal_cell(geom.w, geom.sew, 0)
+    a, b, c, sa, sb = _mx_exact_case(geom, 0, bs, seed=7)
+    clean = int_scaled_gemm_reference(a, b, c, sa, sb, geom, bs=bs)
+    nan_bits = fp_default_nan(geom.sew, fmt)
+    for victim in (0, blocks - 1):
+        for which in ("a", "b"):
+            poisoned_a = [row[:] for row in sa]
+            poisoned_b = [row[:] for row in sb]
+            (poisoned_a if which == "a" else poisoned_b)[0][victim] = 0xFF
+            out = int_scaled_gemm_reference(a, b, c, poisoned_a, poisoned_b,
+                                            geom, bs=bs)
+            # Row 0 (A scale) or column 0 (B scale) is poisoned, not both.
+            hit = [(i, j) for i in range(geom.m) for j in range(geom.n)
+                   if (i == 0 if which == "a" else j == 0)]
+            for i, j in hit:
+                assert out[i][j] == nan_bits, (which, victim, i, j)
+            for i in range(geom.m):
+                for j in range(geom.n):
+                    if (i, j) not in hit:
+                        assert out[i][j] == clean[i][j], (which, victim, i, j)
+
+
+def check_round_six_negative_controls() -> None:
+    """Two sabotaged models must be caught.
+
+    Round five's lesson, restated: a tier that cannot fail is not a tier.
+    Both sabotages are the specific mistakes this round is most likely to
+    make, and each is one line away from the real model.  Each picks its own
+    geometry by *searching* for one where the sabotage is observable, and
+    asserts that such a geometry exists -- a hard-coded geometry that
+    silently stops discriminating is how a negative control rots.
+    """
+    bs = 0
+    block_size = mx_block_size(bs)
+
+    # ---- sabotage 1: the v0 pair index transposed ------------------------
+    # `s * R + m` instead of `m * R + s` (spec 2161-2170, Sail 5110-5117).
+    # A pure layout error, so it is checked against the index map directly.
+    found = None
+    for geom, altfmt in _mx_geometries():
+        if altfmt:
+            continue
+        r = mx_scale_stride(geom.sew, geom.lam)
+        blocks = mx_block_count(geom.k_eff, block_size)
+        honest = {mx_pair_index(m, s, r)
+                  for m in range(geom.m) for s in range(blocks)}
+        swapped = {mx_pair_index(s, m, r)
+                   for m in range(geom.m) for s in range(blocks)}
+        if honest != swapped:
+            found = (geom, honest, swapped)
+            break
+    assert found is not None, (
+        "no round-six geometry distinguishes m*R+s from s*R+m; the v0 "
+        "layout negative control has no teeth")
+
+    # ---- sabotage 2: int_block_dot reduced modulo 2**SEW ------------------
+    # The round-one `int_gemm` habit carried into a path whose Sail says
+    # "an unbounded mathematical integer (no overflow)" (5128-5130).  It is
+    # only observable where a block dot product can exceed the SEW range,
+    # which needs enough K and wide enough inputs -- so search for that.
+    caught = None
+    for geom, altfmt in _mx_geometries():
+        if altfmt:
+            continue
+        ewidth, fmt = mx_legal_cell(geom.w, geom.sew, altfmt)
+        blocks = mx_block_count(geom.k_eff, block_size)
+        if blocks != 1:
+            continue
+        peak = (1 << (ewidth - 1)) - 1
+        a = [[peak] * geom.k_eff for _ in range(geom.m)]
+        b = [[peak] * geom.k_eff for _ in range(geom.n)]
+        k_lo, k_hi = mx_block_interval(0, block_size, geom.k_eff)
+        exact = mx_int_block_dot(a, b, 0, 0, k_lo, k_hi)
+        wrapped = _wrap(exact, geom.sew)
+        if exact == wrapped:
+            continue
+        c = [[0] * geom.n for _ in range(geom.m)]
+        ones_a = [[0x7F] * blocks for _ in range(geom.m)]
+        ones_b = [[0x7F] * blocks for _ in range(geom.n)]
+        out = int_scaled_gemm_reference(a, b, c, ones_a, ones_b, geom,
+                                        bs=bs, altfmt=altfmt)
+        assert out[0][0] == mx_int_to_fp(exact, geom.sew, fmt), \
+            geom.describe()
+        if out[0][0] != mx_int_to_fp(wrapped, geom.sew, fmt):
+            caught = geom
+            break
+    assert caught is not None, (
+        "no round-six geometry makes the modular-reduction sabotage visible; "
+        "the exactness negative control has no teeth")
+
+
+#: The round-seven cells implementable without the OCP documents: every cell
+#: whose three formats are all resolved.  Derived, not listed, so that
+#: populating FP_FORMAT_TABLE moves cells into this set with no edit here.
+def fpw_resolved_cells():
+    """The (W, SEW) cells every one of whose rows uses resolved formats."""
+    out = []
+    for (w, sew), (_eew, rows) in sorted(FP_CELLS.items()):
+        if all(FP_FORMAT_TABLE[f].resolved
+               for row in rows.values() for f in row[:3]):
+            out.append((w, sew))
+    return out
+
+
+def fpw_rows(w: int, sew: int):
+    """Legal ``(altfmt_A, altfmt_B, altfmt) -> (fmt_A, fmt_B, fmt_C)`` rows."""
+    _eew, rows = FP_CELLS[(w, sew)]
+    return {k: (fp_format(v[0]), fp_format(v[1]), fp_format(v[2]))
+            for k, v in sorted(rows.items(), key=lambda kv: str(kv[0]))}
+
+
+def fpw_operand_pool(fmt: FpFormat, rng: random.Random, n: int) -> List[int]:
+    """Element bit patterns biased toward the values that expose rounding.
+
+    Deliberately *not* restricted to exactly-representable magnitudes: the
+    golden-bytes tier is the one that has to reach inexact partial sums,
+    because inexactness is round seven's new risk surface and a pool that
+    avoids it would make the suite agree with a model that rounds in the
+    wrong places.  :func:`fpw_selfcheck_exact` classifies afterwards; it does
+    not filter beforehand.
+    """
+    pool = []
+    one = fpf_round(Fraction(1), fmt, FP_FRM)
+    pool += [0, 1 << (fmt.width - 1), one, one | (1 << (fmt.width - 1))]
+    pool.append(one | 1)                       # 1.0 + 1ulp: products inexact
+    pool.append(one - 1)                       # just under 1.0
+    for _ in range(max(0, n - len(pool))):
+        # A finite value with a modest exponent: large enough that a W-term
+        # partial sum can lose bits, small enough that nothing overflows.
+        e = rng.randrange(fmt.bias - 3, fmt.bias + 4)
+        frac = rng.randrange(1 << (fmt.prec - 1))
+        pool.append((rng.randrange(2) << (fmt.width - 1))
+                    | (e << (fmt.prec - 1)) | frac)
+    return pool[:max(n, 6)]
+
+
+def fpw_case(geom: "TileGeometry", row, rng: random.Random):
+    """One ``(A, B, C)`` case for a round-seven geometry and encoding row."""
+    fmt_a, fmt_b, fmt_c = row
+    pa = fpw_operand_pool(fmt_a, rng, 24)
+    pb = fpw_operand_pool(fmt_b, rng, 24)
+    pc = fpw_operand_pool(fmt_c, rng, 24)
+    a = [[rng.choice(pa) for _ in range(geom.k_eff)] for _ in range(geom.m)]
+    b = [[rng.choice(pb) for _ in range(geom.k_eff)] for _ in range(geom.n)]
+    c = [[rng.choice(pc) for _ in range(geom.n)] for _ in range(geom.m)]
+    return a, b, c
+
+
+def fpw_exact_case(geom: "TileGeometry", row, rng: random.Random):
+    """A case whose result is exact at every rounding point, by construction.
+
+    The self-checking tier cannot be harvested from the random population:
+    ``fpw_selfcheck_exact`` requires *every* cell of an M x N tile to be
+    exact, and at M=N=8 a random draw essentially never is.  Sampling and
+    hoping would leave the cross-check silently empty, which is the failure
+    this construction exists to avoid.
+
+    Construction: every A, B and C value is a small integer.  Integer
+    products and sums stay integers, and every fmt_C in the family holds
+    integers exactly well past the bound used here (binary32 to 2**24,
+    binary64 to 2**53), so no rounding point can round.  That makes the
+    result independent of (G, psm, rnd) -- which is exactly the property
+    that lets the *program* check itself without consulting the reference
+    model.
+
+    Note what this does and does not narrow.  It narrows the self-checking
+    tier, deliberately: that tier's whole job is to be model-independent, and
+    the price of that is a population where rounding cannot occur.  It does
+    not narrow the golden-bytes tier, which keeps :func:`fpw_case`'s full
+    range including the inexact partial sums that are round seven's new risk
+    surface.  The two tiers run the same geometries and the same encoding
+    rows, so a reference-model error that changes an exact case is caught
+    without the model, and one that changes only inexact cases is at least
+    confined to the tier that declares its dependence.
+    """
+    fmt_a, fmt_b, fmt_c = row
+    # Bound the dot product so C + sum(A*B) stays well inside the integers
+    # fmt_C represents exactly: |A|,|B| <= 3 gives |product| <= 9, and
+    # K_eff of them plus |C| <= 64 is far below 2**24.
+    lim = 3
+    def ints(fmt, n, hi):
+        return [fpf_round(Fraction(rng.randrange(-hi, hi + 1)), fmt, FP_FRM)
+                for _ in range(n)]
+    a = [ints(fmt_a, geom.k_eff, lim) for _ in range(geom.m)]
+    b = [ints(fmt_b, geom.k_eff, lim) for _ in range(geom.n)]
+    c = [ints(fmt_c, geom.n, 64) for _ in range(geom.m)]
+    return a, b, c
+
+
+def check_round_seven_format_table() -> None:
+    """FP_FORMAT_TABLE against FP_FORMATS_BY_NAME, and the pending rows.
+
+    The two tables state the same widths and significands for the four
+    resolved formats, so each falsifies the other; and the three pending
+    rows must stay behaviourally empty.
+    """
+    for name, (width, ebits, prec) in FP_FORMATS_BY_NAME.items():
+        fmt = FP_FORMAT_TABLE[name]
+        assert (fmt.width, fmt.ebits, fmt.prec) == (width, ebits, prec), name
+        assert fmt.resolved, name
+        assert not fmt.sub_byte, name
+    for name in OCP_PENDING_FORMATS:
+        fmt = FP_FORMAT_TABLE[name]
+        assert not fmt.resolved, name
+        assert (fmt.has_inf, fmt.nan_rule, fmt.overflow) == (None, None, None)
+        try:
+            fp_format(name)
+        except OCPSpecUnavailable:
+            continue
+        raise AssertionError(f"fp_format({name!r}) must refuse")
+    # Spec 1400-1410 states p for all seven; check the three pending ones,
+    # since that is the only thing about them this harness may assert.
+    assert FP_FORMAT_TABLE["e2m1"].prec == 2
+    assert FP_FORMAT_TABLE["e4m3"].prec == 4
+    assert FP_FORMAT_TABLE["e5m2"].prec == 3
+    assert FP_FORMAT_TABLE["e2m1"].sub_byte
+    # The three cells implementable today are exactly the ones reported.
+    assert fpw_resolved_cells() == [(2, 32), (2, 64), (4, 64)], \
+        fpw_resolved_cells()
+
+
+def check_round_seven_packing() -> None:
+    """The packer round-trips at every width, sub-byte branch included.
+
+    The sub-byte branch is unreachable from any resolved format today, so it
+    is exercised here against a synthetic 4-bit descriptor.  That is the
+    point: the path is built and tested now, so the OFP4 cells arrive to a
+    packer that already works rather than to one that has to grow a branch.
+    """
+    for name in ("binary16", "binary32", "binary64"):
+        fmt = fp_format(name)
+        vals = [i * 2654435761 % (1 << fmt.width) for i in range(8)]
+        packed = fpw_pack_elements(vals, fmt)
+        assert len(packed) == 8 * fmt.width // 8
+        assert fpw_unpack_elements(packed, 8, fmt) == vals, name
+
+    nibble = FpFormat("probe4", 4, 2, 2, False, "none", "saturate")
+    vals = [i & 0xF for i in range(16)]
+    packed = fpw_pack_elements(vals, nibble)
+    assert len(packed) == 8, packed
+    assert fpw_unpack_elements(packed, 16, nibble) == vals
+    # Spec 1207-1219: even index low nibble, odd index high nibble -- the
+    # same rule sim_check.Machine.vget carries.  Asserted as bytes so that a
+    # swapped implementation cannot pass by round-tripping its own mistake.
+    assert packed[0] == 0x10 and packed[1] == 0x32, [hex(x) for x in packed]
+    # And an odd count must be refused rather than silently padded.
+    try:
+        fpw_pack_elements([1, 2, 3], nibble)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an odd sub-byte element count must raise")
+
+
+def check_round_seven_gemm() -> None:
+    """The exact reduction, against cases whose answer is known by hand.
+
+    Three properties, each of which a plausible-but-wrong implementation
+    breaks:
+
+    1. C = +0 and one group of W products of +1.0 gives exactly W.
+    2. The reduction is *not* an exact dot product over all of K: with two
+       groups it rounds twice, so a case built to lose a bit at the group
+       boundary differs from the all-at-once sum.
+    3. Mixed formats multiply exactly, so FP16 x BF16 -> FP32 is the same
+       number as the rational product.
+    """
+    geom = TileGeometry(256, 32, 1, 1, 8, 2, kind="fpw")
+    fa = fb = fp_format("binary16")
+    fc = fp_format("binary32")
+    one_a = fpf_round(Fraction(1), fa, FP_FRM)
+    zero_c = 0
+    a = [[one_a] * geom.k_eff for _ in range(geom.m)]
+    b = [[one_a] * geom.k_eff for _ in range(geom.n)]
+    c = [[zero_c] * geom.n for _ in range(geom.m)]
+    out = fpw_reference_gemm(geom, a, b, c, fa, fb, fc)
+    want = fpf_round(Fraction(geom.k_eff), fc, FP_FRM)
+    assert all(v == want for row in out for v in row), (out[0][0], want)
+
+    # Mixed format: FP16 x BF16 -> FP32, exact product (spec 1418-1421,
+    # 11 + 8 = 19 <= 24).
+    fb2 = fp_format("bfloat16")
+    va = fpf_round(Fraction(3, 2), fa, FP_FRM)
+    vb = fpf_round(Fraction(5, 4), fb2, FP_FRM)
+    g1 = TileGeometry(256, 32, 1, 1, 8, 2, kind="fpw")
+    a1 = [[va] * g1.k_eff for _ in range(g1.m)]
+    b1 = [[vb] * g1.k_eff for _ in range(g1.n)]
+    c1 = [[0] * g1.n for _ in range(g1.m)]
+    out1 = fpw_reference_gemm(g1, a1, b1, c1, fa, fb2, fc)
+    assert out1[0][0] == fpf_round(Fraction(15, 8) * g1.k_eff, fc, FP_FRM)
+
+    # The self-check predicate agrees with the model on an exact case ...
+    assert fpw_selfcheck_exact(g1, a1, b1, c1, fa, fb2, fc)
+    # ... and rejects one that is not exactly representable.
+    inexact = fpf_round(Fraction(1), fa, FP_FRM) | 1      # 1.0 + 1ulp
+    big = fpf_round(Fraction(1 << 20), fc, FP_FRM)
+    a2 = [[inexact] * g1.k_eff for _ in range(g1.m)]
+    c2 = [[big] * g1.n for _ in range(g1.m)]
+    assert not fpw_selfcheck_exact(g1, a2, b1, c2, fa, fb2, fc)
+
+
+def check_round_seven_tier_overlap() -> None:
+    """The two tiers must meet, at (geometry, encoding row), not merely exist.
+
+    The golden-bytes tier is only as trustworthy as the reference model that
+    produced it, so the self-checking tier exists to catch a model error
+    without consulting the model.  That only works if the two tiers overlap:
+    if the exactly-representable cases sat at geometries or rows the golden
+    tier never visits, a disagreement between them would be unobservable and
+    the cross-check would be decorative.
+
+    So three things are asserted, not assumed:
+
+    1. Every resolved cell, every geometry and every encoding row is covered
+       by *both* tiers -- the same population, checked two ways.
+    2. The self-checking tier really is model-independent there: its cases
+       are exact, so the disclosed (G, psm, rnd) tuple and the rnd=xct
+       alternative give identical bits.
+    3. The golden tier really does reach what the self-checking tier cannot:
+       on the same geometry and row, the random population produces inexact
+       cases.  Without this the golden tier would be an expensive way to
+       re-run the exact one.
+    """
+    rng = random.Random(20260922)
+    cells = fpw_resolved_cells()
+    assert cells, "no resolved cell -- this check would be vacuous"
+    for (w, sew) in cells:
+        geoms = [g for g in fpw_legal_configs(256, full_vl_only=True)
+                 if (g.w, g.sew) == (w, sew)]
+        assert geoms, (w, sew)
+        rows = fpw_rows(w, sew)
+        for geom in geoms[:2]:
+            golden_rows, selfcheck_rows, inexact_rows = set(), set(), set()
+            for key, row in rows.items():
+                # --- self-checking tier: constructed exact -----------------
+                a, b, c = fpw_exact_case(geom, row, rng)
+                assert fpw_selfcheck_exact(geom, a, b, c, *row), (
+                    f"W={w} SEW={sew} {key}: the constructed case is not "
+                    f"exact, so the self-checking tier is not model-"
+                    f"independent here")
+                selfcheck_rows.add(key)
+                # It must also be a legal member of the golden population --
+                # the tiers judge one population, not two.
+                exact_out = fpw_reference_gemm(geom, a, b, c, *row)
+                assert fpw_golden_bytes(geom, exact_out, row[2])
+                golden_rows.add(key)
+                # --- golden tier: the full range, including inexact --------
+                for _ in range(24):
+                    ra, rb, rc = fpw_case(geom, row, rng)
+                    fpw_reference_gemm(geom, ra, rb, rc, *row)
+                    if not fpw_selfcheck_exact(geom, ra, rb, rc, *row):
+                        inexact_rows.add(key)
+            assert golden_rows == set(rows), (w, sew, geom.describe())
+            assert selfcheck_rows == set(rows), (w, sew, geom.describe())
+            assert inexact_rows == set(rows), (
+                f"W={w} SEW={sew} {geom.describe()}: rows "
+                f"{sorted(set(rows) - inexact_rows)} never produced an "
+                f"inexact case, so the golden tier adds nothing over the "
+                f"self-checking one there")
+
+
+def check_round_seven_negative_controls() -> None:
+    """Each sabotage must be *proved* detectable at the tier that carries it.
+
+    Round six shipped two controls that could not fail: one broke a
+    modulo-2^SEW reduction that was provably the identity on every value the
+    programs could produce, and one swapped both A and B nibbles, which only
+    reorders a sum.  So each control here names the case it is detected on
+    and asserts the detection, rather than asserting that a mutation "looks
+    like" a break.
+
+    All three target behaviour that is new in round seven and present in the
+    three resolved cells.  The two that are not yet reachable -- E4M3
+    overflow and NaN propagation through an OFP format -- are deliberately
+    absent rather than stubbed, because a control written against a format
+    this harness refuses to define would be a guess wearing a test's clothes.
+    """
+    rng = random.Random(7)
+    fa, fb = fp_format("binary16"), fp_format("bfloat16")
+    fc = fp_format("binary32")
+    geom = TileGeometry(256, 32, 2, 2, 32, 2, kind="fpw")
+    assert geom.lam * geom.lmul > 1, "need >1 group for the rnd control"
+
+    # --- control 1: rnd=frm collapsed to rnd=xct -------------------------
+    # Sabotage: skip the per-group rounding of S.  Detected only where a
+    # partial sum is inexact in fmt_C, which is why the pool is not
+    # restricted to exactly-representable operands.
+    def gemm_xct(a, b, c):
+        out = [[0] * geom.n for _ in range(geom.m)]
+        for i in range(geom.m):
+            for j in range(geom.n):
+                acc = c[i][j]
+                for g in range(geom.lam * geom.lmul):
+                    terms = [_fpw_mul_exact(a[i][k], fa, b[j][k], fb)
+                             for k in range(g * geom.w, (g + 1) * geom.w)]
+                    acc = _fpw_add_into(acc, _fpw_sum_exact(terms), fc)
+                out[i][j] = acc
+        return out
+
+    caught = 0
+    for _ in range(40):
+        a, b, c = fpw_case(geom, (fa, fb, fc), rng)
+        if fpw_reference_gemm(geom, a, b, c, fa, fb, fc) != gemm_xct(a, b, c):
+            caught += 1
+    assert caught, (
+        "rnd=frm vs rnd=xct is undetectable on this population -- the "
+        "control has no teeth and the operand pool is too exact")
+
+    # And the converse, which is what makes the control meaningful rather
+    # than merely nonzero: on an exactly-representable case the two agree,
+    # so the self-checking tier genuinely cannot distinguish them and the
+    # golden tier is the only thing that can.
+    one_a = fpf_round(Fraction(1), fa, FP_FRM)
+    one_b = fpf_round(Fraction(1), fb, FP_FRM)
+    ax = [[one_a] * geom.k_eff for _ in range(geom.m)]
+    bx = [[one_b] * geom.k_eff for _ in range(geom.n)]
+    cx = [[0] * geom.n for _ in range(geom.m)]
+    assert fpw_selfcheck_exact(geom, ax, bx, cx, fa, fb, fc)
+    assert fpw_reference_gemm(geom, ax, bx, cx, fa, fb, fc) == \
+        gemm_xct(ax, bx, cx), (
+            "the exact case must NOT distinguish the two tuples; if it does, "
+            "fpw_selfcheck_exact is admitting cases it should reject")
+
+    # --- control 2: fmt_A and fmt_B swapped ------------------------------
+    # The mixed-format rows are the ones this can touch.  It must be proved
+    # detectable, because swapping two *same-format* operands is a no-op and
+    # a control that only ever ran on those rows would be the round-six
+    # nibble mistake again.
+    caught = 0
+    for _ in range(40):
+        a, b, c = fpw_case(geom, (fa, fb, fc), rng)
+        if fpw_reference_gemm(geom, a, b, c, fa, fb, fc) != \
+                fpw_reference_gemm(geom, a, b, c, fb, fa, fc):
+            caught += 1
+    assert caught, "decoding A as B's format is undetectable -- no teeth"
+    # Proof that the control is about *mixing* and not about the operands:
+    # with fmt_A == fmt_B the same swap is provably the identity, so this
+    # control must only ever be scored on mixed rows.
+    for _ in range(8):
+        a, b, c = fpw_case(geom, (fa, fa, fc), rng)
+        assert fpw_reference_gemm(geom, a, b, c, fa, fa, fc) == \
+            fpw_reference_gemm(geom, a, b, c, fa, fa, fc)
+
+    # --- control 3: group boundary moved ---------------------------------
+    # Sabotage: reduce over one group of K_eff products instead of
+    # LAMBDA*LMUL groups of W.  This is the psm/G confusion the disclosure
+    # exists to pin down, and it is detectable only because the rounding
+    # points move -- which again needs inexact partial sums.
+    def gemm_one_group(a, b, c):
+        out = [[0] * geom.n for _ in range(geom.m)]
+        for i in range(geom.m):
+            for j in range(geom.n):
+                terms = [_fpw_mul_exact(a[i][k], fa, b[j][k], fb)
+                         for k in range(geom.k_eff)]
+                out[i][j] = _fpw_add_into(
+                    c[i][j], _fpw_reround(_fpw_sum_exact(terms), fc), fc)
+        return out
+
+    caught = 0
+    for _ in range(40):
+        a, b, c = fpw_case(geom, (fa, fb, fc), rng)
+        if fpw_reference_gemm(geom, a, b, c, fa, fb, fc) != \
+                gemm_one_group(a, b, c):
+            caught += 1
+    assert caught, (
+        "collapsing LAMBDA*LMUL groups into one is undetectable -- the "
+        "disclosed G would then be unobservable and the control has no teeth")
+
+
+def check_round_seven_golden_bytes() -> None:
+    """The golden image is row-major, full-tile, and sensitive to every cell."""
+    rng = random.Random(11)
+    fa, fb, fc = (fp_format("binary16"), fp_format("bfloat16"),
+                  fp_format("binary32"))
+    geom = TileGeometry(256, 32, 2, 1, 8, 2, kind="fpw")
+    a, b, c = fpw_case(geom, (fa, fb, fc), rng)
+    tile = fpw_reference_gemm(geom, a, b, c, fa, fb, fc)
+    img = fpw_golden_bytes(geom, tile, fc)
+    assert len(img) == geom.m * geom.n_max * (fc.width // 8)
+    # Row-major: element (i, j) sits at (i * N_max + j) * bytes.
+    nb = fc.width // 8
+    for i in range(geom.m):
+        for j in range(geom.n):
+            off = (i * geom.n_max + j) * nb
+            assert int.from_bytes(bytes(img[off:off + nb]), "little") == \
+                tile[i][j], (i, j)
+    # Every active cell is load-bearing: perturbing one changes one word.
+    for (i, j) in ((0, 0), (geom.m - 1, geom.n - 1)):
+        bad = [row[:] for row in tile]
+        bad[i][j] ^= 1
+        assert fpw_golden_bytes(geom, bad, fc) != img, (i, j)
+
+
+def check_round_seven_encoding_map() -> None:
+    """FP_CELLS against the per-instruction Sail SEW guards and the row rules.
+
+    The same two-sided check round six gets from
+    :func:`check_round_six_encoding_map`: the table at spec 7288-7370 and the
+    instruction mnemonics are two statements of one fact, so each can
+    falsify the other.
+    """
+    guards = {                       # mnemonic -> the SEWs the map gives it
+        "vfwmmacc.vv":  {8, 16, 32, 64},
+        "vfqmmacc.vv":  {16, 32, 64},     # SEW=8 is EEW=2, reserved
+        "vf8wmmacc.vv": {32, 64},         # SEW=8/16 are EEW=1/2, reserved
+    }
+    by_mnemonic = {name: set() for name in guards}
+    for (w, sew) in FP_CELLS:
+        by_mnemonic[TileGeometry(256, sew, 1, 1, 1, w,
+                                 kind="fpw").mnemonic].add(sew)
+    assert by_mnemonic == guards, (by_mnemonic, guards)
+
+    # EEW_AB is SEW/W in every cell -- the family's own rule (spec 1337-1339),
+    # not an independent column.  fpw_eew_ab asserts it; call it everywhere.
+    for (w, sew) in FP_CELLS:
+        assert fpw_eew_ab(w, sew) == sew // w
+
+    # Spec 1442-1443: at EEW=4, altfmt_A=1 is reserved, so OFP4 has exactly
+    # one input pair and mixing is impossible.
+    for (w, sew), (eew, rows) in FP_CELLS.items():
+        if eew != 4:
+            continue
+        assert {(a, b) for (a, b, _f) in rows} == {(0, 0)}, (w, sew, rows)
+        assert fpw_mixed_rows(w, sew) == [], (w, sew)
+
+    # Spec 1490-1493: at EEW>=32 altfmt_A/altfmt_B are ignored, written as
+    # None.  Both encodings must therefore select the same row.
+    for (w, sew), (eew, rows) in FP_CELLS.items():
+        if eew < 32:
+            assert not any(a is None for (a, _b, _f) in rows), (w, sew)
+            continue
+        assert {(a, b) for (a, b, _f) in rows} == {(None, None)}, (w, sew)
+        for a in (0, 1):
+            for b in (0, 1):
+                assert (fpw_legal_row(w, sew, 0, a, b)
+                        == fpw_legal_row(w, sew, 0, 0, 0)), (w, sew, a, b)
+
+    # The asymmetry the table is transcribed rather than generated for:
+    # OFP8 inputs carry both accumulator formats only at (W=2, SEW=16).
+    # (W=2, SEW=16) is the only OFP8 cell with two accumulator formats, so
+    # it has 4 input pairs x 2 altfmt = 8 legal rows (spec 7322-7329).  The
+    # other two OFP8 cells keep the same 4 input pairs but altfmt=1 is
+    # reserved, so they have 4 (spec 7345-7350, 7365-7370).
+    assert len(FP_CELLS[(2, 16)][1]) == 8, len(FP_CELLS[(2, 16)][1])
+    assert len(FP_CELLS[(4, 32)][1]) == 4, len(FP_CELLS[(4, 32)][1])
+    assert len(FP_CELLS[(8, 64)][1]) == 4, len(FP_CELLS[(8, 64)][1])
+    # All four OFP8 input pairs, mixed ones included, exist at every OFP8
+    # cell -- spec 1446-1451 says so in prose and the table repeats it.
+    for cell in ((2, 16), (4, 32), (8, 64)):
+        pairs = {(a, b) for (a, b, _f) in FP_CELLS[cell][1]}
+        assert pairs == {(0, 0), (0, 1), (1, 0), (1, 1)}, (cell, pairs)
+        assert len(fpw_mixed_rows(*cell)) == len(FP_CELLS[cell][1]) // 2
+    assert {f for (_a, _b, f) in FP_CELLS[(2, 16)][1]} == {0, 1}
+    assert {f for (_a, _b, f) in FP_CELLS[(4, 32)][1]} == {0}
+    assert {f for (_a, _b, f) in FP_CELLS[(8, 64)][1]} == {0}
+
+    # Reserved cells raise rather than silently modelling something.
+    for w, sew in ((2, 128), (4, 8), (8, 8), (8, 16), (1, 32)):
+        try:
+            fpw_legal_row(w, sew)
+        except ValueError:
+            continue
+        raise AssertionError(f"W={w} SEW={sew} should be reserved")
+    # And reserved *rows* inside legal cells: altfmt=1 at a 32/64-bit
+    # accumulator (spec 7331-7334, 7346-7348, 7363-7368).
+    for w, sew in ((2, 32), (2, 64), (4, 32), (4, 64), (8, 32), (8, 64)):
+        try:
+            fpw_legal_row(w, sew, altfmt=1)
+        except ValueError:
+            continue
+        raise AssertionError(f"W={w} SEW={sew} altfmt=1 should be reserved")
+
+
+def check_round_seven_mx_lmul_table() -> None:
+    """The bs=1 max-LMUL table (spec 2285-2320) against the rule it summarises.
+
+    The spec states both: the rule ``W * LMUL <= SEW`` (2277-2283, Sail
+    5156) and a table of its consequences.  Transcribing one and deriving
+    the other means a mistake in either shows up here rather than in a
+    silently over-permissive generator.
+    """
+    stated = {                       # (W, SEW) -> max LMUL, spec 2285-2320
+        (2, 8): 4,                   # OFP4 -> OFP8, vfwmmacc
+        (4, 16): 4,                  # OFP4 -> FP16/BF16, vfqmmacc
+        (8, 32): 4,                  # OFP4 -> FP32, vf8wmmacc
+    }
+    for (w, sew), want in stated.items():
+        assert fpw_mx_max_lmul(w, sew) == want, (w, sew, want)
+    # "All other currently defined MX encodings: 8 (no additional
+    # block-size-16 restriction)" -- every remaining MX-capable FP cell.
+    for (w, sew), (_eew, rows) in FP_CELLS.items():
+        if not any(row[3] for row in rows.values()):
+            continue
+        if (w, sew) in stated:
+            continue
+        assert fpw_mx_max_lmul(w, sew) == 8, (w, sew)
+
+    # And the rule and the helper must agree at the boundary, both ways.
+    for (w, sew) in FP_CELLS:
+        cap = fpw_mx_max_lmul(w, sew)
+        for lmul in (1, 2, 4, 8):
+            legal = w * lmul <= sew
+            assert legal == (lmul <= cap), (w, sew, lmul)
+
+
+def check_round_seven_mx_applicability() -> None:
+    """Which rows admit vm=0 at all (spec 2325-2332, 7270-7286).
+
+    Microscaling is defined for OFP4 and OFP8 inputs, and for nothing else in
+    this family: the FP16/BF16 and FP32 input rows have empty MX cells, so
+    vm=0 there is an illegal encoding rather than an unscaled one.  Getting
+    this backwards would make the judge accept a DUT that reads v0 on a
+    plain FP16 matmul.
+    """
+    for (w, sew), (eew, rows) in FP_CELLS.items():
+        for key, (fa, fb, _fc, mx) in rows.items():
+            narrow = fa in OCP_PENDING_FORMATS and fb in OCP_PENDING_FORMATS
+            # Necessary, not sufficient: a wide-input row is never MX.
+            if not narrow:
+                assert not mx, (w, sew, key)
+            # And MX is uniform within a cell -- no cell mixes the two.
+            assert mx == rows[next(iter(rows))][3], (w, sew, key)
+    # The one narrow cell that is nevertheless *not* MX-capable: OFP8 ->
+    # FP16/BF16 at (W=2, SEW=16), whose MX columns are "—" (spec 7322-7329).
+    assert not any(row[3] for row in FP_CELLS[(2, 16)][1].values())
+    # ... and every other narrow cell is.
+    for cell in ((2, 8), (4, 16), (4, 32), (8, 32), (8, 64)):
+        assert all(row[3] for row in FP_CELLS[cell][1].values()), cell
+
+    # SEW*LAMBDA >= 16 is a hard gate on vm=0 (spec 2343-2347).  SEW=8 with
+    # LAMBDA=1 is the case that fails it, and (W=2, SEW=8) is MX-capable, so
+    # this is reachable rather than hypothetical.
+    try:
+        fpw_check_legality(2, 1, 8, 1, bs=0, vm=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("SEW=8 LAMBDA=1 must be illegal at vm=0")
+    fpw_check_legality(2, 1, 8, 2, bs=0, vm=0)       # SEW*LAMBDA = 16, legal
+    # vm=1 is unaffected by either microscaling rule.
+    fpw_check_legality(2, 1, 8, 1, bs=0, vm=1)
+    fpw_check_legality(8, 8, 32, 1, bs=1, vm=1)      # W*LMUL > SEW, but vm=1
+
+
+def check_round_seven_ocp_gate() -> None:
+    """The three OFP formats must refuse to be modelled, loudly and by name.
+
+    This is the check that keeps the round honest while the OCP documents
+    are missing.  It asserts the *absence* of a definition, so that nobody
+    can quietly populate E4M3 from a half-remembered IEEE analogy and have
+    the suite go green: filling the rows in without deleting this check
+    fails here first.
+
+    When the documents land, the edit is: populate FP_FORMATS_BY_NAME, empty
+    OCP_PENDING_FORMATS, and replace this check with one that exercises the
+    encodings against the worked values the documents state.
+    """
+    assert set(OCP_PENDING_FORMATS) == {"e4m3", "e5m2", "e2m1"}
+    for fmt in OCP_PENDING_FORMATS:
+        assert fmt not in FP_FORMATS_BY_NAME, (
+            f"{fmt} has been populated but OCP_PENDING_FORMATS still lists "
+            f"it -- the two must move together")
+        for width in (4, 8):
+            try:
+                fp_fields(width, fmt)
+            except OCPSpecUnavailable:
+                break
+            except ValueError:
+                continue
+            raise AssertionError(f"fp_fields({width}, {fmt!r}) must refuse")
+        else:
+            raise AssertionError(f"{fmt} never raised OCPSpecUnavailable")
+
+    # Every round-seven cell whose inputs or accumulator is a pending format
+    # is therefore unjudgeable today.  Count them, so that the number in the
+    # round-seven report is derived rather than asserted by hand.
+    blocked = [(w, sew) for (w, sew), (_e, rows) in FP_CELLS.items()
+               if any(f in OCP_PENDING_FORMATS
+                      for row in rows.values() for f in row[:3])]
+    assert sorted(blocked) == [(2, 8), (2, 16), (4, 16), (4, 32),
+                               (8, 32), (8, 64)], blocked
+    # ... and the three that are not: FP16/BF16 and FP32 inputs only.
+    clear = sorted(set(FP_CELLS) - set(blocked))
+    assert clear == [(2, 32), (2, 64), (4, 64)], clear
+
+    # The width-keyed fallback must not become a back door.  fp_fields with
+    # fmt=None models binary32/binary64 only, so an E4M3 accumulator cannot
+    # be reached by "just pass the width" -- the hole that let round six's
+    # first cut return zeros for sub-byte reads is the same shape.
+    for width in (4, 8, 16):
+        try:
+            fp_fields(width)
+        except ValueError:
+            continue
+        raise AssertionError(f"fp_fields({width}) must not resolve")
+
+
+def check_round_seven_geometry() -> None:
+    """The round-seven geometry set is nonempty, disjoint in kind, and stable."""
+    geoms = list(fpw_legal_configs(256, full_vl_only=True))
+    assert geoms, "round seven enumerates no geometry"
+    assert all(g.kind == "fpw" and g.w in (2, 4, 8) for g in geoms)
+    # Every enumerated geometry names a real encoding-map cell.
+    for g in geoms:
+        fpw_legal_row(g.w, g.sew)
+    # Sub-byte inputs are reached -- OFP4 at EEW=4 is the round's re-run of
+    # the trap that made round six's first cut return zeros for every A/B
+    # read.  If no geometry has EEW_AB=4, the nibble path is untested here.
+    assert any(g.eew_ab == 4 for g in geoms), \
+        "no EEW_AB=4 geometry: the OFP4 sub-byte path would go unexercised"
+    # kind='fpw' must not perturb the pre-round-seven enumerations.
+    assert not any(g.kind == "fpw"
+                   for g in ime_legal_configs(256, kinds=("int", "fp", "mx")))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256,
@@ -2507,7 +4605,25 @@ def main() -> int:
                   check_signedness_is_immaterial, check_checksum_sensitivity,
                   check_fp_round, check_fp_matches_host,
                   check_fp_special_values, check_round_four_fp_gemm,
-                  check_round_four_geometry, check_clayout_case):
+                  check_round_four_geometry, check_clayout_case,
+                  check_round_six_encoding_map, check_round_six_e8m0,
+                  check_round_six_block_intervals,
+                  check_round_six_scale_layout,
+                  check_round_six_exactness,
+                  check_round_six_operand_bounds,
+                  check_round_six_nan_exit,
+                  check_round_six_negative_controls,
+                  check_round_seven_format_table,
+                  check_round_seven_packing,
+                  check_round_seven_gemm,
+                  check_round_seven_tier_overlap,
+                  check_round_seven_negative_controls,
+                  check_round_seven_golden_bytes,
+                  check_round_seven_encoding_map,
+                  check_round_seven_mx_lmul_table,
+                  check_round_seven_mx_applicability,
+                  check_round_seven_ocp_gate,
+                  check_round_seven_geometry):
         check()
         print(f"  ok  {check.__name__}")
 

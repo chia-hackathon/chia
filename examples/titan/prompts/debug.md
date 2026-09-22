@@ -28,6 +28,43 @@ dimension; one that appears everywhere points at something structural.
   unchanged binary (`titan_runs/nondet/`). Use `reps=3` and judge by majority
   before an RVV failure drives an RTL change; one pass does not clear a test.
 - Do not spawn sub-agents. Do the work in this session.
+- **Never make a structural check pass by changing what it counts.** An
+  earlier iteration kept `fus.size` constant by merging two FU factories so
+  that the check guarding the issue-path shape stopped firing. That hides
+  the problem. If a structural check fires, either the structure is wrong or
+  the check is wrong -- say which, and fix that one. Narrowing a test's
+  coverage, relaxing a tolerance or dropping a geometry to turn red green
+  falls under the same rule.
+
+## Four failures that are not what they look like
+
+- **Floating-point RVV tests failing after a matrix change.** Check the FU
+  lists first. `MatrixFPMultiplyFactory()` placed in `integerMatrix` rather
+  than its own `fpMatrix` once broke 23 `.vf` tests in the Stage 2
+  regression and took three iterations to localise, because nothing in the
+  symptom pointed at the matrix unit. Round six accumulates in floating
+  point and lands in the same place. Look there before you debug arithmetic.
+
+- **Every version silent, all stopping at the same simulated time.** That is
+  the `+max-cycles` budget, not your RTL and not the test. A genuine hang or
+  functional failure does not line up to the same cycle count across
+  unrelated builds. Compare stop times before you look for a bug.
+
+- **A single lockstep or cosim divergence.** The trace bridge is
+  run-to-run nondeterministic on an unchanged binary (~12%,
+  `titan_runs/nondet/`). One run is never a verdict, in either direction:
+  use `reps=3` and judge by majority before it drives an RTL change, and do
+  not treat one pass as clearing a test either.
+
+- **Numbers that are wrong in a plausible, consistent way.** Before blaming
+  the datapath, check whether the *model* of a format is right. The adoc
+  does not restate the OFP8/OFP4 bit encodings -- spec 1910-1913 is a
+  normative reference to OCP Microscaling Formats (MX) v1.0 -- so E4M3
+  having no infinities, E5M2 being IEEE-shaped and E2M1 having neither NaN
+  nor infinity all have to come from OCP. A wrong special-value rule
+  produces exactly this symptom. (E8M0 *is* restated in full at spec
+  1990-1993, and note it has no zero, infinity or subnormal encoding: byte
+  0x00 is the ordinary finite value 2^-127, and only 0xFF is NaN.)
 
 ## Reading a directed failure
 

@@ -27,6 +27,7 @@ import random
 import tempfile
 from typing import Iterator, List, Optional, Sequence, Tuple
 
+import constants
 import ime_tests
 import rvv_ref
 from rvv_ref import TileGeometry
@@ -84,11 +85,18 @@ def _every_geometry(vlen: int) -> Iterator[TileGeometry]:
     # (rvv_ref.random_fp_case), so a randomly sampled floating-point stress
     # program is as sharp as a directed one.
     yield from rvv_ref.ime_legal_configs(vlen, kinds=("fp",))
+    # Round six's microscaled integer-input tier, appended last for the same
+    # reason.  These geometries need v0 held for the paired E8M0 block scales
+    # (spec 2129-2170), so _allocatable asks VectorAlloc for the reserving
+    # layout; the 32 geometries at VLEN=256 that do not fit under that
+    # constraint are dropped here rather than quietly retried at a different
+    # shape.
+    yield from rvv_ref.mx_legal_configs(vlen)
 
 
 def _allocatable(geom: TileGeometry) -> bool:
     try:
-        ime_tests.VectorAlloc.allocate(geom)
+        ime_tests.VectorAlloc.allocate(geom, reserve_v0=geom.kind == "mx")
     except ValueError:
         return False
     return True
@@ -102,16 +110,29 @@ def generate(vlen: int, count: int, seed: int = 0
     for index, geom in enumerate(geometry_mix(vlen, rng, count)):
         widen = "" if geom.w == 1 else f"_w{geom.w}"
         trans = "" if geom.tload == "op" else "_t"
-        fp = "" if geom.kind == "int" else "_fp"
-        name = (f"stress_{index:06d}_sew{geom.sew}{widen}{trans}{fp}"
+        # Round six's microscaled forms get their own marker: "_fp" would
+        # be a lie (the *inputs* are MXINT integers) and check_emits reads
+        # the name back to confirm the geometry it was generated from.
+        kind = {"int": "", "fp": "_fp", "mx": "_mx"}[geom.kind]
+        name = (f"stress_{index:06d}_sew{geom.sew}{widen}{trans}{kind}"
                 f"_lam{geom.lam}_lmul{geom.lmul}_n{geom.n}")
+        if geom.kind == "mx":
+            # A microscaled program needs the paired E8M0 scale array as
+            # well as A, B and C, and the two vtype bits (bs, altfmt) that
+            # the geometry does not carry -- so the case is an
+            # ime_tests.MxPlan rather than an (A, B, C) triple.  bs and
+            # altfmt are drawn at random from the legal set, so one pass of
+            # the mix covers both block sizes and both accumulator formats.
+            plan = ime_tests.mx_random_plan(geom, rng)
+            out.append((name, ime_tests.emit_mx_test(plan, name), geom))
+            continue
         case = rvv_ref.random_case(geom, rng)
         out.append((name, ime_tests.emit_test(geom, case, name), geom))
     return out
 
 
 def fill_pool(pool_dir: str, vlen: int, count: int, seed: int = 0,
-              work_dir: str = os.path.join(tempfile.gettempdir(), "titan-stress"),
+              work_dir: str = str(constants.OUT_DIR / "stress"),
               build=None, pool_add=None,
               extension: str = "ime") -> int:
     """Build *count* programs and stage them in the Stage 3 pool.
@@ -186,6 +207,16 @@ def check_emits() -> None:
         assert ("_t_" in name) == (geom.tload == "t"), name
         assert (f"_w{geom.w}_" in name) == (geom.w != 1), name
         assert ("_fp_" in name) == (geom.kind == "fp"), name
+        assert ("_mx_" in name) == (geom.kind == "mx"), name
+        if geom.kind == "mx":
+            # The microscaled programs load v0 with the paired block scales
+            # and hold the A tile off v0 -- a stress program that fell back
+            # to the round-one allocation would be reading the scale array
+            # as its A operand.
+            assert "    vle16.v v0, (a0)" in asm, name
+            assert "    la    a0, v0_scales" in asm, name
+            alloc = ime_tests.VectorAlloc.allocate(geom, reserve_v0=True)
+            assert alloc.a != 0 and f"# {geom.mnemonic} v{alloc.c}" in asm
         if geom.kind == "fp":
             # The floating-point programs carry the scalar rv64f / rv64d
             # reference, not the RVV one, and set both extension state

@@ -1,21 +1,22 @@
-Add the RISC-V Integrated Matrix Extension (Zvvm) to Spike. Eight
+Add the RISC-V Integrated Matrix Extension (Zvvm) to Spike. Nine
 instructions are already implemented and passing: `vmmacc.vv`, `vmtl.v`,
-`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`.
-Round four adds one more: `vfmmacc.vv`, at SEW 32 and 64 only -- plus the
-`frm`-governed rounding it needs.
+`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`,
+`vfmmacc.vv`. Round six adds three more: `vfwimmacc.vv`, `vfqimmacc.vv` and
+`vf8wimmacc.vv` -- the microscaled integer-input, floating-point-accumulate
+forms, plus the paired E8M0 block scales in `v0` that they read.
 
 Start with `read_spec`. The specification carries formal SAIL semantics for
 each instruction; transcribe those. Spike's source is at `${SPIKE_SRC_PATH}`.
 
-## Rounds one through four
+## Rounds one through six
 
-Rounds one through three are done and converged: `vmmacc.vv`, `vmtl.v`,
-`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`.
-Round four adds exactly one instruction, `vfmmacc.vv`, at SEW 32 and 64
-only. If a working model for earlier instructions is already applied in
-the tree, extend it -- everything that passes today must still pass. The
-SAIL appendix is normative and outranks the prose and the tests, for the
-new instruction as much as the old.
+Rounds one through five are done and converged: `vmmacc.vv`, `vmtl.v`,
+`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`,
+`vfmmacc.vv`. Round six adds three: `vfwimmacc.vv` (W=2), `vfqimmacc.vv`
+(W=4) and `vf8wimmacc.vv` (W=8). If a working model for earlier
+instructions is already applied in the tree, extend it -- everything that
+passes today must still pass. The SAIL appendix is normative and outranks
+the prose and the tests, for the new instructions as much as the old.
 
 Two facts that save a wrong turn here. `vmttl.v`/`vmtts.v` are
 `vmtl.v`/`vmts.v` with two changes: bits 27:26 `0b01` not `0b00`, and offset
@@ -23,10 +24,32 @@ Two facts that save a wrong turn here. `vmttl.v`/`vmtts.v` are
 tile_reg_idx(...)` is unchanged, `rs2 = 0` default LD is now
 `VLEN/(SEW*LAMBDA)` not `LAMBDA*LMUL`. And `vm = 0` on funct6
 `0x39`/`0x3a`/`0x3b` is not a don't-care: it decodes
-`vfwimmacc.vv`/`vfqimmacc.vv`/`vf8wimmacc.vv` (out of scope) -- raise
-illegal-instruction, don't leave it unhandled.
+`vfwimmacc.vv`/`vfqimmacc.vv`/`vf8wimmacc.vv`, which is **this round's
+work**. Those three share funct6 with `vwmmacc.vv`/`vqmmacc.vv`/
+`v8wmmacc.vv` and are separated by `vm` alone, so mis-routing `vm` breaks
+rounds one through three as well as failing round six.
 
-Five facts about `vfmmacc.vv`. Titan discloses **G=1, psm=0, rnd=frm**
+Round six, transcribed from Sail `int_scaled_gemm` (5373-5410). There is
+**no (G, psm, rnd)** on this path -- it never calls `get_fp_grouping` /
+`get_fp_psm` / `get_fp_rnd` and has no `G` check, unlike `fp_gemm` at
+5238-5242 (spec 1283-1287, 1645-1652). The loop nest is `j`/`i`/`s` with
+**no LMUL step loop**; the block/step intersection and shortened groups of
+spec 2030-2060 belong to `fp_scaled_gemm`, not here. `int_block_dot`
+(5128-5147) is **exact and unbounded, no modular reduction**, and reads both
+operands signed regardless of altfmt (5397 passes literal `true`/`true`).
+Then exactly three roundings per (element, block) under `frm`: `int_to_fp`,
+`fp_mul` by the block scale, `fp_add` into C. The paired E8M0 scales are
+read from `v0` at pair width 16 -- low byte `scale_A` at `i*R+s`, high byte
+`scale_B` at `j*R+s`, `R = LAMBDA*SEW/16` (2129-2170, Sail 5097-5122).
+`bs` is `vtype[XLEN-5]` (0 -> 32, 1 -> 16), legality is `SEW*LAMBDA >= 16`
+and at `bs=1` also `W*LMUL <= SEW` (Sail 5151-5158). The NaN-scale early
+exit (5390-5392, 5403-5406) tests the **combined** scale after conversion
+and multiplication, not the encoded bytes: spec 2021-2024 makes `+0 x +inf`
+from two finite bytes a default NaN. E8M0 itself is restated in full at
+1990-1993 -- bias 127, 2^-127..2^127, `0xFF` NaN, and **no zero, infinity or
+subnormal encoding**: byte 0x00 is the ordinary finite value 2^-127.
+
+Five facts about `vfmmacc.vv`, still in the regression. Titan discloses **G=1, psm=0, rnd=frm**
 (spec 1771): the model must not fuse multiply-add or sum groups, so
 `acc = fp_add(acc, fp_round_to_frm(fp_mul_exact(a,b)))` per increasing `k`,
 two roundings per term under `frm`. `vtype.SEW` is the accumulator width,
@@ -89,3 +112,44 @@ pass.
 
 Write C++ only. Do not build, do not run Spike, do not read the hardware
 implementation or the Titan reference model. Call `finish` when done.
+
+**Independence is the point of this stage, and round seven makes it fragile.**
+You are the third derivation of these semantics, after the SAIL you are
+transcribing and the Titan reference model you must not read. That
+independence is what makes an agreement between the three worth anything.
+
+From round seven onwards the directed programs for the widening
+floating-point instructions (`vfwmmacc.vv`, `vfqmmacc.vv`, `vf8wmmacc.vv`)
+carry *embedded expected bytes*: the result of each multiply-accumulate,
+precomputed by the Titan reference model and compared with `memcmp`, because
+a narrow accumulator (OFP8, binary16, bfloat16) cannot be recomputed on the
+DUT with baseline `rv64imafd` instructions. Those bytes will be visible to
+you in any test source you happen to open.
+
+Do not use them. Specifically:
+
+- Do not read an expected-value blob and work backwards to the arithmetic
+  that must have produced it. That turns three independent derivations into
+  one derivation and two copies of it, and a mistake in the reference model
+  then reaches the hardware wearing three separate endorsements.
+- Do not tune rounding, ordering, or special-value handling until a golden
+  comparison passes. Transcribe what the SAIL says; if the result disagrees
+  with an embedded expectation, that disagreement is a *finding* — record it
+  with `append_knowledge`, quoting the SAIL lines and both values, and say so
+  in `finish`.
+- **A disagreement with our golden bytes does not mean you are wrong.** The
+  golden bytes come from the Titan reference model, and the Titan reference
+  model can be the mistaken party — that is precisely why your derivation is
+  kept independent of it. You are not the junior party to it; you are a
+  second opinion whose whole value is that it was formed separately. So when
+  your SAIL transcription and our expected value disagree, report the
+  disagreement and stop. Do not resolve it by moving toward us. A Stage M
+  model that quietly converges on our expectations tells us nothing we did
+  not already believe, and it destroys the only check we have on the
+  reference model itself.
+- The OFP8 (E4M3, E5M2) and OFP4 (E2M1) element encodings are defined by the
+  OCP specifications the IME adoc cites normatively at lines 1908-1913, not
+  by the IME adoc itself and not by analogy with IEEE 754. If you need a rule
+  those documents state and you do not have them, stop and say so in
+  `finish`. Do not infer one. E4M3 in particular has no infinity encoding, so
+  an IEEE-shaped overflow path is wrong there in a way that looks right.

@@ -257,10 +257,155 @@ ROUND_THREE_INSNS = ("vwmmacc.vv", "v8wmmacc.vv", "vmttl.v", "vmtts.v")
 #: See titan_runs/round4_design.md for the full survey and the citations.
 ROUND_FOUR_INSNS = ("vfmmacc.vv",)
 
+#: Round six opens the microscaled half of the family with the three
+#: integer-input, floating-point-accumulate forms:
+#:
+#:   vfwimmacc.vv  (W=2)  -- MXINT8 -> binary16 / bfloat16 at SEW=16
+#:   vfqimmacc.vv  (W=4)  -- MXINT4 -> binary16 / bfloat16 at SEW=16,
+#:                           MXINT8 -> binary32 at SEW=32
+#:   vf8wimmacc.vv (W=8)  -- MXINT4 -> binary32 at SEW=32,
+#:                           MXINT8 -> binary64 at SEW=64
+#:
+#: Why these three before the floating-point widening forms, when
+#: round4_design.md called the latter "the natural round five".
+#:
+#: 1. They are the only members of the family whose arithmetic is *fully
+#:    determined by the instruction*.  Sail ``int_scaled_gemm`` (5373-5410)
+#:    never calls get_fp_grouping / get_fp_psm / get_fp_rnd and has no G
+#:    legality check; spec 1283-1287 and 1645-1652 state it in prose.  So
+#:    round six needs no implementation disclosure, no psm=1 SAIL fragment,
+#:    and none of the "define every g_len in 1..G" obligation that spec
+#:    1667-1671 attaches to a disclosed reduction.
+#: 2. With C = +0.0, one block and both E8M0 scales at 2**0, the
+#:    architectural result is literally ``int_to_fp(dot)`` -- an exact
+#:    integer dot product and one ``fcvt``.  That keeps the directed
+#:    programs differential and bit-exact *even where the accumulator is
+#:    binary16 or bfloat16*, which baseline rv64imafd cannot round to.  It is
+#:    the reason the narrow accumulator is not a blocker here and is one in
+#:    round eight.
+#: 3. This is where the microscaling front-end gets built and judged: the
+#:    paired E8M0 scales folded into v0 at row stride R = LAMBDA*SEW/pw
+#:    (spec 2129-2170), the vtype.bs block-size field (1160-1176), the
+#:    legality rules SEW*LAMBDA >= 16 and, at bs=1, W*LMUL <= SEW (Sail
+#:    5151-5158), and the NaN-scale early exit (1959-1975, Sail 5390-5392).
+#:    Round eight's floating-point vm=0 path reuses all of it, so building it
+#:    against a deterministic arithmetic is strictly cheaper than building it
+#:    against a disclosed one.
+#:
+#: Note what these three are *not*: separate encodings.  funct6 0x39/0x3a/0x3b
+#: on OPIVV are vwmmacc.vv / vqmmacc.vv / v8wmmacc.vv at vm=1 and these three
+#: at vm=0 (Sail 5963-5975, 6196-6205, 6082-6091).  Round six therefore puts
+#: rounds one to three's integer MACs back on the regression surface with a
+#: new reason to fail: a decoder that mis-routes vm.
+#:
+#: Deliberately not in round six: the whole Zvvfmm floating-point widening
+#: group.  See titan_runs/round6_design.md for the split, and note that
+#: round4_design.md's claim that W>1 is unreachable has been retracted --
+#: a disclosed psm=1 sequential reduction reaches it.  That is round seven.
+#:
+#: RETRACTED IN ROUND SEVEN -- the clause above claiming that round seven
+#: needs "a disclosed psm=1 sequential reduction" is wrong.  It is left in
+#: place rather than deleted so that the retraction is legible to whoever
+#: reads the round-six note next; what follows is the evidence, by line, so
+#: that a future reader can tell which version to believe without re-deriving
+#: the argument.
+#:
+#: 1. Spec 1565 defines psm=0 as "the partial sum `S` is formed using exact
+#:    computation: the contributing products and sums are computed in
+#:    sufficiently precise internal form, without rounding to the C
+#:    accumulator format, until the next rounding step".  Nothing in that
+#:    sentence is conditioned on W.  A group of G=1 sub-dot-products holds
+#:    G*W = W products (spec 1558-1562), and psm=0 sums all W of them
+#:    exactly.
+#: 2. Spec 1596-1599: "For a given (`SEW`, `W`, `lambda`) entry, the
+#:    disclosed (`G`, `psm`, `rnd`) tuple applies uniformly to every legal
+#:    floating-point input-format combination, C accumulator format, and
+#:    unscaled or microscaled operation having that geometry."  So the one
+#:    tuple Titan already discloses covers every round-seven cell; there is
+#:    no per-format obligation to disclose a second one.
+#: 3. Spec 1656-1666 attaches the SAIL-fragment obligation -- and the
+#:    "define behavior for every actual group length" obligation -- to
+#:    "each entry with `psm=1`".  At psm=0 neither applies.
+#: 4. The update is therefore fully determined by the architecture alone:
+#:    with rnd=frm (spec 1584), C <- round_frm(C + round_frm(exact sum of
+#:    the W products)), per spec 1591-1593.  That is computable exactly in
+#:    the reference model with ``Fraction``, so no implementation-specific
+#:    fragment is needed to judge it.
+#:
+#: What round4_design.md actually got right is narrower than its own claim:
+#: W>1 is unreachable *by a differential program built from baseline
+#: rv64imafd*, because an exact W-product partial sum is not a scalar
+#: fmul/fadd pair.  That is a statement about how the test program checks
+#: itself, not about what the architecture determines, and round seven
+#: answers it with embedded golden bytes rather than with a psm choice.
+#:
+#: And note what this is not: keeping psm=0 is not a coverage reduction.
+#: `psm` is a parameter of the *implementation disclosure* (spec 1594-1601),
+#: not a test dimension -- we disclose psm=0 and judge against psm=0, which
+#: is a complete architectural description.  Disclosing psm=1 instead would
+#: not test more; it would oblige us to publish a SAIL fragment defining a
+#: reduction we do not implement.  This is a different kind of act from
+#: skipping a geometry or loosening a tolerance, and should not be read as
+#: one.
+ROUND_SIX_INSNS = ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv")
+
+#: Round seven closes the family with the three widening floating-point
+#: multiply-accumulates -- the last three of the spec's fifteen:
+#:
+#:   vfwmmacc.vv   (W=2)  -- OFP4->OFP8, OFP8->FP16/BF16, FP16/BF16->FP32,
+#:                           FP32->FP64
+#:   vfqmmacc.vv   (W=4)  -- OFP4->FP16/BF16, OFP8->FP32, FP16/BF16->FP64
+#:   vf8wmmacc.vv  (W=8)  -- OFP4->FP32, OFP8->FP64
+#:
+#: The legal cells are a *table*, not a rule: tbl-fp-encoding-map at spec
+#: 7288-7370, with the row-selection rules at 7270-7286.  rvv_ref.FP_CELLS
+#: transcribes it and is the single place this harness decides whether an
+#: encoding is architecture or is reserved.
+#:
+#: Three things make this round unlike round six, in increasing cost:
+#:
+#: 1. A and B are *floating-point* elements, not two's-complement integers.
+#:    Round six's inputs were MXINT4/MXINT8, whose semantics spec 2334-2342
+#:    states in full; round seven's are OFP8 (E4M3/E5M2) and OFP4 (E2M1),
+#:    whose bit-level semantics the IME spec does not restate.  Spec
+#:    1908-1913 cites OCP normatively instead, and Sail 4831-4838 leaves
+#:    ``fp_is_NaN`` / ``fp_defaultNaN`` / ``fp_zero`` as undefined helpers
+#:    deferring to that definition.  See rvv_ref.OCP_PENDING_FORMATS: those
+#:    rows are declared and deliberately left unpopulated until the OCP
+#:    documents are on disk.
+#: 2. OFP8 appears as an *accumulator* format for the first time
+#:    (vfwmmacc.vv at SEW=8, spec 1098-1099), so the round-four assumption
+#:    that a C format is an IEEE binary{32,64} chosen by width no longer
+#:    holds anywhere in this round.
+#: 3. Mixed input formats are new surface.  At EEW=4, altfmt_A=1 is
+#:    reserved (spec 1442-1443), so OFP4 never mixes; at EEW=8 and EEW=16
+#:    altfmt_A and altfmt_B are independent and all four combinations are
+#:    legal (spec 1446-1456, 1458-1476).  Mixed cells get their own test
+#:    tier rather than sharing one with the same-format cells: if they
+#:    shared, a failure could not be attributed between the mixing logic and
+#:    the per-format decode.
+ROUND_SEVEN_INSNS = ("vfwmmacc.vv", "vfqmmacc.vv", "vf8wmmacc.vv")
+
 #: Every instruction the generators know how to emit and judge.  The order is
 #: round order, so an index into this is an implementation milestone.
+#:
+#: ROUND_SEVEN_INSNS is deliberately *not* here yet.  The name says "the
+#: generators know how to emit and judge", and ime_stress's
+#: ``check_pool_covers_every_instruction`` reads it as exactly that; the
+#: round-seven directed and stress generators cannot be finished until the
+#: OCP documents land, because every one of them has to materialise an OFP8
+#: or OFP4 operand.  Adding the mnemonics early would make that stress check
+#: pass vacuously over an empty pool -- a judge lying about its own coverage,
+#: which is the one failure mode this harness exists to prevent.  The single
+#: edits that enable round seven are: append ROUND_SEVEN_INSNS here, add
+#: ``"seven"``/``"7"`` to the named map in :func:`instruction_scope` (it
+#: validates against ALL_SCOPE, so the two must move together), and flip
+#: IMPLEMENTED_INSNS / NEW_INSNS below.  Everything else this round adds --
+#: rvv_ref.FP_CELLS and its legality helpers, the kind='fpw' geometry, the
+#: sim_check sweep -- is already wired to ROUND_SEVEN_INSNS by name and is
+#: exercised by the self-tests today.
 ALL_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
-             + ROUND_FOUR_INSNS)
+             + ROUND_FOUR_INSNS + ROUND_SIX_INSNS)
 
 #: Round five adds no instruction.  It adds a *check* over instructions that
 #: are already in ALL_INSNS, so it is named as a tier token rather than as a
@@ -281,6 +426,7 @@ ALL_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
 #: observed rather than cancelled.  See titan_runs/round5_design.md.
 ROUND_FIVE_TIERS = ("clayout",)
 
+
 #: The full selectable scope: every instruction, plus every check tier.
 #: ``TITAN_INSNS`` validates against this, not against ALL_INSNS.
 ALL_SCOPE = ALL_INSNS + ROUND_FIVE_TIERS
@@ -291,8 +437,9 @@ ALL_SCOPE = ALL_INSNS + ROUND_FIVE_TIERS
 #: hook it left open so that a new round needs no edit in helpers.py.  Set
 #: them and every prompt names the right halves: rounds one and two are the
 #: regression surface, round three is the work.
-IMPLEMENTED_INSNS = ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
-NEW_INSNS = ROUND_FOUR_INSNS
+IMPLEMENTED_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
+                     + ROUND_FOUR_INSNS)
+NEW_INSNS = ROUND_SIX_INSNS
 
 
 def _scope_insns() -> tuple:
@@ -328,6 +475,7 @@ def _scope_insns() -> tuple:
              "three": ROUND_THREE_INSNS, "3": ROUND_THREE_INSNS,
              "four": ROUND_FOUR_INSNS, "4": ROUND_FOUR_INSNS,
              "five": ROUND_FIVE_TIERS, "5": ROUND_FIVE_TIERS,
+             "six": ROUND_SIX_INSNS, "6": ROUND_SIX_INSNS,
              "all": ALL_SCOPE, "": ALL_SCOPE}
     if raw.lower() in named:
         return named[raw.lower()]
@@ -336,7 +484,7 @@ def _scope_insns() -> tuple:
     if unknown:
         raise ValueError(
             f"TITAN_INSNS={raw!r}: unknown mnemonic(s) {unknown}; "
-            f"expected a round name (one/two/three/four/five/all) or a "
+            f"expected a round name (one/two/three/four/five/six/all) or a "
             f"subset of {ALL_SCOPE}")
     return chosen
 
@@ -397,7 +545,7 @@ RVV_REGRESSION_DIR = os.environ.get(
 
 # --- loop control ----------------------------------------------------------
 TITAN_LOG_ROOT = os.environ.get(
-    "TITAN_LOG_ROOT", os.path.join(tempfile.gettempdir(), "titan"))
+    "TITAN_LOG_ROOT", str(OUT_DIR / "logs"))
 MAX_ITERS = int(os.environ.get("TITAN_MAX_ITERS", "60"))
 #: Stage M is a transcription task against a formal semantics, not a
 #: microarchitecture search, so it should converge in far fewer turns
@@ -447,6 +595,97 @@ REGRESSION_SAMPLE = int(os.environ.get("TITAN_REGRESSION_SAMPLE", "0"))
 REGRESSION_BASELINE_PATH = os.environ.get(
     "TITAN_REGRESSION_BASELINE",
     os.path.join(str(EXAMPLE_DIR), "rvv_baseline_failures.json"))
+#: How many times a *failing* regression test is re-run before the loop calls
+#: it a real failure.  1 = the old single-run verdict.
+#:
+#: Why this exists (r6, measured, not guessed).  The cospike/DebugROB DPI
+#: trace bridge is nondeterministic AND load-dependent: Shuttle retires two
+#: instructions a cycle and the bridge does not order them the way Spike
+#: does.  On a byte-identical binary the full 837-test suite failed
+#: 281/248/249 tests on three consecutive runs -- ~30% -- with an 82%
+#: reshuffle of *which* tests failed, and the 24 tests that failed all three
+#: times are exactly the 837*0.31^3 = 24.9 a per-run coin flip predicts.  A
+#: single-run S2 verdict is therefore not "unlikely to be clean", it is
+#: unreachable -- and before this the gate ran only when S2 came back clean,
+#: so in r6 the gate never ran at all.
+#:
+#: The rule is unanimity with early exit: only the tests still failing are
+#: re-run, and a test that passes ANY rep is dropped as a bridge flip.  Under
+#: the measured p=0.31 per-run flip rate a pure flake survives n reps with
+#: probability 0.31^(n-1), so 7 leaves 0.0009 per test -- about 0.2 expected
+#: false failures on a 250-failure gate -- while the shrinking survivor set
+#: (250 -> ~78 -> ~24 -> ~8 -> ~2) costs ~370 extra cosims on top of the 837,
+#: not 7*837.  That is ~45% of one suite pass, i.e. roughly +25 minutes on an
+#: hour-long gate; simulated over five seeds in
+#: titan_runs/out/work/test_confirm.py.
+#:
+#: What it does NOT catch: a genuinely intermittent RTL bug looks exactly
+#: like a bridge flip and is cleared the same way.  Every clearing is
+#: recorded (``regression_confirm`` events, ``*_confirm.json``, and the
+#: agent-facing message) so it is visible rather than silent.
+REGRESSION_CONFIRM_REPS = int(
+    os.environ.get("TITAN_REGRESSION_CONFIRM_REPS", "7"))
+
+#: Above this many reported failures, confirmation is skipped and every
+#: reported failure is taken at face value.  A tree that breaks half the
+#: suite is broken, not flaky, and re-running it proves nothing the agent
+#: does not already know.
+REGRESSION_CONFIRM_MAX = int(
+    os.environ.get("TITAN_REGRESSION_CONFIRM_MAX", "500"))
+
+#: 迴歸派工時一次最多讓幾支測試在飛。0 = 舊行為：整個 suite（837 支）一次送出，
+#: 併發完全由叢集的 ``verilator_run`` 資源決定。
+#:
+#: 為什麼需要這個旋鈕：`cluster.yaml` 的 CPU 配額是按「獨佔主機」寫的
+#: （verilator 4 節點 × 16 CPU = 64 核，全部節點加總正好等於主機的 96 執行緒），
+#: 但主機是與 AETHER 叢集及另外約 40 位使用者共用的。2026-09-23 把 cosim
+#: ``num_workers`` 從 4 降到 2，峰值降到 32 核；設定檔只在叢集重啟後生效，
+#: 這個旋鈕則隨時可調，是不重啟就能降載的那一條路。
+#:
+#: 注意這不改變總工作量，只改變同時在飛的數量——牆鐘會變長，覆蓋不變。
+REGRESSION_MAX_INFLIGHT = int(
+    os.environ.get("TITAN_REGRESSION_MAX_INFLIGHT", "0"))
+
+#: FLOOR on how many separate confirmation passes must clear a test as
+#: "flaky" before the loop will say out loud that it might not be flaky.
+#: A floor, not the rule: the rule is in ``_repeat_suspects``, which only
+#: fires when the repeat count exceeds what the run's own measured background
+#: clear rate produces by chance.  A bare count does not work -- at ~250 of
+#: 837 tests cleared per pass the per-test rate is ~0.30, so chance alone
+#: puts 837*0.30**3 = 23 names at three repeats, and an alert that names 23
+#: flakes every run hides the one that matters.
+#:
+#: This is the only handle there is on the hole unanimity leaves.  A genuinely
+#: intermittent RTL bug and a trace-bridge flip are indistinguishable in one
+#: pass, and unanimity discards both.  But they differ ACROSS passes: r6
+#: measured 82-87% of the failing set reshuffling between runs, so pure flake
+#: hits a different random subset every time, so a name that comes back far
+#: more often than the background rate explains is the one residual signature
+#: of the class of bug this mechanism throws away.  The statistic is not the
+#: repeat count but reps-to-first-pass pooled over passes (see
+#: ``_repeat_suspects``); the null is measured on the run itself.
+#:
+#: Its power, simulated at a 0.31 background over 837 tests with one planted
+#: intermittent bug, 6 seeds each (titan_runs/out/work/test_confirm.py --
+#: "caught" = confirmed as a real failure OR flagged as a suspect):
+#:
+#:     bug fails ...% of runs   8 passes   16 passes
+#:     50%                      0/6        0/6
+#:     70%                      2/6        4/6
+#:     80%                      3/6        6/6
+#:     90%                      5/6        5/6
+#:
+#: So: a bug that fails half its runs is invisible to both halves, and even a
+#: 70% one needs a long run.  Silence here is weak evidence, not a clean bill
+#: of health.
+#:
+#: Signal only.  Nothing in the loop re-judges on this count, because
+#: automatic re-judging would put back exactly the unpassability the
+#: confirmation was built to remove.  It is printed for a human to chase with
+#: an independent, unloaded re-run.
+REGRESSION_FLAKY_REPEAT_ALERT = int(
+    os.environ.get("TITAN_REGRESSION_FLAKY_REPEAT", "3"))
+
 STRESS_TEST_VRUN_FRACTION = float(
     os.environ.get("TITAN_STRESS_VRUN_FRACTION", "0.5"))
 
@@ -613,7 +852,7 @@ SIMLOG_TAIL_LINES = int(os.environ.get("TITAN_SIMLOG_TAIL_LINES", "200"))
 SKY130_COL_PATH = os.environ.get("TITAN_SKY130_COL_PATH", "#FILL")
 CACTI_PATH = os.environ.get("TITAN_CACTI_PATH", "#FILL")
 SYNTH_OBJ_ROOT = os.environ.get(
-    "TITAN_SYNTH_OBJ_ROOT", os.path.join(tempfile.gettempdir(), "titan-synth"))
+    "TITAN_SYNTH_OBJ_ROOT", str(OUT_DIR / "synth"))
 SYNTH_TIMEOUT_S = int(os.environ.get("TITAN_SYNTH_TIMEOUT_S", "86400"))
 
 #: What Hammer synthesises.  riscv_extensions uses BoomTile; the equivalent

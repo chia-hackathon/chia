@@ -1,7 +1,8 @@
-Implement round four of the RISC-V Integrated Matrix Extension (Zvvm) in
-Saturn: `vfmmacc.vv` at SEW 32 and 64 -- on top of `vmmacc.vv`, `vmtl.v`,
-`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`,
-already implemented and passing.
+Implement round six of the RISC-V Integrated Matrix Extension (Zvvm) in
+Saturn: `vfwimmacc.vv`, `vfqimmacc.vv` and `vf8wimmacc.vv` -- the microscaled
+integer-input, floating-point-accumulate forms -- on top of `vmmacc.vv`,
+`vmtl.v`, `vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`,
+`vmtts.v`, `vfmmacc.vv`, already implemented and passing.
 
 Start by calling `read_spec` and reading the specification. Then read Saturn.
 The orientation in your system prompt tells you where to look; it does not
@@ -21,25 +22,27 @@ reports SKIP. A SKIP means you do not support that tile geometry,
 which is allowed. A mismatch means the IME path disagrees with a plain RVV 1.0
 sequence computing the same thing, and that is never allowed.
 
-## Rounds one through four
+## Rounds one through six
 
-Rounds one through three are done and converged: `vmmacc.vv`, `vmtl.v`,
-`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`.
-Round four adds exactly one instruction, `vfmmacc.vv`, at SEW 32 and 64
-only. Where RTL for earlier instructions is already in the tree, extend it:
-every directed test that passes today must still pass. The spec's SAIL
-appendix is normative and outranks its prose -- never write something the
-SAIL does not say in order to make a test pass.
+Rounds one through five are done and converged: `vmmacc.vv`, `vmtl.v`,
+`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`,
+`vfmmacc.vv`. Round six adds three: `vfwimmacc.vv` (W=2), `vfqimmacc.vv`
+(W=4) and `vf8wimmacc.vv` (W=8). Where RTL for earlier instructions is
+already in the tree, extend it: every directed test that passes today must
+still pass. The spec's SAIL appendix is normative and outranks its prose --
+never write something the SAIL does not say in order to make a test pass.
 
 Three more facts. `vwmmacc.vv`/`v8wmmacc.vv` reuse the round-two datapath
 (SEW stays the accumulator width, tiles arrive via `vmtl.v`, only funct6 and
 unpack depth W change). `vmttl.v`/`vmtts.v` are `vmtl.v`/`vmts.v` with two
 changes: bits 27:26 `0b01` not `0b00`, and offset `(i % linesize) * LD + (i /
 linesize)` (div/mod swapped); `flat_idx = tile_reg_idx(...)` is unchanged,
-`rs2 = 0` default LD is now `VLEN/(SEW*LAMBDA)` not `LAMBDA*LMUL`. And `vm =
-0` on funct6 `0x39`/`0x3a`/`0x3b` is not a don't-care: it decodes
-`vfwimmacc.vv`/`vfqimmacc.vv`/`vf8wimmacc.vv` (out of scope) -- raise
-illegal-instruction, don't leave it unhandled.
+`rs2 = 0` default LD is now `VLEN/(SEW*LAMBDA)` not `LAMBDA*LMUL`. And `vm = 0` on funct6 `0x39`/`0x3a`/`0x3b` is not a don't-care: it decodes
+`vfwimmacc.vv`/`vfqimmacc.vv`/`vf8wimmacc.vv`, which is **this round's work**.
+Those three share their funct6 with `vwmmacc.vv`/`vqmmacc.vv`/`v8wmmacc.vv`
+and are separated by `vm` alone, so a decoder that mis-routes `vm` breaks
+rounds one through three as well as failing round six. The `ime_mxl_` tier
+exists to catch exactly that.
 
 Two facts about `vqmmacc.vv` that save a wrong turn: `vtype.SEW` is the
 *accumulator* (C) width, so int8 A/B means SEW=32 -- M, N_max, EMUL_C and the
@@ -51,7 +54,35 @@ is the plain row-major int8 panel the existing loader already fetches. The RTL
 work is a 4-way-packed int8 MAC datapath feeding the existing 32-bit C tile,
 not new addressing.
 
-Five facts about `vfmmacc.vv`. Titan discloses **G=1, psm=0, rnd=frm**
+Seven facts about round six. **There is no (G, psm, rnd) here at all.**
+Sail `int_scaled_gemm` (5373-5410) never calls `get_fp_grouping` /
+`get_fp_psm` / `get_fp_rnd` and has no `G` legality check, unlike `fp_gemm`
+at 5238-5242; spec 1283-1287 and 1645-1652 say so in prose. Nothing about
+round four's disclosure applies. **The loop nest is `j`/`i`/`s` only --
+there is no LMUL step loop.** The block-and-step intersection and shortened
+groups of spec 2030-2060 belong to `fp_scaled_gemm`; here `int_block_dot`
+gets the whole block interval `[s*block_size, min(k_lo+block_size,K_eff)-1]`.
+**`int_block_dot` is exact and unbounded** (Sail 5128-5130, "no overflow")
+and reads both operands **signed regardless of altfmt** (5397 passes the
+literals `true`/`true`); there is no modular reduction anywhere on this
+path, unlike `int_gemm`. **Exactly three roundings per (element, block)**:
+`int_to_fp`, `fp_mul` by the block scale, `fp_add` into C, all under `frm`.
+**The paired E8M0 scales live in `v0`**, read at the pair width 16: low byte
+`scale_A`, high byte `scale_B`, row stride `R = LAMBDA*SEW/16`, A at
+`i*R+s` and B at `j*R+s` out of the same register (spec 2129-2170, Sail
+5097-5122). `vd`/`vs1`/`vs2` must not overlap `v0`. **`bs` is
+`vtype[XLEN-5]`, not an instruction field** (spec 1160-1176): 0 means block
+size 32, 1 means 16. Legality: `SEW*LAMBDA >= 16` always, and at `bs=1` also
+`W*LMUL <= SEW` (Sail 5151-5158). **The NaN-scale early exit** (Sail
+5390-5392, 5403-5406) tests the *combined* scale after conversion and
+multiplication, not the encoded bytes: spec 2021-2024 makes `+0 x +inf` from
+two finite E8M0 bytes a default NaN, and a model that only looks for `0xFF`
+misses it. `altfmt_A` and `altfmt_B` must be 0 (MXINT is signed
+unconditionally); `vtype.altfmt` selects the C accumulator format and is a
+*base* Zvfbfa field at an absolute bit position, not one of the IME fields
+keyed by offset below XLEN.
+
+Five facts about `vfmmacc.vv`, still in the regression. Titan discloses **G=1, psm=0, rnd=frm**
 (spec 1771): the DUT must not fuse multiply-add or sum groups, so
 `acc = fp_add(acc, fp_round_to_frm(fp_mul_exact(a,b)))` per increasing `k`,
 two roundings per term under `frm`. `vtype.SEW` is the accumulator width,
@@ -105,6 +136,39 @@ regression; the matrix unit does not get to stall that path.
   `LMUL > 1` shuffling is entirely on the register side, via
   `tile_reg_idx(i, LMUL, LAMBDA, VLEN/SEW)`. Do not compose the two indices.
 
+- **A matrix FP unit does not belong in the integer FU list.** Putting
+  `MatrixFPMultiplyFactory()` into `integerMatrix` once broke 23 `.vf` tests
+  in the Stage 2 regression and cost three iterations to find, because the
+  symptom was floating-point *RVV* tests failing rather than anything matrix
+  related. Round six accumulates in floating point, so it lands in the same
+  place: give it its own `fpMatrix` list rather than extending the integer
+  one. Check this before you start debugging arithmetic.
+
+- **Do not make a check pass by changing what it counts.** There was an
+  iteration that kept `fus.size` constant by merging two FU factories into
+  one, so the check that guards the issue-path shape stopped complaining.
+  That is hiding the problem, not fixing it. If a structural check fires,
+  either the structure is wrong or the check is wrong -- say which, and fix
+  that. The same rule covers narrowing a test's coverage, relaxing a
+  tolerance, or skipping a geometry to turn a red run green.
+
+- **OFP8 and OFP4 special values are not in the adoc.** Spec 1910-1913 is a
+  *normative reference* to the OCP Microscaling Formats (MX) v1.0
+  specification, not a restatement; the adoc never gives the bit encodings.
+  E4M3 has no infinities and only one NaN encoding, E5M2 is IEEE-shaped,
+  E2M1 has neither NaN nor infinity. If you need any of those rules, get
+  them from OCP -- a guess here produces wrong numbers that look exactly
+  like an RTL bug and will cost you iterations. (Round six itself does not
+  need them: its data inputs are MXINT4/MXINT8, plain signed two's
+  complement with no special values, and E8M0 *is* restated in full at spec
+  1990-1993. This matters for the floating-point rounds.)
+
+- **Every version silent, all stopping at the same simulated time, means
+  the cycle budget ran out.** That is `+max-cycles`, not your RTL and not
+  the test. A real hang or a real functional failure does not line up to the
+  same cycle count across unrelated builds. Check the stop time before you
+  go looking for a bug.
+
 ## Testing your own work
 
 You have `run_directed_start` / `run_directed_wait`. Use them: get
@@ -119,8 +183,10 @@ Then: `change -> start("failing") -> wait -> read the values -> change`.
 12% of runs on an unchanged binary (`titan_runs/nondet/`), so run a failing
 RVV test three times — `run_rvv_start(tests, reps=3)` — and judge by majority
 before you change RTL for it; a single pass does not clear a test either.
-Call `finish` only when `run_directed_start("all")` is 27/27,
-`run_rvv_start("failing")` is clean, and the tree holds no scaffolding.
+Call `finish` only when `run_directed_start("all")` passes every program it
+runs -- the suite grows each round, so judge by "0 failed", never by a
+remembered count -- `run_rvv_start("failing")` is clean, and the tree holds
+no scaffolding.
 
 Do not modify any test or reference file, and do not run sbt, make or
 verilator by hand — `run_directed_start` is that build, correctly configured.

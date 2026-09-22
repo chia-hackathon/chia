@@ -28,18 +28,20 @@ When you are unsure what an instruction does, re-read the spec. Every time.
 
 ## What you are implementing
 
-Nine instructions total -- the directed suite's full scope this round.
-Eight are already implemented and must keep passing: `vmmacc.vv`,
-`vmtl.v`, `vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`,
-`vmtts.v`. One is new this round: `vfmmacc.vv`, floating-point, SEW 32/64
-only.
+Twelve instructions total -- the directed suite's full scope this round.
+Nine are already implemented and must keep passing: `vmmacc.vv`, `vmtl.v`,
+`vmts.v`, `vqmmacc.vv`, `vwmmacc.vv`, `v8wmmacc.vv`, `vmttl.v`, `vmtts.v`,
+`vfmmacc.vv`. Three are new this round: `vfwimmacc.vv`, `vfqimmacc.vv` and
+`vf8wimmacc.vv` -- microscaled integer inputs accumulated in floating
+point.
 
 | | |
 |---|---|
 | `v{,q,w,8w}mmacc.vv vd, vs1, vs2` | C <- C + A x B^T; funct6 and unpack depth (W in {1,4,2,8}) vary, the datapath shape does not |
 | `vmtl.v` / `vmttl.v vd, (rs1), rs2` | order-preserving / transposing 2D tile load |
 | `vmts.v` / `vmtts.v vs3, (rs1), rs2` | order-preserving / transposing 2D tile store |
-| `vfmmacc.vv vd, vs1, vs2` **(new)** | C <- fp_add(C, fp_round_frm(fp_mul(A,B))) per k, one term at a time; SEW=32/64 only, funct3=OPFVV not OPIVV |
+| `vfmmacc.vv vd, vs1, vs2` | C <- fp_add(C, fp_round_frm(fp_mul(A,B))) per k, one term at a time; SEW=32/64 only, funct3=OPFVV not OPIVV |
+| `vf{w,q,8w}immacc.vv vd, vs1, vs2, v0.scale` **(new)** | per microscaling block: exact signed integer dot -> `int_to_fp` -> `fp_mul` by the paired E8M0 block scale from `v0` -> `fp_add` into C, all under `frm`. Same funct6 as `v{w,q,8w}mmacc.vv`, selected by `vm=0`; funct3 OPIVV. No (G, psm, rnd) and no LMUL step loop |
 
 The good news, and it is genuinely good: **Zvvm adds no architectural
 register state.** A tile is an ordinary vector register group, reinterpreted
@@ -266,7 +268,8 @@ believe one of them is wrong, say so via `finish` and stop — do not change it.
 The working shape of a turn: read the notes and the status, form one
 hypothesis, change the code, `run_directed_start("failing")`, wait it out,
 read what changed, repeat. Call `finish` only when `run_directed_start("all")`
-is 27/27 **and** `run_rvv_start("failing")` is clean — or when your budget is
+reports 0 failed — the suite grows each round, so judge by that and never by
+a remembered count — **and** `run_rvv_start("failing")` is clean — or when your budget is
 spent, in which case record in your notes what you had not tested.
 
 ## Rules

@@ -99,6 +99,37 @@ VTYPE_IME_FIELDS = {  # name -> (offset below XLEN, width)
     "altfmt_B": (7, 1),
 }
 
+# ... and the *base* altfmt field, which is not an IME field at all.  Spec
+# 856-861: "They are distinct from the base `altfmt` field defined by
+# Zvfbfa -- which selects the floating-point format of the output
+# accumulator C in conjunction with `vsew` (see integrated-matrix-altfmt)
+# and resides in the low part of `vtype` at the bit position assigned by
+# Zvfbfa.  `altfmt` (output format, Zvfbfa) does not collide with the
+# IME-defined `altfmt_A` / `altfmt_B` (input formats, high bits)."
+#
+# Two consequences that matter to round six, and one caveat:
+#
+#   * it is keyed by an *absolute* lsb, not by an offset below XLEN, which
+#     is why it cannot live in VTYPE_IME_FIELDS -- the two dicts are indexed
+#     differently and merging them would silently place the field at
+#     vtype[XLEN-8];
+#   * it is the field that picks binary16 vs bfloat16 for the C accumulator
+#     at SEW=16 (spec 1092-1106), which is the *only* thing that
+#     distinguishes the two rows of the MX_CELLS entries at (W=2, SEW=16)
+#     and (W=4, SEW=16); and
+#   * this adoc does not restate Zvfbfa's bit position -- it defers to that
+#     extension.  Zvfbfa puts altfmt immediately above vma, at vtype[8],
+#     i.e. inside the vtypei immediate of vsetvli.  The generator writes it
+#     through `vsetvl` anyway, along with the IME fields, so the position is
+#     load-bearing for exactly one thing: an implementation that decodes it
+#     elsewhere will read altfmt=0 and accumulate a round-six SEW=16 tile in
+#     binary16 where the test asked for bfloat16.  That is a real failure
+#     mode, and it is named here rather than buried so that a round-six
+#     mismatch confined to the bfloat16 rows points straight at it.
+VTYPE_BASE_FIELDS = {  # name -> (lsb, width)
+    "altfmt": (8, 1),
+}
+
 
 class EncodingError(ValueError):
     """Raised for an unknown instruction or an operand that does not fit."""
@@ -504,10 +535,46 @@ def check_mx_split() -> None:
             f"{unscaled}/{scaled} are no longer split by the vm bit")
 
 
+def check_round_seven_vtype_fields() -> None:
+    """The altfmt placement trap, pinned rather than left as a comment.
+
+    The block comment above VTYPE_BASE_FIELDS explains why `altfmt` cannot
+    live in VTYPE_IME_FIELDS: the IME fields are keyed by an offset below
+    XLEN and Zvfbfa's `altfmt` by an absolute lsb, so merging the two dicts
+    places it at vtype[XLEN-8] and every accumulator-format selection reads
+    back zero.  Round six survived that as a comment because only two of its
+    cells had a second accumulator format.  Round seven cannot: `altfmt`
+    selects the C format on *every* cell in tbl-fp-encoding-map, including
+    the E4M3-vs-E5M2 choice at (W=2, SEW=8) where both rows are legal
+    (spec 7319-7320), so a misplaced field silently turns every round-seven
+    program into its altfmt=0 twin -- a result that is wrong but plausible.
+
+    A comment cannot fail. This can.
+    """
+    assert "altfmt" in VTYPE_BASE_FIELDS, (
+        "altfmt is Zvfbfa's, keyed by absolute lsb (spec 856-861)")
+    assert "altfmt" not in VTYPE_IME_FIELDS, (
+        "altfmt must not be an IME field: VTYPE_IME_FIELDS is keyed by "
+        "offset-below-XLEN, so this would place it at vtype[XLEN-8]")
+    assert set(VTYPE_IME_FIELDS) == {"lambda", "bs", "altfmt_A", "altfmt_B"}, \
+        sorted(VTYPE_IME_FIELDS)
+    # The two altfmt_* inputs are the IME ones and sit immediately below bs
+    # (spec 1113-1116): altfmt_A at vtype[XLEN-6], altfmt_B at vtype[XLEN-7].
+    assert VTYPE_IME_FIELDS["altfmt_A"] == (6, 1)
+    assert VTYPE_IME_FIELDS["altfmt_B"] == (7, 1)
+    # Zvfbfa's altfmt is inside the vtypei immediate; the IME ones are not.
+    # That asymmetry is the reason every generator writes vtype with vsetvl.
+    lsb, width = VTYPE_BASE_FIELDS["altfmt"]
+    assert width == 1 and lsb < 11, (lsb, width)
+    for name, (offset, _w) in VTYPE_IME_FIELDS.items():
+        assert offset >= 4, (name, offset)
+
+
 def main() -> int:
     for check in (check_table, check_round_one_bits, check_round_two_bits,
                   check_round_three_bits, check_round_four_bits,
-                  check_llvm_drift, check_mx_split):
+                  check_llvm_drift, check_mx_split,
+                  check_round_seven_vtype_fields):
         check()
         print(f"  ok  {check.__name__}")
     print(f"\nZvvm v{SPEC_VERSION}: {len(INSTRUCTIONS)} instructions, "

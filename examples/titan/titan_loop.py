@@ -37,7 +37,9 @@ import argparse
 import functools
 import gzip
 import hashlib
+import hostload
 import json
+import math
 import os
 import tarfile
 import tempfile
@@ -66,6 +68,9 @@ from constants import (AGENT_LOG_DIR, AGENT_LOG_REL, AGENT_RUNS_PER_ITER,
                        SYNTH_CONFIG as DIRECTED_CONFIG,
                        MAX_ITERS, MODEL_MAX_ITERS, MODEL_MAX_SKIP_FRACTION,
                        REGRESSION_ALERT_DELTA, REGRESSION_BASELINE_PATH,
+                       REGRESSION_CONFIRM_MAX, REGRESSION_CONFIRM_REPS,
+                       REGRESSION_FLAKY_REPEAT_ALERT,
+                       REGRESSION_MAX_INFLIGHT,
                        REGRESSION_SAMPLE, RVV_AGENT_MAX_TESTS,
                        RUNTIME_ENV, S2_COSIM_SCALA, S2_COSIM_SCALA_REL,
                        SIMLOG_TAIL_LINES, SPEC_DIR,
@@ -552,6 +557,11 @@ def _write_s2_cosim_config(pg_opts, enable: bool = True) -> None:
 #: directory; the first handful is what a diagnosis actually needs.
 REGRESSION_LOGS_KEPT = 12
 
+#: 迴歸跑到一半時每幾支重新評估一次主機負載。Gate 的 837 支要跑一小時以上，
+#: 主機在這段時間裡會變；ps 一次約 20ms，這個頻率的成本可以忽略。
+HOSTLOAD_RECHECK_EVERY = int(
+    os.environ.get("TITAN_HOSTLOAD_RECHECK_EVERY", "50"))
+
 
 def _run_regression(artifact, select: Optional[Sequence[str]] = None,
                     sample: bool = True
@@ -613,12 +623,45 @@ def _run_regression(artifact, select: Optional[Sequence[str]] = None,
     if sample and REGRESSION_SAMPLE and 0 < REGRESSION_SAMPLE < len(suite):
         stride = len(suite) / float(REGRESSION_SAMPLE)
         suite = [suite[int(i * stride)] for i in range(REGRESSION_SAMPLE)]
-    refs = {name: nodes.cosim_run.chia_remote(
-        artifact, elf, name, 0, SIM_WORK_DIR, extension=EXTENSION)
-        for name, elf in suite}
+    def _submit(nm, el):
+        return nodes.cosim_run.chia_remote(
+            artifact, el, nm, 0, SIM_WORK_DIR, extension=EXTENSION)
+
+    # 降載旋鈕：REGRESSION_MAX_INFLIGHT > 0 時改成滑動視窗送出，一次只讓 N 支在飛。
+    # 0 = 交給 hostload 依當下餘裕決定（它有自己的上限），不再是整個 suite 一次送出。
+    # 總工作量不變、覆蓋不變，只有牆鐘變長 —— 見 constants 裡的說明。
+    #
+    # 視窗由主機負載決定而非寫死：這台機器與 AETHER 叢集及約 40 位使用者共用，
+    # 而 cluster.yaml 的配額是按獨佔主機寫的。hostload 只量「別人」的用量
+    # （排除自己的 uid，否則我們自己的 sim 會把自己擋住），而且永遠會放行 ——
+    # 它是節流閥不是開關，主機上有掛了數週的長期佔用，等待條件可能永不成立。
+    window, why = hostload.advised_window(REGRESSION_MAX_INFLIGHT)
+    print(f"[hostload] 派工 {len(suite)} 支：{why}", flush=True)
+    queued = list(suite)
+    if window > 0:
+        refs = {nm: _submit(nm, el) for nm, el in queued[:window]}
+        queued = queued[window:]
+    else:
+        refs = {nm: _submit(nm, el) for nm, el in queued}
+        queued = []
     failing: List[Tuple[str, str, str]] = []
+    done = 0
     for name, _ in suite:
-        res = get(refs[name])
+        res = get(refs.pop(name))
+        done += 1
+        # 中途重新評估：Gate 的 837 支要跑一小時以上，主機在這段時間裡會變。
+        # ps 一次約 20ms，所以每 50 支看一次的成本可以忽略。
+        if queued and done % HOSTLOAD_RECHECK_EVERY == 0:
+            new_window, new_why = hostload.advised_window(
+                REGRESSION_MAX_INFLIGHT)
+            if new_window != window:
+                print(f"[hostload] {done}/{len(suite)} 已完成，視窗 "
+                      f"{window} -> {new_window}：{new_why}", flush=True)
+                window = new_window
+        # 補到視窗大小為止（視窗變大就多送幾支，變小就這輪不送，靠自然消耗縮小）
+        while queued and len(refs) < window:
+            nxt_nm, nxt_el = queued.pop(0)
+            refs[nxt_nm] = _submit(nxt_nm, nxt_el)
         if res.match:
             continue
         if res.crashed:
@@ -648,47 +691,322 @@ def _run_regression(artifact, select: Optional[Sequence[str]] = None,
     return failing, [n for n, _ in suite]
 
 
-def _merge_failing(path: Optional[str], ran, failing) -> None:
-    """Same merge rule as the directed failing set: only what ran changes.
 
-    A ``run_rvv_start('vmv...')`` that passes must clear exactly that test,
-    not the 200 it never touched -- otherwise ``'failing'`` would collapse to
-    "whatever the last partial run happened to break" and the agent would
-    lose the set the loop actually grades.
+#: Every confirmation pass this process ran, oldest first, so ``run()`` can
+#: put the single-run-vs-confirmed numbers in the run summary without
+#: threading a return value through four call sites.
+_CONFIRM_LOG: List[Dict[str, object]] = []
+
+#: How many repeatedly-cleared names chance may be expected to produce
+#: before the alert is allowed to fire.  Below one name: if the background
+#: would already put a name at this repeat count, the repeat says nothing.
+_REPEAT_EXPECTED_MAX = 0.5
+
+#: test name -> the confirmation passes that cleared it as a bridge flip.
+#:
+#: Across-pass memory is the whole point.  Within one pass an intermittent RTL
+#: bug and a trace-bridge flip are the same observation, and unanimity throws
+#: both away.  Across passes they need not be: r6 measured 82-87% of the
+#: failing set reshuffling run to run, so an intermittent bug should keep
+#: naming itself while flake keeps naming somebody else.
+_CLEARED_HISTORY: Dict[str, List[str]] = {}
+
+#: test name -> [reps it failed, reps it ran] pooled over every confirmation
+#: pass, counting the confirmation reps only (never the first run, which is
+#: what selected the test in the first place -- conditioning on it would put
+#: a fail in every name's numerator for free).
+_CLEARED_OBS: Dict[str, List[int]] = {}
+
+
+def _binom_tail(k: int, n: int, p: float) -> float:
+    """P(X >= k) for X ~ Binomial(n, p).  Exact; n is two digits at most."""
+    if k <= 0:
+        return 1.0
+    if k > n:
+        return 0.0
+    p = min(max(p, 0.0), 1.0)
+    return sum(math.comb(n, i) * (p ** i) * ((1.0 - p) ** (n - i))
+               for i in range(k, n + 1))
+
+
+def _repeat_suspects() -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    """Which cleared tests look less like flake than the run's own flake does.
+
+    This is the half-step past "record it and hope someone looks".  Unanimity
+    cannot tell an intermittent real bug from a trace-bridge flip inside one
+    pass, so the question is what separates them across the whole run.
+
+    Counting how many passes cleared a name -- the obvious answer -- does not
+    work.  With ~250 of 837 tests cleared per pass the per-test clear rate is
+    ~0.30, so chance alone puts 837*0.30**3 = 23 names at three repeats, and
+    a measurement of that (below) showed the naive counter naming ~26 pure
+    flakes and missing the planted bug.
+
+    What does work is data the confirmation already produced and used to
+    throw away: HOW MANY reps each cleared test failed before it passed.
+    Early exit makes that a run-length -- a flake flipping at p=0.31 fails
+    1/(1-0.31) = 1.4 reps before passing, a test that genuinely misbehaves
+    70% of the time fails 3.3 -- and those pool across passes into a real
+    sample.  The null is estimated from the run itself (p_hat over every
+    cleared test's pooled reps), so the alarm rate is calibrated to whatever
+    the bridge is doing today rather than to r6's 0.31.
+
+    A name fires when ``N * P(X >= fails | reps, p_hat)`` is below
+    ``_REPEAT_EXPECTED_MAX`` -- fewer than half a name expected by chance
+    across the whole family -- with ``REGRESSION_FLAKY_REPEAT_ALERT`` passes
+    as a floor.
+
+    Signal only.  Nothing re-judges on this: automatic re-judging would hand
+    back the unpassable gate this whole mechanism exists to remove.
+
+    Power is limited and the limit is the point.  The statistic separates a
+    bug from flake only when the bug's per-run rate is well above the
+    background and several passes have accumulated; a bug that fails 40% of
+    runs against a 31% background will not surface, and an empty list means
+    "nothing exceeded chance", never "no intermittent bug".
+
+    Returns ``(suspects, context)``.  ``context`` is published either way,
+    because "checked, nothing exceeded chance" and "never looked" must not
+    read the same in the logs.
     """
-    if not path:
-        return
-    ran = set(ran)
-    _write_failing(path, (_read_failing(path) - ran) | set(failing))
+    fails = sum(v[0] for v in _CLEARED_OBS.values())
+    reps = sum(v[1] for v in _CLEARED_OBS.values())
+    names = len(_CLEARED_OBS)
+    passes = len(_CONFIRM_LOG)
+    p_hat = (fails / reps) if reps else 0.0
+    floor = max(1, REGRESSION_FLAKY_REPEAT_ALERT)
+    context: Dict[str, object] = {
+        "passes": passes, "distinct_names_cleared": names,
+        "pooled_fail_reps": fails, "pooled_reps": reps,
+        "background_fail_rate": round(p_hat, 4),
+        "floor_passes": floor, "expected_max": _REPEAT_EXPECTED_MAX,
+    }
+    if names < 2 or reps < 2 or p_hat <= 0.0 or p_hat >= 1.0:
+        return [], context
+    suspects = []
+    for name, (f, r) in _CLEARED_OBS.items():
+        cleared_in = _CLEARED_HISTORY.get(name, [])
+        if len(cleared_in) < floor:
+            continue
+        expected = names * _binom_tail(f, r, p_hat)
+        if expected >= _REPEAT_EXPECTED_MAX:
+            continue
+        suspects.append({"test": name, "passes": len(cleared_in),
+                         "cleared_in": cleared_in,
+                         "failed_reps": f, "total_reps": r,
+                         "expected_by_chance": round(expected, 4)})
+    suspects.sort(key=lambda d: (d["expected_by_chance"], -d["failed_reps"]))
+    context["suspects"] = len(suspects)
+    return suspects, context
 
 
-def _dump_regression_logs(dump: helpers.Dumper, stem: str,
-                          failing: Sequence[Tuple[str, str, str]]) -> None:
-    """The S2 equivalent of ``_dump_sim_logs``.
+def _confirm_failures(artifact, failing: Sequence[Tuple[str, str, str]],
+                      label: str, eligible: int = 0
+                      ) -> Tuple[List[Tuple[str, str, str]], Dict[str, object]]:
+    """Re-run only the failing tests and keep the ones that fail every time.
 
-    r8's S2 wrote a JSON list of 841 names and nothing else, so "why did
-    every test fail?" was unanswerable without re-running the whole gate by
-    hand.  This keeps the head of the first few failing logs -- the head, not
-    the tail, because a cospike abort prints its divergence and then dumps
-    spike's architectural state, so the interesting part is at the top -- plus
-    a histogram of the last line of every log, which is what tells 841
-    identical harness deaths apart from 841 real divergences.
+    The single most expensive mistake in this loop was treating one cosim run
+    as a verdict.  r6 measured what that costs: on a byte-identical binary the
+    full suite failed 281/248/249 tests on three consecutive runs, 82% of the
+    failing set reshuffled between runs, and the tests that failed all three
+    times were exactly the count independent per-run coin flips predict.  The
+    trace bridge is also load-dependent -- ``machine_vdivu_vx-0`` diverges at
+    instruction 55255 every time inside the 837-way harness and passes every
+    time when run alone -- so this cannot be fixed by "run it somewhere else".
+
+    So: rep 1 is the caller's run, which has already happened.  Each further
+    rep re-runs *only* what is still failing, on the SAME build, and a test
+    that passes any rep is dropped.  Unanimity, not majority, because with
+    p~=0.31 per-run flips a majority of 3 would still confirm ~20% of pure
+    flakes -- 50 false failures on a gate-sized set -- while unanimity over
+    ``REGRESSION_CONFIRM_REPS`` leaves 0.31**(n-1) each.  The survivor set
+    shrinks by ~3x a rep, so the extra cost is a fraction of one suite pass,
+    not (n-1) passes.
+
+    Two assumptions, both UNVERIFIED, written down so they are not later
+    mistaken for measurements:
+
+    1. *The bridge only manufactures spurious divergences; it never hides a
+       real one.*  Clearing a test because it passed one rep is only sound if
+       a pass cannot be an artefact.  Nothing has tested that.  If the bridge
+       can mask a genuine mismatch, this function converts a real failure into
+       a clean S2 -- and so did the single-run code before it, which never
+       re-checked a pass either.
+    2. *Flips are independent between reps.*  The arithmetic behind
+       ``REGRESSION_CONFIRM_REPS`` (0.31**(n-1)) assumes that.  r6's three
+       full-suite runs are consistent with independence -- the triple-failure
+       count matched 837*0.31**3 -- but three samples cannot establish it.
+       If flips are correlated (per test, per node, per binary), the residual
+       false-confirmation rate is WORSE than the arithmetic predicts, and the
+       visible symptom would be a gate that keeps failing on the same names:
+       see ``_repeat_suspects``, which would then be firing on flake rather
+       than on an intermittent bug.
+
+    Returns ``(confirmed, stats)``.  ``confirmed`` is a subset of ``failing``
+    in the same ``(name, reason, log)`` shape, with the reason and log taken
+    from the most recent rep that produced one.  ``stats`` is what gets
+    published: nothing here is allowed to disappear quietly.
     """
-    chunks = [f"{len(failing)} failing regression test(s)\n"]
-    for name, reason, log in list(failing)[:5]:
-        lines = (log or "").splitlines()
-        head = "\n".join(lines[:40]) or "(no log captured)"
-        chunks.append(f"===== {name}\n{reason}\n({len(lines)} lines, "
-                      f"first {min(len(lines), 40)})\n{head}\n")
-    hist: Dict[str, int] = {}
-    for _, reason, log in failing:
-        lines = [ln for ln in (log or "").splitlines() if ln.strip()]
-        key = lines[-1].strip() if lines else f"(no log) {reason}"
-        hist[key] = hist.get(key, 0) + 1
-    chunks.append("===== histogram of the last line of each log\n")
-    for key, n in sorted(hist.items(), key=lambda kv: -kv[1]):
-        chunks.append(f"{n:5d}  {key[:200]}")
-    dump.text(f"{stem}.simlogs.txt", "\n".join(chunks))
+    names = [n for n, _, _ in failing]
+    reps = max(1, REGRESSION_CONFIRM_REPS)
+    stats: Dict[str, object] = {
+        "label": label, "reps": reps, "reported": len(names),
+        "confirmed": len(names), "cleared": [], "per_rep": [len(names)],
+        "extra_runs": 0, "skipped": None,
+    }
+    if not names or reps == 1:
+        stats["skipped"] = "disabled" if reps == 1 else "no failures"
+        _CONFIRM_LOG.append(stats)
+        return list(failing), stats
+    if REGRESSION_CONFIRM_MAX and len(names) > REGRESSION_CONFIRM_MAX:
+        # Not flake: a tree this broken is broken, and 500 x 6 cosims would
+        # tell the agent something it can already see.
+        stats["skipped"] = f"more than {REGRESSION_CONFIRM_MAX} failures"
+        _event("regression_confirm_skipped", label=label,
+               reported=len(names), cap=REGRESSION_CONFIRM_MAX)
+        _CONFIRM_LOG.append(stats)
+        return list(failing), stats
+
+    _event("section_start", name=f"confirm:{label}")
+    t0 = time.time()
+    entry = {n: (n, r, log) for n, r, log in failing}
+    cleared: Dict[str, int] = {}
+    survivors = list(names)
+    # (fails, reps) per name over the confirmation reps of THIS pass -- the
+    # run-length that _repeat_suspects pools across passes.  The first run is
+    # excluded on purpose: every name here failed it by construction.
+    obs: Dict[str, List[int]] = {n: [0, 0] for n in names}
+    for rep in range(2, reps + 1):
+        if not survivors:
+            break
+        again, ran = _run_regression(artifact, select=survivors, sample=False)
+        stats["extra_runs"] = int(stats["extra_runs"]) + len(ran)
+        failed_this_rep = {n for n, _, _ in again}
+        for n in ran:
+            if n in obs:
+                obs[n][1] += 1
+                if n in failed_this_rep:
+                    obs[n][0] += 1
+        for n, r, log in again:
+            # Keep the freshest evidence; an empty log this rep must not
+            # overwrite a full one from an earlier rep.
+            entry[n] = (n, r, log or entry[n][2])
+        failed_now = {n for n, _, _ in again}
+        ran_set = set(ran)
+        # A name that did not run at all is kept, not cleared: silence is
+        # not a pass.  (It should not happen -- baseline subtraction is
+        # deterministic -- but "cleared because we never asked" is exactly
+        # the failure mode this function exists to prevent.)
+        still = [n for n in survivors if n in failed_now or n not in ran_set]
+        for n in survivors:
+            if n not in still:
+                cleared[n] = rep
+        survivors = still
+        stats["per_rep"].append(len(survivors))
+
+    confirmed = [entry[n] for n in names if n in survivors]
+    stats["confirmed"] = len(confirmed)
+    stats["cleared"] = sorted(cleared)
+    stats["seconds"] = round(time.time() - t0, 1)
+    for name in cleared:
+        _CLEARED_HISTORY.setdefault(name, []).append(label)
+        pooled = _CLEARED_OBS.setdefault(name, [0, 0])
+        pooled[0] += obs[name][0]
+        pooled[1] += obs[name][1]
+    stats["eligible"] = eligible or len(names)
+    suspects, context = _repeat_suspects()
+    stats["repeat_suspects"] = suspects
+    stats["repeat_context"] = context
+    if suspects:
+        _event("regression_flaky_repeat", label=label,
+               count=len(suspects), threshold=context.get("threshold"),
+               background=context.get("background_clear_rate"),
+               tests=[d["test"] for d in suspects][:20])
+    _event("regression_confirm", label=label, reported=len(names),
+           confirmed=len(confirmed), reps=reps,
+           extra_runs=stats["extra_runs"], seconds=stats["seconds"])
+    _event("section_end", name=f"confirm:{label}",
+           reported=len(names), confirmed=len(confirmed))
+    _CONFIRM_LOG.append(stats)
+    return confirmed, stats
+
+
+def _confirm_note(stats: Dict[str, object]) -> str:
+    """One paragraph, for the agent and for whoever reads the logs.
+
+    The point is that the single-run number stays visible.  Reporting only
+    the confirmed count would make this look like a suite that simply got
+    less flaky, which is the one reading of it that is false.
+    """
+    reported, confirmed = stats["reported"], stats["confirmed"]
+    if stats.get("skipped") == "no failures":
+        return ""
+    if stats.get("skipped"):
+        return (f"(regression verdict: CONFIRMATION WAS SKIPPED -- "
+                f"{stats['skipped']}. The {reported} failure(s) below are "
+                f"SINGLE-RUN numbers: nothing here was re-run and none of it "
+                f"is confirmed. At the measured ~30% per-run flip rate a "
+                f"fraction of them are trace-bridge artefacts, but this pass "
+                f"cannot tell you which.)\n\n" + _repeat_block(stats))
+    cleared = reported - confirmed
+    head = (f"(regression verdict: {reported} test(s) failed the first run; "
+            f"re-running just those on the same binary, up to "
+            f"{stats['reps']} times, left {confirmed} that failed EVERY "
+            f"run. {cleared} passed on a re-run and are counted as trace-"
+            f"bridge flips, not as your bug -- the cospike/DebugROB bridge "
+            f"is nondeterministic and load-dependent, ~30% of tests flip per "
+            f"run.")
+    if confirmed:
+        head += (" Only the confirmed ones are listed below and only they "
+                 "are in the failing set.)")
+    else:
+        head += " Nothing survived, so S2 counts as clean.)"
+    return head + "\n\n" + _repeat_block(stats)
+
+
+def _repeat_block(stats: Dict[str, object]) -> str:
+    """The loud half: cleared tests that do not behave like this run's flake.
+
+    Unanimity's blind spot is an intermittent *real* bug, which it discards
+    with the same shrug as a bridge flip.  What separates them is how long
+    they keep failing before they let go, pooled over the run; see
+    ``_repeat_suspects``.  This prints that and asks a human to re-run them
+    standalone.  It re-judges nothing: doing so automatically would put back
+    the unpassable gate.
+    """
+    suspects = stats.get("repeat_suspects") or []
+    ctx = stats.get("repeat_context") or {}
+    if not suspects:
+        return ""
+    lines = ["!! REPEATEDLY 'FLAKY' TESTS -- possible intermittent real bug",
+             f"   {len(suspects)} test(s) were cleared as trace-bridge flips "
+             f"but did not behave",
+             f"   like this run's flake does. Background, measured on this "
+             f"run's own",
+             f"   {ctx.get('distinct_names_cleared')} cleared test(s): a "
+             f"cleared test fails "
+             f"{ctx.get('background_fail_rate')} of its re-runs",
+             f"   ({ctx.get('pooled_fail_reps')}/{ctx.get('pooled_reps')} "
+             f"reps over {ctx.get('passes')} confirmation pass(es)). These "
+             f"kept failing far",
+             "   longer than that, often enough that chance would produce "
+             "fewer than",
+             f"   {_REPEAT_EXPECTED_MAX} such name(s) across the whole suite. "
+             f"They are NOT counted as failures and",
+             "   nothing has been re-judged -- but re-run them on their own, "
+             "outside the",
+             "   parallel harness (the bridge is load-dependent), before the "
+             "design is",
+             "   called correct:"]
+    for item in suspects[:20]:
+        lines.append(f"   - {item['test']}: failed {item['failed_reps']} of "
+                     f"{item['total_reps']} re-runs across "
+                     f"{item['passes']} pass(es) "
+                     f"({', '.join(item['cleared_in'][:6])}); "
+                     f"expected by chance {item['expected_by_chance']}")
+    if len(suspects) > 20:
+        lines.append(f"   ... and {len(suspects) - 20} more.")
+    return "\n".join(lines) + "\n\n"
 
 
 #: How many times the gate may hand the design back to the agent and then
@@ -778,16 +1096,22 @@ def _run_s2(dump: helpers.Dumper, label: str, attempt: int, pg_opts,
     _LAST_COSIM.update(artifact=cosim_artifact, tree=_tree_digest(pg_opts),
                        label=label, attempt=attempt)
 
-    # SINGLE-RUN VERDICT, knowingly.  Each of these tests runs once, and the
-    # cospike/DebugROB DPI trace bridge is nondeterministic run to run: the
-    # same binary on the same test flips ~12% of runs (titan_runs/nondet/,
-    # 8/64 at VERILATOR_THREADS=8).  So this sample carries a false-failure
-    # rate of roughly 12% per failing test.  Repeating it here would multiply
-    # the per-iteration S2 cost, so it is left single-run; the agent-facing
-    # path has `reps` (tools.run_rvv_start) for the cases that matter.
-    regression_failures, ran = _run_regression(cosim_artifact)
+    # NO LONGER A SINGLE-RUN VERDICT.  It was, and the comment here used to
+    # justify it with a 12% flip rate; r6 measured the real one at ~30% per
+    # test per run, which makes a clean single-run S2 unreachable -- and
+    # since run() returns before the gate unless S2 is clean, it meant the
+    # gate and Stage 3 never executed.  The first run still runs once (that
+    # is the cost this was protecting); only its failures are re-run, which
+    # is cheap because they are few and get fewer every rep.
+    reported, ran = _run_regression(cosim_artifact)
+    regression_failures, confirm = _confirm_failures(
+        cosim_artifact, reported, f"{label}_attempt{attempt}",
+        eligible=len(ran))
+    dump.json(f"{label}_regression_attempt{attempt}_confirm.json", confirm)
     # Before the branch: a clean run has to clear the set too, or the agent's
     # `run_rvv_start("failing")` would keep re-running tests that now pass.
+    # The *confirmed* set is what the agent inherits -- handing it 45 names
+    # of which 43 are bridge flips is how r6 burned iterations.
     _merge_failing(rvv_failing_path, ran,
                    [n for n, _, _ in regression_failures])
     if regression_failures:
@@ -804,11 +1128,17 @@ def _run_s2(dump: helpers.Dumper, label: str, attempt: int, pg_opts,
             extra_files={"failures.txt": "\n".join(
                 f"{n}: {r}" for n, r, _ in regression_failures)})
         _event("regression_failure", attempt=attempt,
-               count=len(regression_failures))
-        message = helpers.format_regression_failure(
+               count=len(regression_failures), reported=len(reported))
+        message = _confirm_note(confirm) + helpers.format_regression_failure(
             attempt + 1, regression_failures, log_path=regress_path)
         return regression_failures, message
 
+    if reported:
+        # Clean only after confirmation.  Said out loud, because "S2 clean"
+        # now means something weaker than it used to and the trace should
+        # show which one it meant.
+        _event("regression_all_flaky", attempt=attempt,
+               reported=len(reported))
     _event("directed_pass", attempt=attempt)
     return [], None
 
@@ -1127,25 +1457,81 @@ def _gate_regression(dump: helpers.Dumper, pg_opts, run_id: str,
                seconds=round(time.time() - t0, 1))
         return False, message
 
-    # SINGLE-RUN VERDICT, knowingly -- same caveat as _run_s2.  Every test
-    # here runs once, and the cospike/DebugROB trace bridge flips ~12% of runs
-    # on an unchanged binary (titan_runs/nondet/), so a gate failure list of
-    # this size is expected to contain a handful of false failures and a
-    # borderline test can pass the gate by luck.  Re-running the whole 841 to
-    # majority would triple the most expensive step in the run; when a gate
-    # failure matters, confirm it with run_rvv_start(..., reps=3).
-    failing, ran = _run_regression(cosim_artifact, sample=False)
+    # COVERAGE IS UNCHANGED: still every test in the suite, still unsampled,
+    # still baseline-subtracted.  What changed is the verdict.  Every test
+    # here used to run exactly once, and the cospike/DebugROB trace bridge
+    # flips ~30% of tests per run on an unchanged binary (r6: 281/248/249 of
+    # 837 over three runs, 82% of the set reshuffling), so a single-run gate
+    # over 837 tests reports ~250 failures no matter how correct the design
+    # is -- it could never pass and it was never reached.  So the failures,
+    # and only the failures, are re-run to unanimity; see _confirm_failures.
+    # This does not relax what the gate tests, only how many observations it
+    # needs before it calls one of them a bug.
+    reported, ran = _run_regression(cosim_artifact, sample=False)
+    failing, confirm = _confirm_failures(cosim_artifact, reported, "gate",
+                                         eligible=len(ran))
     wall = round(time.time() - t0, 1)
     # Same merge rule as _run_s2: only what ran changes, so the agent's
     # rvv failing set is the gate's verdict and not a partial view of it.
     _merge_failing(rvv_failing_path, ran, [n for n, _, _ in failing])
     dump.json("gate_regression.json",
               {"ran": len(ran), "failing": len(failing),
+               "reported_single_run": len(reported), "confirm": confirm,
                "reused_build": reused, "seconds": wall,
                "baseline_path": REGRESSION_BASELINE_PATH,
-               "tests": [{"test": n, "reason": r} for n, r, _ in failing]})
+               "tests": [{"test": n, "reason": r} for n, r, _ in failing],
+               "cleared_as_flaky": confirm.get("cleared", []),
+               "repeat_suspects": confirm.get("repeat_suspects", []),
+               "repeat_context": confirm.get("repeat_context", {}),
+               "field_notes": {
+                   "reported_single_run":
+                       "failures of the FIRST run of the full suite -- the "
+                       "number the old single-run gate would have reported.",
+                   "failing":
+                       "of those, the ones that failed every one of "
+                       f"{REGRESSION_CONFIRM_REPS} reps of the same binary. "
+                       "This is the gate's verdict.",
+                   "cleared_as_flaky":
+                       "reported by the first run and passed at least one "
+                       "re-run, so counted as a cospike/DebugROB trace-bridge "
+                       "flip. ASSUMPTION, unverified: the bridge only "
+                       "manufactures spurious divergences and never hides a "
+                       "real one -- a passing rep is therefore taken as "
+                       "proof the test is not broken. Nothing has tested "
+                       "that assumption; if it is false, a real failure can "
+                       "be cleared here (the single-run gate never "
+                       "re-checked a pass either, so this is not a new "
+                       "exposure, but it is not a measured one).",
+                   "repeat_suspects":
+                       "cleared-as-flaky tests that kept failing their "
+                       "re-runs longer than this run's OWN flake does: the "
+                       "cut is where chance would produce fewer than "
+                       f"{_REPEAT_EXPECTED_MAX} such names, with a floor of "
+                       f"{max(1, REGRESSION_FLAKY_REPEAT_ALERT)} passes. A "
+                       "plain repeat count does not work (at a ~0.30 clear "
+                       "rate chance alone puts ~23 of 837 names at three "
+                       "repeats), so the statistic is reps-to-first-pass "
+                       "pooled over passes. These may be intermittent REAL "
+                       "bugs that unanimity discarded. Signal only: nothing "
+                       "was re-judged. Re-run them standalone, outside the "
+                       "parallel harness. An empty list means 'checked, "
+                       "nothing exceeded chance' -- NOT that an intermittent "
+                       "bug is excluded: the test has power only when the "
+                       "bug's per-run rate is well above the background and "
+                       "several passes have accumulated.",
+                   "repeat_context":
+                       "the null this was judged against, measured on this "
+                       "run: confirmation passes so far, distinct names ever "
+                       "cleared, and the pooled fraction of re-runs a "
+                       "cleared test fails.",
+                   "independence":
+                       "the confirmation arithmetic assumes flips are "
+                       "independent between reps. r6's three full-suite runs "
+                       "are consistent with that but cannot establish it; if "
+                       "flips are correlated the residual false-confirmation "
+                       "rate is worse than 0.31**(reps-1) per test."}})
     _event("gate_regression", ran=len(ran), failing=len(failing),
-           reused_build=reused, seconds=wall)
+           reported=len(reported), reused_build=reused, seconds=wall)
     if not failing:
         _event("section_end", name="gate_regression", ran=len(ran), failing=0,
                seconds=wall)
@@ -1161,8 +1547,8 @@ def _gate_regression(dump: helpers.Dumper, pg_opts, run_id: str,
         logs={n: log for n, _, log in failing if log},
         extra_files={"failures.txt": "\n".join(
             f"{n}: {r}" for n, r, _ in failing)})
-    message = helpers.format_regression_failure("gate (full suite)", failing,
-                                                log_path=regress_path)
+    message = _confirm_note(confirm) + helpers.format_regression_failure(
+        "gate (full suite)", failing, log_path=regress_path)
     _event("section_end", name="gate_regression", ran=len(ran),
            failing=len(failing), seconds=wall)
     return False, message
@@ -1797,6 +2183,7 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
                                 failing_path=failing_path,
                                 rvv_failing_path=rvv_failing_path)
         result["s1_s2"] = ok
+        result["regression_confirm"] = _confirm_summary()
         if not ok:
             return result
 
@@ -1804,6 +2191,7 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
                                       pg_opts=pg_opts, run_id=run_id,
                                       rvv_failing_path=rvv_failing_path)
         result["gate"] = gate_ok
+        result["regression_confirm"] = _confirm_summary()
         gate_rounds = 0
         while not gate_ok:
             # Two ways to get here.  Without a message: the cheap tier passed
@@ -1853,6 +2241,7 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
                                           pg_opts=pg_opts, run_id=run_id,
                                           rvv_failing_path=rvv_failing_path)
             result["gate"] = gate_ok
+            result["regression_confirm"] = _confirm_summary()
 
         if stress:
             if spike_artifact is None:
@@ -1937,10 +2326,49 @@ def _archive(run_id: str, out_dir: str, result: Dict[str, object]) -> None:
         print(f"WARNING: could not remove the stress pool: {exc}")
 
 
+def _confirm_summary() -> str:
+    """The run-level one-liner: how much of S2/gate's failure reporting was
+    the trace bridge rather than the design.  Kept in the result dict and in
+    the archived summary so a run cannot be read as "S2 was clean" when what
+    happened was "S2 reported 47 failures and none of them reproduced"."""
+    if not _CONFIRM_LOG:
+        return "not run"
+    reported = sum(int(c["reported"]) for c in _CONFIRM_LOG)
+    confirmed = sum(int(c["confirmed"]) for c in _CONFIRM_LOG)
+    extra = sum(int(c.get("extra_runs", 0)) for c in _CONFIRM_LOG)
+    line = (f"{len(_CONFIRM_LOG)} pass(es): {reported} single-run "
+            f"failure(s) reported, {confirmed} survived "
+            f"{REGRESSION_CONFIRM_REPS}-rep unanimity "
+            f"({extra} extra cosims)")
+    suspects, ctx = _repeat_suspects()
+    if suspects:
+        # In the archived summary, not only in the trace: a name cleared this
+        # often may be an intermittent real bug that unanimity discarded, and
+        # whoever reads the run needs to see that without opening the JSON.
+        names = ", ".join(f"{d['test']} ({d['failed_reps']}/"
+                          f"{d['total_reps']} re-runs failed)"
+                          for d in suspects[:6])
+        line += (f" -- WARNING: {len(suspects)} test(s) cleared as flaky "
+                 f"kept failing far longer than this run's own flake "
+                 f"({ctx.get('background_fail_rate')} of re-runs) "
+                 f"({names}{', ...' if len(suspects) > 6 else ''}); "
+                 f"possible intermittent real bug, re-run them standalone")
+    elif ctx.get("distinct_names_cleared", 0) >= 2:
+        # Said explicitly: no alert here means "checked, nothing exceeded
+        # chance", not "never looked" -- and it is weak evidence either way.
+        line += (f" -- no cleared test exceeded this run's own flake profile "
+                 f"({ctx.get('background_fail_rate')} of re-runs failed, "
+                 f"{ctx.get('distinct_names_cleared')} names over "
+                 f"{ctx.get('passes')} pass(es)); weak evidence, not a clean "
+                 f"bill of health")
+    return line
+
+
 def _render_summary(run_id: str, result: Dict[str, object]) -> str:
     lines = [f"# Titan run {run_id}", ""]
     for key in ("vlen", "model", "model_digest", "rtl_source", "rtl_digest",
-                "s1_s2", "gate", "gate_failure", "stress_done",
+                "s1_s2", "regression_confirm", "gate", "gate_failure",
+                "stress_done",
                 "stress_failure",
                 "converged"):
         if key in result:
