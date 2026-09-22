@@ -1,0 +1,6 @@
+63:  output [63:0] axi4_mem_0_bits_w_bits_data,	// @[generators/chipyard/src/main/scala/iobinders/IOBinders.scala:401:22]
+64:  output [7:0]  axi4_mem_0_bits_w_bits_strb,	// @[generators/chipyard/src/main/scala/iobinders/IOBinders.scala:401:22]
+84:  input  [63:0] axi4_mem_0_bits_r_bits_data,	// @[generators/chipyard/src/main/scala/iobinders/IOBinders.scala:401:22]
+248:    .mem_axi4_0_w_bits_data                                                            (axi4_mem_0_bits_w_bits_data),
+249:    .mem_axi4_0_w_bits_strb                                                            (axi4_mem_0_bits_w_bits_strb),
+269:    .mem_axi4_0_r_bits_data                                                            (axi4_mem_0_bits_r_bits_data),

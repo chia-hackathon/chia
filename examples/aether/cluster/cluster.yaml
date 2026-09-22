@@ -33,7 +33,10 @@ cluster_name: aether
 # CPU 配額（2026-09-07）：10 個 Ray 節點全在同一台 96 核主機上，若不指定 --num-cpus
 # 每個節點都會回報 96、總計 960，Ray 的 CPU 配額形同虛設。各 node type 用
 # worker_env_commands export CHIA_NUM_CPUS，worker_start_ray_commands 讀它：
-#   head 4 + head_local 4 + database 2 + llm 2 + chipyard 16 + verilator_run 4×16 + riscv_build 4 = 96
+#   head 4 + head_local 4 + database 2 + llm 2 + chipyard 16 + verilator_run 3×16 + riscv_build 4 = 80
+# 2026-09-23: cosim num_workers 4 -> 3 (96 -> 80 cores). The host is shared;
+# this leaves 16 cores for other users. Concurrent simulations drop 16 -> 12;
+# per-simulation thread count is unchanged.
 available_node_types:
 
     # loop 的唯讀工具（讀 spec、查狀態、寫知識庫）
@@ -96,7 +99,7 @@ available_node_types:
     # 跑模擬。最小 loop 硬體固定，這裡是主要的平行度來源
     cosim:
         resources: {"verilator_run": 4}
-        num_workers: 4
+        num_workers: 3
         compatible_ips: ["${AETHER_HEAD_IP}"]
         worker_env_commands: ["export CHIA_NUM_CPUS=16"]   # 每台 2 支 8-thread Verilator sim（titan nodes.py num_cpus=VERILATOR_THREADS=8）
         docker:

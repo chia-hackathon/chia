@@ -1,0 +1,21 @@
+    .clock       (_source_1_clk),	// @[generators/chipyard/src/main/scala/harness/HarnessClocks.scala:70:26]
+    .reset       (_harnessBinderReset_catcher_io_sync_reset),	// @[generators/rocket-chip/src/main/scala/util/ResetCatchAndSync.scala:39:28]
+    .io_uart_txd (_chiptop0_uart_0_txd),	// @[generators/chipyard/src/main/scala/harness/HasHarnessInstantiators.scala:101:40]
+    .io_uart_rxd (_uart_sim_0_uartno0_io_uart_rxd)
+  );	// @[generators/testchipip/src/main/scala/uart/SimUART.scala:76:28]
+  SimDRAM #(
+    .ADDR_BITS(32),
+    .CHIP_ID(0),
+    .CLOCK_HZ(500000000),
+    .DATA_BITS(64),
+    .ID_BITS(4),
+    .LINE_SIZE(64),
+    .MEM_BASE(40'd2147483648),
+    .MEM_SIZE(268435456)
+  ) simdram (	// @[generators/chipyard/src/main/scala/harness/HarnessBinders.scala:130:21]
+    .clock             (_chiptop0_axi4_mem_0_clock),	// @[generators/chipyard/src/main/scala/harness/HasHarnessInstantiators.scala:101:40]
+    .reset             (_harnessBinderReset_catcher_io_sync_reset),	// @[generators/rocket-chip/src/main/scala/util/ResetCatchAndSync.scala:39:28]
+    .axi_aw_ready      (_simdram_axi_aw_ready),
+    .axi_aw_valid      (_chiptop0_axi4_mem_0_bits_aw_valid),	// @[generators/chipyard/src/main/scala/harness/HasHarnessInstantiators.scala:101:40]
+    .axi_aw_bits_id    (_chiptop0_axi4_mem_0_bits_aw_bits_id),	// @[generators/chipyard/src/main/scala/harness/HasHarnessInstantiators.scala:101:40]
+    .axi_aw_bits_addr  (_chiptop0_axi4_mem_0_bits_aw_bits_addr),	// @[generators/chipyard/src/main/scala/harness/HasHarnessInstantiators.scala:101:40]
