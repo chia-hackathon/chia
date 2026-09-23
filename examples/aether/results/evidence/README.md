@@ -21,10 +21,11 @@ of a tool, not prose.
   SRAM only, no logic, no place & route.
   - `*.mems.conf` — the elaborated SRAM lists both configurations produce.
   - `instance-counts.md` — **read this first.** `.top.mems.conf` lists SRAM
-    *definitions*, not instances: `cc_banks_0_ext` is instantiated 8 times, and
-    the wide configuration replaces {1×4096×128 + 1×8192×64} with 2×4096×128.
+    *definitions*, not instances: `cc_banks_0_ext` is instantiated 8 times, wrapped macros (e.g. the Gemmini
+    scratchpad `mem_ext`, 4×) must be counted hierarchically, and
+    the wide configuration replaces one 8192×64 macro with one 4096×128.
     Summing the file directly gives −18%; weighting by instantiation count
-    gives **+0.16%**, with total SRAM capacity unchanged at 731.2 KiB.
+    gives **+0.11%**, with total SRAM capacity unchanged at 967.8 KiB.
   - `sram-area.md`, `results.json` — per-macro and total area at 90/45/32/22 nm
     (CACTI 7 rejects anything coarser than 90 nm).
   - `raw/<node>/<config>/<sram>.{cfg,out}` — CACTI inputs and outputs verbatim.

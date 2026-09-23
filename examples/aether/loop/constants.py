@@ -76,9 +76,9 @@ VERILATOR_RUN_RESOURCE = 1
 CHISEL_BUILD_RESOURCE = 1
 
 # --- LLM -------------------------------------------------------------------
-# The 159 loop iterations reported in our results ran on claude-fable-5-1;
-# this default was switched to Opus 5 afterwards for subsequent runs.
-LLM_MODEL = "claude-opus-5"
+# The 159 loop iterations reported in our results ran on claude-fable-5-1
+# and claude-opus-4-7; the default is now Opus 5.5 for subsequent runs.
+LLM_MODEL = "claude-opus-5-5"
 LLM_EXTRA_CLI_ARGS = ["--effort", "high"]
 LLM_TIMEOUT_SECONDS = 1800
 LLM_SYSTEM_MESSAGE = (
