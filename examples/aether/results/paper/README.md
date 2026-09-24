@@ -14,6 +14,17 @@ round finished, and `loop/ledger.py`/`loop/journal.py` were then re-run
 round9's final results into this appendix. Generated 2026-09-17 (round9
 finished, final numbers throughout).
 
+> **Update (2026-09-18, post-round10):** a Round 10 (`llama-lmhead-fused-n1`)
+> ran after this appendix was generated and is a completed negative result
+> (648,292 -> 648,292 cycles, 1.00x). It is not folded into the per-round
+> narrative below, which still reflects round9 as the last completed round.
+> The true final loop totals, including round10, are **63 runs, 248 DB
+> rows, 159 LLM-invoking iterations (150 accepted/8 correctness-fail/1
+> build-fail), $180.16, ~74 wall-clock hours** — see
+> `results/loop/ledger.json`/`ledger.md` (round10-inclusive) and
+> `../../README.md`'s Results summary / Aggregate loop statistics sections
+> for the authoritative current numbers.
+
 ## Files
 
 - **`experiments.csv`** (335 lines incl. header, 334 data rows) — one row

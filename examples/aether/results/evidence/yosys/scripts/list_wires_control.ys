@@ -1,0 +1,3 @@
+plugin -i slang
+read_slang -f /share1/saves/max410011/hackathon/aether/out/work/yosys/src/control/top.local.f -D SYNTHESIS --top ChipTop
+tee -o /share1/saves/max410011/hackathon/aether/out/work/yosys/out/control/control.wirenames_sample.txt select -list w:*

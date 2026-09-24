@@ -34,3 +34,14 @@ of a tool, not prose.
     `cacti_runner.py` cannot be used at all.
   - `tag_array_0_ext` (16×88 = 176 B) is below what CACTI can model and is
     excluded from both totals; no analytical fallback was substituted for it.
+
+- `yosys/` — RTL generic-cell (gate/FF) count comparison, control vs
+  WideMbus, from open-source Yosys (`read_slang` frontend, no PDK, no
+  area/µm² numbers — a same-methodology relative comparison only). Total
+  cells differ by **+0.03%** (261,207 → 261,295), FF instances by +0.04%;
+  the entire delta traces to 8 new SRAM bank read-address pipeline
+  registers from a scratchpad re-partitioning, not new logic elsewhere.
+  `gate-count.md` has the full breakdown and caveats; `scripts/` has the
+  Yosys scripts used (the oss-cad-suite install and RTL source copies used
+  to produce this are not included here — see `gate-count.md`'s Reproduce
+  section for paths).

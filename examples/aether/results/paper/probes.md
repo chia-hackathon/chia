@@ -229,7 +229,7 @@ over hardware config, run after round10 concluded. Full source:
 | control | 8 | 12 | llama-q8-gemv-gemmini-lmhead | cold | 634,507 | 6.61 | 1.0000x | `simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleConfig.txt` |
 | DeepMshr | 8 | 24 | llama-q8-gemv-gemmini-lmhead | cold | 634,580 | 6.61 | 0.9999x | `simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleDeepMshrConfig.txt` |
 | WideMbus | 16 | 12 | llama-q8-gemv-gemmini-lmhead | cold | 472,616 | 8.87 | 1.343x | `simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleWideMbusConfig.txt` |
-| WideDeep | 16 | 24 | llama-q8-gemv-gemmini-lmhead | cold | 472,093 | 8.89 | 1.344x | `simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleWideDeepConfig.txt` |
+| WideDeep | 16 | 24 | llama-q8-gemv-gemmini-lmhead | cold | 472,093 | 8.88 | 1.344x | `simlog.llama-q8-gemv-gemmini-lmhead.GENV256D128GemminiShuttleWideDeepConfig.txt` |
 
 **Verification the knobs took effect** (elaborated artefacts, not source):
 `sifive,mshr-count` in the generated `.dts` = 12/12/24/24
@@ -242,6 +242,14 @@ rate (7.92 B/cycle) is 99.0% of the 8 B/cycle mbus roofline, which is why
 there was no MSHR-shaped headroom to recover. End-to-end decode projection
 (`loop/llama_project.py --scenario decode --S 512`): control 2.29 →
 WideDeep 3.47 tok/s @500 MHz (1.51x); @1 GHz 4.58 → 6.93.
+
+> **Paper headline (aether.tex): widening the mbus *alone* (WideMbus), not
+> WideDeep.** The number the published paper leads with is the memory-bus
+> width alone: 2.29 → 3.43 tok/s @500 MHz (4.575 → 6.854 @1 GHz, 1.50x),
+> with the bus recovering 97.6% (n1) / 99.7% (lm_head) of what both knobs
+> together save and MSHRs alone recovering only 16.2% / -0.04%. WideDeep's
+> 1.51x above is the "both knobs" figure, only marginally ahead of the bus
+> alone — see `results/hw-sweep/README.md` §5.
 
 **This corrects the "L2 MSHR occupancy/bank conflicts" attribution** in
 §B above / `out/paper/methodology.md` §6(b) — that attribution was inferred,

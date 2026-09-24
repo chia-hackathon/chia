@@ -2,8 +2,11 @@
 
 Scope: the CHIA-based LLM-kernel optimization inner loop targeting the
 Gemmini/Saturn RISC-V SoC (`GENV256D128GemminiShuttleConfig`,
-model `claude-fable-5-1`), from the pre-round1 smoke test through
-round9 (finished; this document reflects final round9 numbers).
+models `claude-fable-5-1` and `claude-opus-4-7`), from the pre-round1 smoke test through round10
+(finished; this document was drafted at round9 and later updated with a
+final "Roll-up (through round10, final)" section once round10 completed —
+per-round narrative sections below round10 still describe round9 as the
+most recent, but the final rollup includes round10).
 
 Primary sources (read in this order, not re-derived): `out/loop/rounds.json`,
 `out/loop/FINAL_REPORT.md`, `out/loop/ledger.md` / `ledger.json`,
@@ -507,7 +510,11 @@ and limitations, and `out/hw-sweep/README.md` for the complete write-up.
   of the two-knob gain; deepening MSHRs alone gets 6.5% (n1) or ~0% (lmhead).
 - **End-to-end decode projection** (`loop/llama_project.py --scenario
   decode --S 512`, cold): control 2.29 → WideDeep 3.47 tok/s @500 MHz
-  (**1.51x**); @1 GHz, 4.58 → 6.93 tok/s.
+  (**1.51x**); @1 GHz, 4.58 → 6.93 tok/s. **Note:** the published paper's
+  headline instead isolates the memory-bus knob alone (WideMbus): 2.29 →
+  3.43 tok/s @500 MHz (4.575 → 6.854 @1 GHz, **1.50x**), since the bus
+  alone recovers 97.6%/99.7% of what WideDeep buys and the extra MSHRs are
+  not worth their area; WideDeep above is the "both knobs" figure.
 - **Verification that the config fragments actually took effect**: the
   generated device tree's `sifive,mshr-count` (12/12/24/24) and the
   generated `TestHarness.sv`'s `SimDRAM .DATA_BITS()` (64/128/64/128)

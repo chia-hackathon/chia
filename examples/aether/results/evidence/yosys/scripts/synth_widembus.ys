@@ -1,0 +1,26 @@
+# yosys gate/FF-counting script (uses the slang frontend plugin, since the
+# built-in read_verilog -sv frontend chokes on some SystemVerilog
+# assignment-pattern syntax emitted by firtool/CIRCT).
+# Placeholders: /share1/saves/max410011/hackathon/aether/out/work/yosys/src/widembus/top.local.f ChipTop /share1/saves/max410011/hackathon/aether/out/work/yosys/out/widembus widembus
+#
+# read_slang fully elaborates the design (module hierarchy is dissolved into
+# one flat top module -- this plugin does not support -keep-hierarchy), so
+# `stat` immediately after gives a generic-cell (RTLIL) netlist count: this
+# IS our gate/FF count, at the same abstraction level FIRRTL/CIRCT emitted.
+# We deliberately do NOT run the full `synth -flatten` optimization+techmap
+# recipe: on this ~260k-cell/10M-wire-bit flat netlist its CHECK pass hung
+# for >9 minutes with zero progress on this shared host (see logs/*_heavy_synth_killed.log)
+# and was abandoned as not worth the runtime for a same-methodology delta
+# comparison. Both configs are measured with the identical (lean) recipe, so
+# the control vs WideMbus delta is still apples-to-apples.
+#
+# SRAM *_ext macros are true RTL blackboxes in the source (no body anywhere
+# in gen-collateral) -- their area was already characterized separately with
+# CACTI, so they naturally stay as blackbox cells and contribute 0 further
+# gates/FFs here. -D SYNTHESIS selects the synthesizable branch of
+# plusarg_reader.v (assign out = DEFAULT) instead of the sim-only
+# $value$plusargs branch.
+plugin -i slang
+read_slang -f /share1/saves/max410011/hackathon/aether/out/work/yosys/src/widembus/top.local.f -D SYNTHESIS --top ChipTop
+
+tee -o /share1/saves/max410011/hackathon/aether/out/work/yosys/out/widembus/widembus.generic_stat.txt stat -top ChipTop

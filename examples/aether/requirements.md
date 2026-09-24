@@ -111,7 +111,8 @@ inside the `llm` container (`chia/models/claude.py`;
 `ANTHROPIC_API_KEY` in the container env, or a `~/.claude` credential
 directory, which `cluster/cluster.yaml` bind-mounts as
 `-v ${HOME}/.claude:/home/ray/.claude`. Budget accordingly: the published
-10 rounds / 243 iterations cost **$177.76**.
+10 rounds / 159 LLM-invoking iterations (248 DB rows over 63 runs) cost
+**$180.16** total.
 
 ## 5. Hardware / RTL side
 

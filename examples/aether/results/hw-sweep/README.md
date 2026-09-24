@@ -136,7 +136,7 @@ which this sweep **reproduces to the cycle**). Logs:
 | control | 8 | 12 | 634,507 | 6.61 | 1.000x |
 | DeepMshr | 8 | 24 | 634,580 | 6.61 | **0.9999x** |
 | WideMbus | 16 | 12 | 472,616 | 8.87 | **1.343x** |
-| WideDeep | 16 | 24 | 472,093 | 8.89 | **1.344x** |
+| WideDeep | 16 | 24 | 472,093 | 8.88 | **1.344x** |
 
 This is the cleaner of the two experiments and it is unambiguous: **doubling
 the L2 MSHR file changes a 4 MiB cold weight stream by 73 cycles out of
@@ -187,18 +187,40 @@ constraint has moved elsewhere (Gemmini's StreamReader / L2 occupancy); a
 
 | design point | n1 cold B/cyc | lmhead B/cyc | Mcyc/token | tok/s @500 MHz | tok/s @1 GHz |
 |---|---|---|---|---|---|
-| control | 5.67 | 6.61 | 218.6 | 2.29 | 4.58 |
+| control | 5.67 | 6.61 | 218.6 | 2.29 | 4.575 |
 | DeepMshr | 6.04 | 6.61 | 208.1 | 2.40 | 4.81 |
-| WideMbus | 8.92 | 8.87 | 145.9 | 3.43 | 6.85 |
-| **WideDeep (best)** | **9.05** | **8.89** | **144.3** | **3.47** | **6.93** |
+| **WideMbus** | **8.92** | **8.87** | **145.9** | **3.43** | **6.854** |
+| WideDeep (both knobs) | 9.05 | 8.88 | 144.3 | 3.47 | 6.93 |
 
 (`--gemv-bytes-per-cycle` from the n1 cold probe, `--lmhead-bytes-per-cycle`
-from the lmhead run above, per design point.)
+from the lmhead run above, per design point. Reproduce the headline row:
+`python loop/llama_project.py --scenario decode --S 512
+--gemv-bytes-per-cycle 8.92 --lmhead-bytes-per-cycle 8.87
+--mem-bytes-per-cycle 8` -> 6.854 tok/s @1 GHz; the control uses
+`--gemv-bytes-per-cycle 5.67 --lmhead-bytes-per-cycle 6.61` -> 4.575.)
 
-So the best measured design point is a **1.51x end-to-end decode speedup**
-(218.6 -> 144.3 Mcycles/token; 1.57x on the n1 GEMV alone, 1.34x on the
-lm-head), at the cost of doubling the memory-bus width. The extra MSHRs
-contribute 1.1% of that and are not worth their area.
+**Headline: widening the memory bus alone is the story.** WideMbus alone
+takes the end-to-end decode projection from 2.29 to 3.43 tok/s at 500 MHz
+(4.575 to 6.854 tok/s at 1 GHz) — a **1.50x** speedup — with L2 MSHRs left
+at the control's 12. Isolating each knob's share of the *combined*
+(WideDeep) saving over control: the bus alone recovers **97.6%** of the
+saving on n1 and **99.7%** on lm_head; doubling MSHRs alone recovers only
+**16.2%** on n1 and **-0.04%** (i.e. slightly worse) on lm_head. The two
+knobs are not additive — combining them (WideDeep) buys only a sliver more
+than the bus alone. Doubling the memory bus alone (WideMbus, both kernels)
+is therefore the correct headline; the extra MSHRs are not worth their
+area on their own.
+
+For completeness, the **both-knobs** design point (WideDeep: wider bus +
+deeper MSHRs together) reaches a **1.51x** end-to-end speedup (218.6 ->
+144.3 Mcycles/token; 3.47 tok/s @500 MHz, 6.93 tok/s @1 GHz; 1.57x on the
+n1 GEMV alone, 1.34x on the lm-head) — only marginally better than
+widening the bus alone.
+
+**Caveat:** the DRAM backend in these RTL sims (`testchipip`'s `SimDRAM`,
+`mm_magic_t`) is untimed/width-generic behavioral memory, not a timed DRAM
+model with row/bank/refresh contention — see the paper for the resulting
+scope limits on this projection.
 
 ## 6. Reproduce
 
