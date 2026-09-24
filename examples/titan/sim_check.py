@@ -35,6 +35,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from fractions import Fraction
+
 import ime_encodings as ime
 import ime_tests
 import rvv_ref
@@ -68,6 +70,21 @@ _FABI = {
 #: binary64; there is no ``.h`` in the baseline -march, which is why round
 #: four's floating-point tier stops at SEW >= 32.
 _FP_WIDTH = {"s": 32, "d": 64}
+
+
+def _sext64(value: int) -> int:
+    """Interpret a 64-bit register as signed.
+
+    The register file holds Python ints that may already be negative (an
+    ``li`` of a negative immediate stores one directly), so the value is
+    masked into 64 bits before the sign test.  Without the mask, Python's
+    arithmetic shift on a negative int reports "sign bit set" for every
+    negative number and subtracts 2**64 from an already-signed value -- which
+    turned every exact-tier expectation into -2**64 and looked like a
+    conversion bug in the generator rather than one here.
+    """
+    value &= (1 << 64) - 1
+    return value - (1 << 64) if value >> 63 else value
 
 _DIRECTIVE_WIDTH = {".byte": 1, ".half": 2, ".word": 4, ".dword": 8}
 
@@ -513,6 +530,32 @@ def run(program: Program, machine: Machine, limit: int = 20_000_000) -> int:
                 raise SimError(
                     f"csrwi frm, {machine.frm}: rvv_ref's reference model "
                     f"implements round-to-nearest-even only")
+        elif mnemonic == "fsrmi":
+            # Round seven sets frm explicitly rather than trusting the reset
+            # value (spec 1495).  Only RNE is modelled, and anything else is
+            # refused rather than silently ignored -- a program that asked
+            # for a rounding mode this harness does not implement must not
+            # appear to have been judged under it.
+            machine.frm = int(ops[0], 0)
+            if machine.frm != rvv_ref.FP_FRM:
+                raise SimError(
+                    f"fsrmi {machine.frm}: rvv_ref's reference model "
+                    f"implements round-to-nearest-even only")
+        elif mnemonic.startswith("fcvt.") and len(ops) == 2:
+            # Integer -> float, the exact tier's one conversion.  Goes
+            # through rvv_ref.fp_round so the simulator and the reference
+            # model cannot disagree about it.
+            _dst, src = mnemonic.split(".")[1:3]
+            if src not in ("l", "w"):
+                raise SimError(f"{mnemonic} is not modelled")
+            try:
+                width = _FP_WIDTH[_dst]
+            except KeyError:
+                raise SimError(f"{mnemonic} is not modelled") from None
+            val = _sext64(x[_reg(ops[1])])
+            sign = 1 if val < 0 else 0
+            machine.f[_freg(ops[0])] = rvv_ref.fp_round(
+                sign, Fraction(abs(val)), width)
         elif mnemonic in ("flw", "fld", "fsw", "fsd"):
             # Raw bit moves: no canonicalisation, no host float anywhere, so
             # a signalling NaN or a -0.0 survives the round trip.
@@ -698,6 +741,19 @@ _TILE_LS = {"vmtl.v": False, "vmts.v": False,
 #: raise SimError instead of quietly scoring itself against a model nobody
 #: derived.  See titan_runs/round4_design.md.
 _FP_MACC_W = {"vfmmacc.vv": 1}
+
+#: Round seven.  Widening floating-point mnemonic -> W, for the cells whose
+#: element formats the IME specification defines.  ``vf8wmmacc.vv`` is
+#: absent because every one of its encoding-map cells takes an OFP input
+#: format (spec 7362-7370) and those are declared unsupported -- see
+#: constants.ROUND_SEVEN_SUPPORTED.  A program that reached an unmodelled
+#: cell raises SimError rather than scoring itself against a model nobody
+#: derived.
+#:
+#: Round eight adds ``vf8wmmacc.vv``: its (W=8, SEW=64) cell takes OFP8
+#: inputs, which the OCP OFP8 v1.0 document now defines.  Its other cell,
+#: (W=8, SEW=32), takes E2M1 and still raises SimError below.
+_FPW_MACC_W = {"vfwmmacc.vv": 2, "vfqmmacc.vv": 4, "vf8wmmacc.vv": 8}
 
 #: Round six.  Microscaled integer-input, FP-accumulate mnemonic -> W.
 #:
@@ -896,6 +952,57 @@ def _ime(machine: Machine, word: int) -> None:
                 machine.vset(vd, c_flat, sew, acc)
         return
 
+    if name in _FPW_MACC_W:
+        # Round seven.  Sail fp_gemm at the Titan disclosure G=1, psm=0,
+        # rnd=frm, with W > 1 -- so unlike the W=1 case above a group is no
+        # longer a single product: it is the W products of one
+        # sub-dot-product, summed *exactly* (psm=0, spec 1565), rounded once
+        # to fmt_C (rnd=frm, spec 1584), and then accumulated
+        # (spec 1591-1593).
+        #
+        # The arithmetic is not reimplemented here.  It is
+        # rvv_ref.fpw_reference_gemm, which is also the authority the
+        # directed programs' golden bytes come from, so this model and that
+        # reference cannot drift apart -- the same discipline the W=1 and
+        # microscaled blocks follow.  What this block owns is the *register
+        # addressing*: pulling A, B and C out of the vector file through the
+        # same _AB_INDEX / _C_INDEX globals the negative controls sabotage.
+        w = _FPW_MACC_W[name]
+        geom = _geometry(machine, w, kind="fpw")
+        geom.validate()
+        cell = (geom.w, geom.sew)
+        if cell not in rvv_ref.fpw_resolved_cells():
+            raise SimError(
+                f"{name} at SEW={geom.sew} is an OFP4 (E2M1) cell; E2M1 is "
+                f"defined by OCP MX v1.0, which is not on disk, and this "
+                f"implementation declares the cell unsupported")
+        altfmt_a, altfmt_b = machine.altfmt_ab
+        name_a, name_b, name_c, _mx = rvv_ref.fpw_legal_row(
+            geom.w, geom.sew, machine.altfmt, altfmt_a, altfmt_b)
+        fmt_a, fmt_b, fmt_c = (rvv_ref.fp_format(name_a),
+                               rvv_ref.fp_format(name_b),
+                               rvv_ref.fp_format(name_c))
+        vd, vs1, vs2 = fields["vd"], fields["vs1"], fields["vs2"]
+        eew_ab = geom.eew_ab
+        a = [[machine.vget(vs1, _AB_INDEX(i, k, geom), eew_ab)
+              for k in range(geom.k_eff)] for i in range(geom.m)]
+        b = [[machine.vget(vs2, _AB_INDEX(j, k, geom), eew_ab)
+              for k in range(geom.k_eff)] for j in range(geom.n)]
+        # C is read across the *physical* tile width: the reference model
+        # carries inactive columns (j >= N) through untouched, and reading
+        # only the active ones would make it invent them.
+        c = [[machine.vget(vd, _C_INDEX(i, j, geom), sew)
+              for j in range(geom.n_max)] for i in range(geom.m)]
+        out = rvv_ref.fpw_reference_gemm(geom, a, b, c, fmt_a, fmt_b, fmt_c)
+        # ... but only the active columns are written back, because the
+        # instruction does not write the others.  Writing the pass-through
+        # values would be harmless today and would hide a C-index bug that
+        # addressed an inactive column.
+        for i in range(geom.m):
+            for j in range(geom.n):
+                machine.vset(vd, _C_INDEX(i, j, geom), sew, out[i][j])
+        return
+
     if name in _MX_MACC_W:
         # Sail int_scaled_gemm (5373-5410).  Two structural facts decide
         # this block, and both are easy to get wrong in the direction of
@@ -1032,6 +1139,22 @@ def _ime(machine: Machine, word: int) -> None:
 # driver
 # ---------------------------------------------------------------------------
 
+def _fpw_sweep_tier(geom: TileGeometry, seed: int) -> str:
+    """Which widening-FP tier the sweep runs for *seed* at *geom*.
+
+    Round seven's cells alternate golden / exact, as they always have, so
+    their seeds run what they ran.  Round eight's OFP8 cells cycle golden /
+    exact / special.  Exact falls back to golden where no baseline fcvt
+    reaches the accumulator (binary16 / bfloat16).
+    """
+    tier = ("golden", "exact")[seed % 2]
+    if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_EIGHT_CELLS:
+        tier = ("golden", "exact", "special")[seed % 3]
+    if tier == "exact" and not ime_tests.fpw_exact_emittable(geom):
+        tier = "golden"
+    return tier
+
+
 def simulate(geom: TileGeometry, seed: int = 0) -> Tuple[int, str]:
     """Assemble and run one directed program, whichever shape it is.
 
@@ -1042,6 +1165,24 @@ def simulate(geom: TileGeometry, seed: int = 0) -> Tuple[int, str]:
     """
     if geom.check == "clayout":
         program = assemble(ime_tests.emit_clayout_test(geom))
+    elif geom.kind == "fpw":
+        # Round seven.  Two tiers per geometry, and the seed selects between
+        # them so that a multi-seed sweep covers both: "golden" embeds the
+        # reference model's bytes, "exact" recomputes on the DUT from
+        # integers.  Both must run, because the whole value of the pair is
+        # that they can disagree -- see
+        # rvv_ref.check_round_seven_tier_overlap.
+        rng = random.Random(seed)
+        rows = rvv_ref.fpw_rows(geom.w, geom.sew)
+        key = sorted(rows, key=str)[seed % len(rows)]
+        tier = _fpw_sweep_tier(geom, seed)
+        case = (rvv_ref.fpw_exact_case(geom, rows[key], rng)
+                if tier == "exact"
+                else rvv_ref.fpw_special_case(geom, rows[key], rng)
+                if tier == "special"
+                else rvv_ref.fpw_case(geom, rows[key], rng))
+        plan = ime_tests.FpwPlan(geom, key, tier, *case, tag="sweep")
+        program = assemble(ime_tests.emit_fpw_test(plan))
     elif geom.kind == "mx":
         # Round six.  Its operands are not a plain random_case: the tier
         # rests on the result being exactly representable, so the plan has
@@ -1070,9 +1211,13 @@ def check_negative_control(geom: TileGeometry) -> None:
     def sabotage(machine: Machine, word: int) -> None:
         original(machine, word)
         name, fields = ime.decode(word)
-        if name in _MACC_W or name in _FP_MACC_W:
-            g = (_geometry(machine, _FP_MACC_W[name], kind="fp")
-                 if name in _FP_MACC_W else _geometry(machine, _MACC_W[name]))
+        if name in _MACC_W or name in _FP_MACC_W or name in _FPW_MACC_W:
+            if name in _FP_MACC_W:
+                g = _geometry(machine, _FP_MACC_W[name], kind="fp")
+            elif name in _FPW_MACC_W:
+                g = _geometry(machine, _FPW_MACC_W[name], kind="fpw")
+            else:
+                g = _geometry(machine, _MACC_W[name])
             index = rvv_ref.c_element_index(1 % g.m, 0, g)
             machine.vset(fields["vd"], index, machine.sew,
                          machine.vget(fields["vd"], index, machine.sew) ^ 1)
@@ -1344,6 +1489,17 @@ def main() -> int:
     # one, not two on-DUT computations against each other) and has to be
     # shown to be able to fail.
     controls += [g for g in _clayout_geometries(args.vlen) if g.m > 1][:1]
+    # ... and one round-seven geometry per resolved cell, for the same
+    # reason again.  This matters more here than anywhere else: a
+    # golden-tier program compares against bytes this harness wrote, so if
+    # its comparison never fired it would be a program that agrees with
+    # itself.  Proving the compare can fail is what stops "the model said
+    # so" from being unfalsifiable.
+    for cell in rvv_ref.fpw_resolved_cells():
+        controls += [g for g in rvv_ref.fpw_legal_configs(args.vlen,
+                                                          full_vl_only=True)
+                     if (g.w, g.sew) == cell and g.emul_c != 16
+                     and _allocatable(g) and g.m > 1][:1]
     for control in controls:
         check_negative_control(control)
         print(f"  ok  check_negative_control  {control.describe()}")
@@ -1361,7 +1517,9 @@ def main() -> int:
                   check_mxl_tier,
                   check_mxl_legality_is_load_bearing,
                   check_round_seven_sub_byte_path,
-                  check_round_seven_sweep_is_not_yet_live):
+                  check_round_seven_sweep_is_live,
+                  check_round_eight_sweep_is_live,
+                  check_round_eight_ofp8_decode_is_load_bearing):
         check(args.vlen)
         print(f"  ok  {check.__name__}")
 
@@ -1601,6 +1759,15 @@ def _every_geometry(vlen: int):
     # every earlier tier keeps the position -- and therefore the seeds --
     # it had before.
     yield from rvv_ref.mx_legal_configs(vlen)
+    # Round seven's widening floating-point tier, appended last for the
+    # same append-don't-interleave reason.  Only the cells whose element
+    # formats the IME specification defines are swept: the OFP cells are
+    # filtered against rvv_ref.fpw_resolved_cells rather than being
+    # silently absent, so that 'declared unsupported' and 'forgotten' are
+    # different and distinguishable states.
+    _resolved = set(rvv_ref.fpw_resolved_cells())
+    yield from (g for g in rvv_ref.fpw_legal_configs(vlen)
+                if (g.w, g.sew) in _resolved)
 
 
 def check_round_seven_sub_byte_path(vlen: int = 256) -> None:
@@ -1667,34 +1834,132 @@ def check_round_seven_sub_byte_path(vlen: int = 256) -> None:
         raise AssertionError(f"EEW={eew} must not be modelled")
 
 
-def check_round_seven_sweep_is_not_yet_live(vlen: int = 256) -> None:
-    """Round seven must not appear in the executed sweep until it can run.
+def check_round_seven_sweep_is_live(vlen: int = 256) -> None:
+    """Round seven is in the executed sweep, and only for supported cells.
 
-    The meta-judge's headline number is "N program executions across M
-    geometries".  If round-seven geometries entered ``_every_geometry``
-    before their generators existed, M would grow while the programs behind
-    it did not -- a judge reporting coverage it does not have, which is the
-    precise failure this file exists to make impossible.
+    This replaces an earlier invariant that asserted the *opposite* -- that
+    no kind='fpw' geometry had entered the sweep -- which was right while the
+    generators did not exist and became a lie the moment they did.  It is
+    restated rather than deleted so that the rule it encoded survives: a
+    geometry may be swept only once there are programs behind it, because a
+    sweep that counts geometries it cannot run reports coverage it does not
+    have.
 
-    So the invariant is asserted rather than left to discipline: the
-    executed sweep contains no kind='fpw' geometry, and the round-seven
-    enumeration is nonempty (so this check is about sequencing, not about an
-    empty set trivially satisfying it).
+    The obligation now runs the other way, and both halves are asserted
+    because either alone is satisfied by an empty pool:
+
+    * every resolved cell is represented in the sweep, and
+    * no unresolved (OFP) cell is, so an extension this implementation
+      declares unsupported is never judged.
     """
-    assert any(True for _ in rvv_ref.fpw_legal_configs(vlen)), \
-        "round seven enumerates nothing -- this check would be vacuous"
-    live = [g for g in _every_geometry(vlen) if g.kind == "fpw"]
-    assert not live, (
-        f"{len(live)} kind='fpw' geometries are in the executed sweep but "
-        f"round seven has no generators yet; see constants.ROUND_SEVEN_INSNS")
-    # And the round-seven cells that the OCP documents block are exactly the
-    # narrow-input ones, so the eventual unblock is a format change and not
-    # a legality change.
-    blocked = {(w, sew) for (w, sew), (_e, rows) in rvv_ref.FP_CELLS.items()
-               if any(f in rvv_ref.OCP_PENDING_FORMATS
-                      for row in rows.values() for f in row[:3])}
-    assert blocked == {(2, 8), (2, 16), (4, 16), (4, 32), (8, 32), (8, 64)}, \
-        sorted(blocked)
+    swept = {(g.w, g.sew) for g in _every_geometry(vlen) if g.kind == "fpw"}
+    resolved = set(rvv_ref.fpw_resolved_cells())
+    assert resolved, "no resolved cell -- this check would be vacuous"
+    assert swept == resolved, (sorted(swept), sorted(resolved))
+    unresolved = set(rvv_ref.FP_CELLS) - resolved
+    assert unresolved, "no unresolved cell -- the OFP exclusion is untested"
+    assert not (swept & unresolved), sorted(swept & unresolved)
+    # And an OFP cell must still refuse to resolve, so that a future edit
+    # which populates FP_FORMAT_TABLE by guesswork fails here rather than
+    # quietly widening the sweep.
+    for (w, sew) in sorted(unresolved):
+        try:
+            rvv_ref.fpw_rows(w, sew)
+        except rvv_ref.OCPSpecUnavailable:
+            continue
+        raise AssertionError(
+            f"W={w} SEW={sew} resolved its formats without the OCP "
+            f"documents -- FP_FORMAT_TABLE has been populated by guesswork")
+
+def check_round_eight_sweep_is_live(vlen: int = 256) -> None:
+    """Round eight's OFP8 cells are swept, vf8wmmacc.vv included, E2M1 not."""
+    swept = {(g.w, g.sew) for g in _every_geometry(vlen) if g.kind == "fpw"}
+    for cell in rvv_ref.FPW_ROUND_EIGHT_CELLS:
+        assert cell in swept, cell
+    for cell in ((2, 8), (4, 16), (8, 32)):
+        assert cell not in swept, cell
+    mnems = {g.mnemonic for g in _every_geometry(vlen) if g.kind == "fpw"}
+    assert "vf8wmmacc.vv" in mnems, sorted(mnems)
+    # The three tiers are each reachable from the sweep's seed mapping.
+    g = next(g for g in _every_geometry(vlen)
+             if g.kind == "fpw" and (g.w, g.sew) == (4, 32)
+             and g.emul_c != 16 and _allocatable(g))
+    tiers = [_fpw_sweep_tier(g, seed) for seed in range(3)]
+    assert tiers == ["golden", "exact", "special"], tiers
+    for seed in range(3):
+        code, out = simulate(g, seed)
+        assert code == ime_tests.EXIT_PASS and "TITAN PASS" in out, (seed, out)
+    # Round seven's mapping is untouched.
+    g7 = next(g for g in _every_geometry(vlen)
+              if g.kind == "fpw" and (g.w, g.sew) == (2, 32)
+              and g.emul_c != 16 and _allocatable(g))
+    assert [_fpw_sweep_tier(g7, s) for s in range(4)] == \
+        ["golden", "exact", "golden", "exact"]
+
+
+def check_round_eight_ofp8_decode_is_load_bearing(vlen: int = 256) -> None:
+    """A DUT that decodes OFP8 wrongly must FAIL the programs.
+
+    The rvv_ref controls prove the *reference* distinguishes right from
+    wrong.  This proves the *programs* do: each program is built with the
+    correct decoder (so its golden bytes are right), then run on a model
+    whose OFP8 decode is sabotaged, and must print TITAN FAIL.  Sabotages:
+    E4M3 read IEEE-shaped (0x7E = 448 becomes NaN), E4M3 <-> E5M2 swapped,
+    and subnormals flushed to zero.
+    """
+    good = rvv_ref._fpf_unpack_generic
+    e4, e5 = rvv_ref.fp_format("e4m3"), rvv_ref.fp_format("e5m2")
+    ieee_e4 = rvv_ref.replace(e4, has_inf=True, nan_rule="ieee",
+                              name="e4m3_ieee")
+
+    def as_ieee(bits, fmt):
+        return good(bits, ieee_e4 if fmt.name == "e4m3" else fmt)
+
+    def swapped(bits, fmt):
+        return good(bits, {"e4m3": e5, "e5m2": e4}.get(fmt.name, fmt))
+
+    def flushed(bits, fmt):
+        k, sgn, v = good(bits, fmt)
+        if k == "num" and (bits >> (fmt.prec - 1)) & fmt.emax == 0:
+            v = type(v)(0)
+        return k, sgn, v
+
+    rng = random.Random(808)
+    tally = []
+    for cell in rvv_ref.FPW_ROUND_EIGHT_CELLS:
+        geom = next(g for g in rvv_ref.fpw_legal_configs(vlen,
+                                                         full_vl_only=True)
+                    if (g.w, g.sew) == cell and g.emul_c != 16
+                    and _allocatable(g) and g.lam * g.lmul >= 2)
+        rows = rvv_ref.fpw_rows(*cell)
+        for bad_name, bad in (("ieee-shaped E4M3", as_ieee),
+                              ("E4M3<->E5M2 swap", swapped),
+                              ("subnormal flush", flushed)):
+            caught = total = 0
+            for key, row in rows.items():
+                if bad is as_ieee and "e4m3" not in (row[0].name,
+                                                     row[1].name):
+                    continue
+                for tier, make in (("golden", rvv_ref.fpw_case),
+                                   ("special", rvv_ref.fpw_special_case)):
+                    plan = ime_tests.FpwPlan(geom, key, tier,
+                                             *make(geom, row, rng),
+                                             tag="decode-control")
+                    program = assemble(ime_tests.emit_fpw_test(plan))
+                    # The same program passes on the correct model, so a
+                    # failure below is the sabotage and nothing else.
+                    assert run(program, Machine(vlen=vlen)) == \
+                        ime_tests.EXIT_PASS, (cell, key, tier)
+                    rvv_ref._fpf_unpack_generic = bad
+                    try:
+                        code = run(program, Machine(vlen=vlen))
+                    finally:
+                        rvv_ref._fpf_unpack_generic = good
+                    caught += code != ime_tests.EXIT_PASS
+                    total += 1
+            assert caught, f"{cell}: {bad_name} DUT passed every program"
+            tally.append((cell, bad_name, caught, total))
+    return tally
 
 
 def _clayout_geometries(vlen: int):

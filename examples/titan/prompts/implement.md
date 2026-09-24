@@ -158,7 +158,9 @@ regression; the matrix unit does not get to stall that path.
   E4M3 has no infinities and only one NaN encoding, E5M2 is IEEE-shaped,
   E2M1 has neither NaN nor infinity. If you need any of those rules, get
   them from OCP -- a guess here produces wrong numbers that look exactly
-  like an RTL bug and will cost you iterations. (Round six itself does not
+  like an RTL bug and will cost you iterations. The OCP OFP8 v1.0 text is at
+  `specs/ime/ocp-ofp8-v1.0.txt` (E4M3/E5M2); OCP MX v1.0 (E2M1) is not
+  available, and the E2M1 extensions are declared unsupported. (Round six itself does not
   need them: its data inputs are MXINT4/MXINT8, plain signed two's
   complement with no special values, and E8M0 *is* restated in full at spec
   1990-1993. This matters for the floating-point rounds.)

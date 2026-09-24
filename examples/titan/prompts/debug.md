@@ -61,8 +61,9 @@ dimension; one that appears everywhere points at something structural.
   does not restate the OFP8/OFP4 bit encodings -- spec 1910-1913 is a
   normative reference to OCP Microscaling Formats (MX) v1.0 -- so E4M3
   having no infinities, E5M2 being IEEE-shaped and E2M1 having neither NaN
-  nor infinity all have to come from OCP. A wrong special-value rule
-  produces exactly this symptom. (E8M0 *is* restated in full at spec
+  nor infinity all have to come from OCP (OFP8 v1.0 text:
+  `specs/ime/ocp-ofp8-v1.0.txt`; OCP MX / E2M1 is not available). A wrong
+  special-value rule produces exactly this symptom. (E8M0 *is* restated in full at spec
   1990-1993, and note it has no zero, infinity or subnormal encoding: byte
   0x00 is the ordinary finite value 2^-127, and only 0xFF is NaN.)
 

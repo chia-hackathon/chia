@@ -11,6 +11,9 @@ cluster.yaml
 # ("規格放置").  The generated instructions.json and extract_spec.py next to
 # it ARE committed, so the package imports without the .adoc present.
 specs/ime/*.adoc
+# OCP OFP8 v1.0 text extracted from the OCP PDF (round eight) -- third-party
+# too, so it is not redistributed either; regenerate it from the PDF.
+specs/ime/ocp-*.txt
 
 # Loop scratch
 *.bak-*

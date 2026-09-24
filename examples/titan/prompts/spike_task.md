@@ -149,7 +149,11 @@ Do not use them. Specifically:
   reference model itself.
 - The OFP8 (E4M3, E5M2) and OFP4 (E2M1) element encodings are defined by the
   OCP specifications the IME adoc cites normatively at lines 1908-1913, not
-  by the IME adoc itself and not by analogy with IEEE 754. If you need a rule
-  those documents state and you do not have them, stop and say so in
-  `finish`. Do not infer one. E4M3 in particular has no infinity encoding, so
-  an IEEE-shaped overflow path is wrong there in a way that looks right.
+  by the IME adoc itself and not by analogy with IEEE 754. The OCP OFP8 v1.0
+  specification is available next to the adoc as
+  `specs/ime/ocp-ofp8-v1.0.txt` (listed by the spec tool): read it for E4M3 /
+  E5M2. OCP MX v1.0 (E2M1 / OFP4) is NOT available; if you need a rule it
+  states, stop and say so in `finish`. Do not infer one. E4M3 in particular
+  has no infinity encoding and only one NaN pattern (S.1111.111), so an
+  IEEE-shaped decode or overflow path is wrong there in a way that looks
+  right.

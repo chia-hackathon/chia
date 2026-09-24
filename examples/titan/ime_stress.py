@@ -92,6 +92,16 @@ def _every_geometry(vlen: int) -> Iterator[TileGeometry]:
     # constraint are dropped here rather than quietly retried at a different
     # shape.
     yield from rvv_ref.mx_legal_configs(vlen)
+    # Round seven's widening floating-point tier, appended last for the same
+    # reason.  Only the cells whose element formats the IME specification
+    # defines are here -- rvv_ref.fpw_legal_configs enumerates every legal
+    # cell, so the OFP ones are filtered out against fpw_resolved_cells
+    # rather than being silently absent.  An unsupported extension has no
+    # geometry in this pool by construction, which is what
+    # constants.ROUND_SEVEN_UNSUPPORTED declares.
+    resolved = set(rvv_ref.fpw_resolved_cells())
+    yield from (g for g in rvv_ref.fpw_legal_configs(vlen)
+                if (g.w, g.sew) in resolved)
 
 
 def _allocatable(geom: TileGeometry) -> bool:
@@ -113,7 +123,8 @@ def generate(vlen: int, count: int, seed: int = 0
         # Round six's microscaled forms get their own marker: "_fp" would
         # be a lie (the *inputs* are MXINT integers) and check_emits reads
         # the name back to confirm the geometry it was generated from.
-        kind = {"int": "", "fp": "_fp", "mx": "_mx"}[geom.kind]
+        kind = {"int": "", "fp": "_fp", "mx": "_mx",
+                "fpw": "_fpw"}[geom.kind]
         name = (f"stress_{index:06d}_sew{geom.sew}{widen}{trans}{kind}"
                 f"_lam{geom.lam}_lmul{geom.lmul}_n{geom.n}")
         if geom.kind == "mx":
@@ -126,13 +137,29 @@ def generate(vlen: int, count: int, seed: int = 0
             plan = ime_tests.mx_random_plan(geom, rng)
             out.append((name, ime_tests.emit_mx_test(plan, name), geom))
             continue
+        if geom.kind == "fpw":
+            # A round-seven program needs an encoding-map row (which pair of
+            # input formats, and which accumulator format) as well as an
+            # (A, B, C) triple, so the case is an ime_tests.FpwPlan.  The row
+            # and the tier are drawn at random from the legal sets, so one
+            # pass of the mix covers mixed-format rows and both tiers.
+            rows = rvv_ref.fpw_rows(geom.w, geom.sew)
+            key = rng.choice(sorted(rows, key=str))
+            row = rows[key]
+            tier = rng.choice(["golden", "exact"]) \
+                if ime_tests.fpw_exact_emittable(geom) else "golden"
+            case = (rvv_ref.fpw_exact_case(geom, row, rng) if tier == "exact"
+                    else rvv_ref.fpw_case(geom, row, rng))
+            plan = ime_tests.FpwPlan(geom, key, tier, *case, tag="stress")
+            out.append((name, ime_tests.emit_fpw_test(plan, name), geom))
+            continue
         case = rvv_ref.random_case(geom, rng)
         out.append((name, ime_tests.emit_test(geom, case, name), geom))
     return out
 
 
 def fill_pool(pool_dir: str, vlen: int, count: int, seed: int = 0,
-              work_dir: str = str(constants.OUT_DIR / "stress"),
+              work_dir: str = constants.STRESS_WORK_DIR,
               build=None, pool_add=None,
               extension: str = "ime") -> int:
     """Build *count* programs and stage them in the Stage 3 pool.

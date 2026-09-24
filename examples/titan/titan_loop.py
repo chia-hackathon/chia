@@ -9,8 +9,8 @@ decision here that matters:
     S2  regression   Saturn's own riscv-vector-tests       judge: ships with Saturn
     S3  stress       randomised tile geometries            judge: the M model
 
-**Every judge predates the defendant it judges.** rvv_ref.py is written by a
-human before any RTL exists; riscv-vector-tests shipped with Saturn and passed
+**Every judge predates the defendant it judges.** rvv_ref.py is written outside
+the loop (Claude Code sessions directed by the authors) before any RTL exists; riscv-vector-tests shipped with Saturn and passed
 before anyone touched it; and the Spike model runs *first*, so its author
 cannot have seen the RTL it will later judge -- that independence is a
 property of the ordering, not of a rule in a prompt that an agent might work
@@ -231,8 +231,10 @@ _AGENT_COSIM_ARTIFACTS: Dict[str, object] = {}
 #: ``set_vl`` -- while the cospike bridge next to it is compiled against the
 #: stock headers in ``$RISCV/include/riscv`` (``build_spike`` does not update
 #: those).  S2 was therefore grading the RTL against a Spike that is neither
-#: stock nor ABI-compatible with its own bridge, which is how r10 got 22
-#: ``.vf`` "regressions" whose SPIKE-side scalar operand was the wrong value.
+#: stock nor ABI-compatible with its own bridge.  (This was first blamed for
+#: r10's 22 ``.vf`` failures; later measurements -- titan_runs/s2_judge*/ --
+#: showed those were real: 9/10 against clean stock Spike, 0/10 on a pristine
+#: tree, i.e. an RTL stall bug.  The contamination was a judge bug all the same.)
 #:
 #: Passing the artifact makes ``ChiselBuildNode`` restage its bytes into
 #: ``$RISCV/lib`` before make (and carry them in the simulator's
@@ -501,6 +503,49 @@ def _write_failing(path: str, names) -> None:
         pass
 
 
+def _merge_failing(path: Optional[str], ran, failing) -> None:
+    """Same merge rule as the directed failing set: only what ran changes.
+
+    A ``run_rvv_start('vmv...')`` that passes must clear exactly that test,
+    not the 200 it never touched -- otherwise ``'failing'`` would collapse to
+    "whatever the last partial run happened to break" and the agent would
+    lose the set the loop actually grades.
+    """
+    if not path:
+        return
+    ran = set(ran)
+    _write_failing(path, (_read_failing(path) - ran) | set(failing))
+
+
+def _dump_regression_logs(dump: helpers.Dumper, stem: str,
+                          failing: Sequence[Tuple[str, str, str]]) -> None:
+    """The S2 equivalent of ``_dump_sim_logs``.
+
+    r8's S2 wrote a JSON list of 841 names and nothing else, so "why did
+    every test fail?" was unanswerable without re-running the whole gate by
+    hand.  This keeps the head of the first few failing logs -- the head, not
+    the tail, because a cospike abort prints its divergence and then dumps
+    spike's architectural state, so the interesting part is at the top -- plus
+    a histogram of the last line of every log, which is what tells 841
+    identical harness deaths apart from 841 real divergences.
+    """
+    chunks = [f"{len(failing)} failing regression test(s)\n"]
+    for name, reason, log in list(failing)[:5]:
+        lines = (log or "").splitlines()
+        head = "\n".join(lines[:40]) or "(no log captured)"
+        chunks.append(f"===== {name}\n{reason}\n({len(lines)} lines, "
+                      f"first {min(len(lines), 40)})\n{head}\n")
+    hist: Dict[str, int] = {}
+    for _, reason, log in failing:
+        lines = [ln for ln in (log or "").splitlines() if ln.strip()]
+        key = lines[-1].strip() if lines else f"(no log) {reason}"
+        hist[key] = hist.get(key, 0) + 1
+    chunks.append("===== histogram of the last line of each log\n")
+    for key, n in sorted(hist.items(), key=lambda kv: -kv[1]):
+        chunks.append(f"{n:5d}  {key[:200]}")
+    dump.text(f"{stem}.simlogs.txt", "\n".join(chunks))
+
+
 def _run_directed(artifact, tests: Sequence[Tuple[str, bytes]]
                   ) -> Tuple[List[Tuple[str, helpers.Outcome]], Dict[str, str]]:
     refs = {name: nodes.verilator_run_remote.chia_remote(
@@ -561,6 +606,14 @@ REGRESSION_LOGS_KEPT = 12
 #: 主機在這段時間裡會變；ps 一次約 20ms，這個頻率的成本可以忽略。
 HOSTLOAD_RECHECK_EVERY = int(
     os.environ.get("TITAN_HOSTLOAD_RECHECK_EVERY", "50"))
+
+#: 接續（--rtl-diff）時，如果 attempt 0 的 directed 全過、S2 抽樣也乾淨，
+#: 就不再叫 LLM，直接進 Gate。r22 的教訓：樹已經收斂，agent 的第一個 turn
+#: 卻「順手」改了 MatrixFPMultiplyPipe，讓 cosim 在每支 RVV 測試都死在第 0
+#: 條指令；它最後自己 revert 了，但那一整個 turn 是純成本加純風險。Gate 失敗
+#: 時仍走原本的 gate-debug 流程叫 LLM，所以這條捷徑不會跳過任何判官。
+#: 設 TITAN_RESUME_FAST_PATH=0 可關閉。
+RESUME_FAST_PATH = os.environ.get("TITAN_RESUME_FAST_PATH", "1") != "0"
 
 
 def _run_regression(artifact, select: Optional[Sequence[str]] = None,
@@ -1817,7 +1870,7 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
                 diff_path: str, pg_opts, run_id: str = "run",
                 failing_path: Optional[str] = None,
                 rvv_failing_path: Optional[str] = None
-                ) -> Tuple[str, str]:
+                ) -> Tuple[str, str, object]:
     """Resume S1 from a previous run's RTL edits.
 
     Applies the non-riscv-isa-sim part of *diff_path* to the freshly reset
@@ -1827,7 +1880,11 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
     its first turn is spent rediscovering the state r4 already paid five
     iterations for.  It counts as attempt 0 and dumps like any other attempt.
 
-    Returns (note for the first prompt, digest of the applied diff).
+    Returns (note for the first prompt, digest of the applied diff,
+    clean artifact).  The third element is the directed build when attempt 0
+    passed directed AND the S2 sample came back clean (cosim built, nothing
+    confirmed failing) -- the evidence ``run()`` needs to go straight to the
+    gate -- and ``None`` otherwise.
     """
     with open(diff_path) as f:
         rtl = _split_diff(f.read())[1]
@@ -1863,7 +1920,7 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
             artifact, 1, log_path=_publish_logs(
                 run_id, "iter0", pg_opts,
                 build_stdout=getattr(artifact, "stdout", "") or "",
-                build_stderr=getattr(artifact, "stderr", "") or "")), digest
+                build_stderr=getattr(artifact, "stderr", "") or "")), digest, None
 
     tests, geometries = _build_directed(dump, vlen, full_sweep=False)
     outcomes, logs = _run_directed(artifact, tests)
@@ -1889,7 +1946,7 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
         body = helpers.format_directed_failure(1, outcomes, logs,
                                                log_path=path)
         scope = helpers.format_rtl_seed_scope(done, new, failing=True)
-        return scope + "\n" + head + body, digest
+        return scope + "\n" + head + body, digest, None
 
     head = helpers.format_rtl_seed_scope(done, new, failing=False) + "\n" + head
     body = (f"every directed test passed or skipped: {summary['counts']}. "
@@ -1907,7 +1964,8 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
            cosim_build_ok=regression_failures is not None,
            failing=len(regression_failures or []))
     body += frag if frag is not None else "regression sample clean.\n"
-    return head + body, digest
+    clean = artifact if regression_failures == [] else None
+    return head + body, digest, clean
 
 
 def _reseed_model(dump: helpers.Dumper, status_path: str, vlen: int,
@@ -2159,8 +2217,9 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
         # half of a previous run's diff, plus a real build-and-judge of it so
         # the first prompt carries true feedback rather than a claim.
         first_note = None
+        resume_clean = None
         if rtl_diff:
-            first_note, rtl_digest = _rtl_resume(dump, status_path, vlen,
+            first_note, rtl_digest, resume_clean = _rtl_resume(dump, status_path, vlen,
                                                  rtl_diff, pg_opts, run_id,
                                                  failing_path=failing_path,
                                                  rvv_failing_path=rvv_failing_path)
@@ -2174,14 +2233,25 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
             first_note = f"{first_note}\n\n{extra}" if first_note else extra
 
         llm = llm_mod.make_llm(f"titan_{run_id}")
-        ok, artifact = _iterate(llm, rtl_tools, dump, status_path, finish,
-                                label="impl", vlen=vlen, max_iters=MAX_ITERS,
-                                first_message=None, pg_opts=pg_opts,
-                                first_note=first_note, run_id=run_id,
-                                knowledge_path=knowledge_path,
-                                run_tool=run_tool, events_path=events_path,
-                                failing_path=failing_path,
-                                rvv_failing_path=rvv_failing_path)
+        if resume_clean is not None and RESUME_FAST_PATH:
+            # Attempt 0 already is the S1+S2 verdict ``_iterate`` would have
+            # to reproduce: same build, same directed suite, same sampled
+            # regression with the same unanimity confirmation.  Nothing is
+            # left for an agent turn to do except change a converged tree.
+            _event("rtl_resume_fast_path", digest=result.get("rtl_digest"))
+            print("[resume] attempt 0 directed + S2 sample clean -> "
+                  "skipping the agent turn, going straight to the gate",
+                  flush=True)
+            ok, artifact = True, resume_clean
+        else:
+            ok, artifact = _iterate(llm, rtl_tools, dump, status_path, finish,
+                                    label="impl", vlen=vlen, max_iters=MAX_ITERS,
+                                    first_message=None, pg_opts=pg_opts,
+                                    first_note=first_note, run_id=run_id,
+                                    knowledge_path=knowledge_path,
+                                    run_tool=run_tool, events_path=events_path,
+                                    failing_path=failing_path,
+                                    rvv_failing_path=rvv_failing_path)
         result["s1_s2"] = ok
         result["regression_confirm"] = _confirm_summary()
         if not ok:

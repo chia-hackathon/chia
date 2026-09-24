@@ -34,7 +34,7 @@ import argparse
 import random
 import struct
 from fractions import Fraction
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 # NOT named `encodings` -- CPython imports the stdlib `encodings` package
@@ -1239,11 +1239,90 @@ FP_FRM = 0        # RNE, round to nearest, ties to even
 #: pending format gets a precise diagnosis instead of a KeyError that reads
 #: like a typo.
 OCP_PENDING_FORMATS = {
-    "e4m3": "OFP8 E4M3: needs OCP 8-bit Floating Point (OFP8) v1.0 "
-            "(no Inf encoding; NaN set and overflow rule not derivable)",
-    "e5m2": "OFP8 E5M2: needs OCP 8-bit Floating Point (OFP8) v1.0",
     "e2m1": "OFP4 E2M1: needs OCP Microscaling Formats (MX) v1.0 "
             "(no Inf, no NaN; overflow rule is spec text)",
+}
+
+# --- round eight: OFP8 (E4M3 / E5M2) from the OCP OFP8 v1.0 document ------
+#
+# Round eight obtained ONE of the two documents named above: "OCP 8-bit
+# Floating Point Specification (OFP8) Revision 1.0" (approved 2023-06-20;
+# PDF at titan/ocp-spec/, text extracted to specs/ime/ocp-ofp8-v1.0.txt for
+# the agents).  OCP MX v1.0, which defines E2M1, is still NOT on disk, so
+# e2m1 alone stays in OCP_PENDING_FORMATS and every E2M1 cell stays
+# unsupported.  Every rule below is quoted from the OFP8 PDF by page
+# ("OFP8 p.N"; PDF page numbers, which equal the printed page numbers):
+#
+#   * OFP8 p.11 (sec. 4.2): "E4M3: ... 1 sign bit, 4 biased exponent bits, 3
+#     mantissa bits, and an exponent bias of 7."  "E5M2: ... 1 sign bit, 5
+#     biased exponent bits, 2 mantissa bits, and an exponent bias of 15."
+#     "max_E4M3 ... 448", "max_E5M2 ... 57,344".
+#   * OFP8 p.12 (sec. 5.1): normal v = (-1)^S x 2^(E-bias) x (1 + 2^-m x M);
+#     subnormal (E = 0, M > 0) v = (-1)^S x 2^(1-bias) x (0 + 2^-m x M).
+#     "The E5M2 format represents infinities and NaNs.  Interpretation of the
+#     three mantissa values for NaNs is not defined.  The E4M3 format does
+#     not represent infinities and uses only two bit patterns for NaN (a
+#     single mantissa-exponent bit pattern but allowing both values of the
+#     sign bit) in order to increase emax to 8".
+#   * OFP8 p.13 Table 1: bias 7 / 15, emax 8 / 15, emin -6 / -14.  Table 2:
+#     E4M3 Inf N/A, NaN S.1111.111, zeros S.0000.000, max normal S.1111.110
+#     = +-448, min normal S.0001.000 = 2^-6, max subnormal S.0000.111 =
+#     0.875 x 2^-6, min subnormal S.0000.001 = 2^-9.  E5M2 Inf S.11111.00,
+#     NaN S.11111.{01,10,11}, max normal S.11110.11 = +-57344, min normal
+#     2^-14, max subnormal 0.75 x 2^-14, min subnormal 2^-16.
+#   * OFP8 p.14-15 (sec. 5.2.1, Table 3): conversion TO OFP8 requires round
+#     to nearest even and BOTH a saturating and a non-saturating mode.  After
+#     rounding, a magnitude above max: SAT -> max normal; NONSAT -> E4M3 NaN,
+#     E5M2 infinity.  +-Inf source: SAT -> +-max, NONSAT -> E4M3 NaN, E5M2
+#     +-Inf.  Below min subnormal -> signed zero.  "Conversion from a NaN
+#     produces an implementation-defined OFP8 NaN"; NaN sign bit is left to
+#     the implementation.
+#
+# IME side (integrated-matrix-v0.9.0.adoc):
+#
+#   * 1133-1140: altfmt_A / altfmt_B = 0 -> E4M3, = 1 -> E5M2 at 8-bit input
+#     width, independently per operand; 1445-1451: all four combinations,
+#     mixed included, are covered by the one OFP8 extension per output.
+#   * 1096-1099: vtype.altfmt x vsew=000 selects an E4M3 / E5M2 *accumulator*
+#     -- IME does round TO OFP8, but only in Zvvofp8mm (vfmmacc.vv SEW=8) and
+#     Zvvofp4ofp8mm (vfwmmacc.vv SEW=8, E2M1 inputs).  Neither is live in
+#     round eight (see constants.ROUND_EIGHT_UNSUPPORTED), so every OFP8
+#     value a round-eight program meets is an INPUT; no program rounds to
+#     OFP8.  The rounding rule is still encoded, and negative-controlled, so
+#     that it is not invented later under time pressure.
+#   * 1400-1405: p = 4 (E4M3), 3 (E5M2) -- agrees with OCP (m + hidden bit).
+#   * 1872-1878: any NaN materialised in a concrete format is that format's
+#     default NaN (fp_defaultNaN), whose OFP8 bit pattern the adoc never
+#     states (Sail 4831-4838 leaves the helper undefined).
+#   * 1847-1850 (fp_round_to_frm): rounding to fmt_C uses frm and "may raise
+#     ... overflow".  The adoc never mentions saturation; OCP requires both
+#     modes and does not say which one a consumer uses.
+#
+# Where the two documents are silent or leave a choice, Titan discloses the
+# most literal reading, as data, exactly like FP_DISCLOSURE:
+#
+#   overflow      "nonsat".  IME rounding is fp_round_to_frm, an IEEE-style
+#                 rounding that raises the overflow flag; the only OCP mode
+#                 in which overflow behaves like IEEE RNE (E5M2 -> Inf) is
+#                 NONSAT, and E4M3 NONSAT gives NaN (OCP Table 3).  Unused by
+#                 every live round-eight cell (no OFP8 accumulator).
+#   default_nan   E4M3 0x7F (+, S.1111.111 -- its only NaN magnitude);
+#                 E5M2 0x7E (+, S.11111.10 -- the RISC-V canonical-NaN shape:
+#                 sign 0, exponent all ones, top mantissa bit set).  OCP
+#                 leaves both implementation-defined.  Unused by every live
+#                 round-eight cell (a NaN result is materialised in fmt_C,
+#                 which is IEEE binary16/bfloat16/32/64 there).
+#   frm           Only RNE (frm=0) is modelled for an OFP8 *destination*: OCP
+#                 requires RNE only ("may implement additional rounding
+#                 modes").  Decoding an OFP8 input involves no rounding.
+#   snan          OCP p.12: E5M2 NaN mantissa interpretation "is not defined"
+#                 and E4M3 has one NaN pattern, so no OFP8 NaN is signalling.
+#                 This matters only for fflags, which no program checks.
+OFP8_DISCLOSURE = {
+    "overflow": "nonsat",
+    "default_nan": {"e4m3": 0x7F, "e5m2": 0x7E},
+    "frm": "rne-only",
+    "snan": "none",
 }
 
 
@@ -1339,10 +1418,16 @@ FP_FORMAT_TABLE = {
     "bfloat16": FpFormat("bfloat16", 16, 8, 8, True, "ieee", "inf"),
     "binary32": FpFormat("binary32", 32, 8, 24, True, "ieee", "inf"),
     "binary64": FpFormat("binary64", 64, 11, 53, True, "ieee", "inf"),
-    # Widths and significands from spec 1400-1410; everything behavioural is
-    # deliberately absent.  See OCP_PENDING_FORMATS for what each needs.
-    "e4m3": FpFormat("e4m3", 8, 4, 4),
-    "e5m2": FpFormat("e5m2", 8, 5, 3),
+    # Round eight: OFP8 from OCP OFP8 v1.0 (see OFP8_DISCLOSURE for every
+    # citation).  E4M3: no infinity (OFP8 p.12), NaN only S.1111.111 (Table
+    # 2), so S.1111.000-110 are ordinary normals up to 448.  E5M2 is
+    # IEEE-shaped (Table 2: Inf S.11111.00, NaN S.11111.{01,10,11}).  The
+    # ``overflow`` field is the disclosed non-saturating mode (OCP Table 3
+    # NONSAT column): E4M3 -> NaN, E5M2 -> Inf.
+    "e4m3": FpFormat("e4m3", 8, 4, 4, False, "ocp_e4m3", "nan"),
+    "e5m2": FpFormat("e5m2", 8, 5, 3, True, "ieee", "inf"),
+    # E2M1: width and significand from spec 1400-1410 only; everything
+    # behavioural is deliberately absent until OCP MX v1.0 is on disk.
     "e2m1": FpFormat("e2m1", 4, 2, 2),
 }
 
@@ -1366,10 +1451,20 @@ def fp_format(name: str) -> FpFormat:
 
 
 def fpf_is_nan(bits: int, fmt: FpFormat) -> bool:
-    """NaN predicate driven by the descriptor, not by an IEEE assumption."""
+    """NaN predicate driven by the descriptor, not by an IEEE assumption.
+
+    ``"ocp_e4m3"`` is OCP OFP8 p.12 / Table 2 (p.13): E4M3's NaN is the
+    single exponent-and-mantissa pattern S.1111.111, "allowing both values of
+    the sign bit".  S.1111.000 through S.1111.110 are ordinary normals
+    (256 .. 448), so the IEEE predicate would misread six finite magnitudes
+    per sign as NaN -- the trap round eight's negative controls pin.
+    """
     if fmt.nan_rule == "ieee":
         return ((bits >> (fmt.prec - 1)) & fmt.emax == fmt.emax
                 and bool(bits & ((1 << (fmt.prec - 1)) - 1)))
+    if fmt.nan_rule == "ocp_e4m3":
+        mag_mask = (1 << (fmt.width - 1)) - 1
+        return bits & mag_mask == mag_mask
     if fmt.nan_rule == "none":
         return False
     raise OCPSpecUnavailable(
@@ -1383,29 +1478,150 @@ def fpf_is_inf(bits: int, fmt: FpFormat) -> bool:
             and not bits & ((1 << (fmt.prec - 1)) - 1))
 
 
+def fpf_default_nan(fmt: FpFormat) -> int:
+    """Sail ``fp_defaultNaN`` for *fmt* (spec 1872-1878, Sail 4834-4838).
+
+    The four IEEE-table formats delegate to :func:`fp_default_nan`, so their
+    patterns are byte-identical to rounds four to seven.  The OFP8 patterns
+    are Titan disclosures (:data:`OFP8_DISCLOSURE`): OCP OFP8 p.14 makes the
+    NaN produced by a conversion "implementation-defined".
+    """
+    if fmt.name in FP_FORMATS_BY_NAME:
+        return fp_default_nan(fmt.width, fmt.name)
+    try:
+        return OFP8_DISCLOSURE["default_nan"][fmt.name]
+    except KeyError:
+        raise OCPSpecUnavailable(
+            f"no default NaN is defined for {fmt.name}") from None
+
+
+def fpf_max_finite(fmt: FpFormat) -> int:
+    """Bit pattern of the largest finite positive value of *fmt*.
+
+    IEEE-shaped: biased exponent emax-1, mantissa all ones (E5M2: 0x7B =
+    57344, OCP Table 2).  ``"ocp_e4m3"``: exponent all ones, mantissa all
+    ones but the NaN pattern, i.e. S.1111.110 = 448 (OCP Table 2).
+    """
+    mbits = fmt.prec - 1
+    if fmt.nan_rule == "ocp_e4m3":
+        return (fmt.emax << mbits) | ((1 << mbits) - 2)
+    if fmt.has_inf:
+        return ((fmt.emax - 1) << mbits) | ((1 << mbits) - 1)
+    raise OCPSpecUnavailable(f"max finite of {fmt.name} is not modelled")
+
+
+def _fpf_unpack_generic(bits: int, fmt: FpFormat):
+    """Descriptor-driven decode, for formats outside FP_FORMATS_BY_NAME.
+
+    OCP OFP8 p.12: normal v = (-1)^S 2^(E-bias) (1 + 2^-m M); subnormal
+    (E=0, M>0) v = (-1)^S 2^(1-bias) (2^-m M); E=0, M=0 is a signed zero.
+    Special encodings come from the descriptor (has_inf, nan_rule), never
+    from an assumption that the top binade is reserved: for E4M3 it is not.
+    """
+    mbits = fmt.prec - 1
+    sign = (bits >> (fmt.width - 1)) & 1
+    exp = (bits >> mbits) & fmt.emax
+    frac = bits & ((1 << mbits) - 1)
+    if fpf_is_nan(bits, fmt):
+        return "nan", sign, Fraction(0)
+    if fpf_is_inf(bits, fmt):
+        return "inf", sign, Fraction(0)
+    if fmt.nan_rule == "ieee" and exp == fmt.emax:
+        raise AssertionError(f"{fmt.name} 0x{bits:x}: unclassified top binade")
+    if exp == 0:
+        return "num", sign, Fraction(frac, 1 << mbits) * _pow2(1 - fmt.bias)
+    return ("num", sign,
+            Fraction((1 << mbits) | frac, 1 << mbits) * _pow2(exp - fmt.bias))
+
+
 def fpf_unpack(bits: int, fmt: FpFormat):
     """``(kind, sign, Fraction)`` for *bits* read as *fmt*.
 
-    Delegates to :func:`fp_unpack` for the resolved IEEE-shaped formats,
-    which rounds four to six already exercise, rather than opening a second
-    implementation of the same decode.
+    Delegates to :func:`fp_unpack` for the four IEEE formats that rounds four
+    to seven already exercise, so their decode is byte-for-byte unchanged.
+    The OFP8 formats go through :func:`_fpf_unpack_generic`, which reads
+    every behavioural fact from the descriptor; it is checked against an
+    independent 256-code table built from the OCP formulas in
+    :func:`check_round_eight_ofp8_decode`, and against fp_unpack on all
+    65536 binary16 codes so the generic path is known IEEE-correct too.
     """
-    if fmt.nan_rule != "ieee" or not fmt.has_inf:
-        raise OCPSpecUnavailable(
-            f"{fmt.name} is not IEEE-shaped; its decode is not modelled")
-    return fp_unpack(bits, fmt.width, fmt.name)
+    if not fmt.resolved:
+        raise OCPSpecUnavailable(f"{fmt.name} is not modelled")
+    if fmt.name in FP_FORMATS_BY_NAME:
+        if fmt.nan_rule != "ieee" or not fmt.has_inf:
+            raise OCPSpecUnavailable(
+                f"{fmt.name} is not IEEE-shaped; its decode is not modelled")
+        return fp_unpack(bits, fmt.width, fmt.name)
+    return _fpf_unpack_generic(bits, fmt)
+
+
+def _fpf_round_generic(value: "Fraction", fmt: FpFormat) -> int:
+    """RNE into an OFP8 destination, per OCP OFP8 sec. 5.2.1 (p.14).
+
+    "Conversion ... first applies rounding to reduce the mantissa bit count
+    to that of the destination OFP8 format.  After that, if the rounded
+    magnitude is above the maximum destination magnitude" the overflow rule
+    applies (``fmt.overflow``: ``"saturate"`` -> +-max normal, ``"nan"`` ->
+    NaN, ``"inf"`` -> +-Inf); if it is "below the minimum subnormal number
+    magnitude: generate a corresponding zero" -- which is what RNE into the
+    subnormal range already does.  The sign is preserved except for NaN.
+    """
+    sign = 1 if value < 0 else 0
+    mag = -value if sign else value
+    sbit = sign << (fmt.width - 1)
+    mbits = fmt.prec - 1
+    if mag == 0:
+        return sbit
+    e = max(_floor_log2(mag), 1 - fmt.bias)
+    scaled = mag / _pow2(e - mbits)
+    q, r = divmod(scaled.numerator, scaled.denominator)
+    if 2 * r > scaled.denominator or (2 * r == scaled.denominator and q & 1):
+        q += 1
+    if q >> fmt.prec:
+        q >>= 1
+        e += 1
+    rounded = Fraction(q) * _pow2(e - mbits)
+    max_bits = fpf_max_finite(fmt)
+    _k, _s, max_mag = _fpf_unpack_generic(max_bits, fmt)
+    if rounded > max_mag:
+        return _fpf_overflow(sign, fmt)
+    if q >> mbits == 0:                        # subnormal (or zero)
+        return sbit | q
+    return sbit | ((e + fmt.bias) << mbits) | (q & ((1 << mbits) - 1))
+
+
+def _fpf_overflow(sign: int, fmt: FpFormat) -> int:
+    """OCP Table 3 (p.15), the "greater than max OFP8 magnitude" row."""
+    sbit = sign << (fmt.width - 1)
+    if fmt.overflow == "saturate":
+        return sbit | fpf_max_finite(fmt)
+    if fmt.overflow == "inf":
+        if not fmt.has_inf:
+            raise OCPSpecUnavailable(f"{fmt.name} has no infinity")
+        return sbit | (fmt.emax << (fmt.prec - 1))
+    if fmt.overflow == "nan":
+        return fpf_default_nan(fmt)
+    raise OCPSpecUnavailable(
+        f"{fmt.name} overflow rule {fmt.overflow!r} is not modelled")
 
 
 def fpf_round(value: "Fraction", fmt: FpFormat, frm: int = 0) -> int:
     """Round an exact value into *fmt*, per the descriptor's overflow rule."""
-    if fmt.overflow != "inf":
-        raise OCPSpecUnavailable(
-            f"{fmt.name} overflow rule {fmt.overflow!r} is not modelled; a "
-            f"format without infinities cannot use the IEEE overflow path")
     if frm != FP_FRM:
         raise ValueError(
             f"frm={frm} is not modelled; round seven generates RNE only "
             f"(FP_FRM), matching spec 1495 and the FP_DISCLOSURE tuple")
+    if fmt.name not in FP_FORMATS_BY_NAME:
+        # Round eight: OFP8 destinations (OFP8_DISCLOSURE).  No live cell
+        # reaches this -- every round-eight accumulator is IEEE -- but the
+        # exact-case constructor and the negative controls do.
+        if not fmt.resolved:
+            raise OCPSpecUnavailable(f"{fmt.name} is not modelled")
+        return _fpf_round_generic(value, fmt)
+    if fmt.overflow != "inf":
+        raise OCPSpecUnavailable(
+            f"{fmt.name} overflow rule {fmt.overflow!r} is not modelled; a "
+            f"format without infinities cannot use the IEEE overflow path")
     # fp_round takes a nonnegative magnitude plus a sign bit; round seven
     # works in signed Fractions throughout, so the split happens here and
     # nowhere else.  A negative value that rounds to zero must give -0.0,
@@ -1432,6 +1648,13 @@ def fp_fields(width: int, fmt: Optional[str] = None):
                 f"OCP normatively (1908-1913) rather than restating the "
                 f"encoding, so there is nothing here to derive it from; see "
                 f"OCP_PENDING_FORMATS.")
+        if fmt in OFP8_DISCLOSURE["default_nan"]:
+            # Round eight: OFP8 is modelled by the descriptor helpers
+            # (fpf_*) only.  This IEEE-shaped path would misread E4M3's top
+            # binade, so it refuses rather than half-working.
+            raise ValueError(
+                f"{fmt!r} is an OCP OFP8 format; use the FpFormat helpers "
+                f"(fpf_unpack / fpf_round / fpf_default_nan), not fp_fields")
         try:
             fwidth, ebits, prec = FP_FORMATS_BY_NAME[fmt]
         except KeyError:
@@ -2447,8 +2670,13 @@ def _fpw_materialise(value, fmt: FpFormat) -> int:
     :func:`fpf_round` refuses the others rather than inventing a pattern.
     """
     if value[0] == "nan":
-        return fp_default_nan(fmt.width, fmt.name)
+        return fpf_default_nan(fmt)
     if value[0] == "inf":
+        if fmt.name not in FP_FORMATS_BY_NAME:
+            # Round eight, OFP8 destination: OCP Table 3 (p.15) "+-Inf" row
+            # -- SAT gives +-max, NONSAT gives E5M2 +-Inf / E4M3 NaN, which
+            # is exactly the overflow rule the descriptor carries.
+            return _fpf_overflow(value[1], fmt)
         if not fmt.has_inf:
             raise OCPSpecUnavailable(
                 f"an infinite result in {fmt.name}, which encodes no "
@@ -2462,7 +2690,7 @@ def _fpw_add_into(acc_bits: int, addend, fmt: FpFormat) -> int:
     """``C <- round_frm(C + S)`` (spec 1591-1593), with C read back as bits."""
     kind, sign, mag = fpf_unpack(acc_bits, fmt)
     if kind == "nan":
-        return fp_default_nan(fmt.width, fmt.name)
+        return fpf_default_nan(fmt)
     acc = ("inf", sign) if kind == "inf" else ("num", -mag if sign else mag)
     return _fpw_materialise(_fpw_sum_exact([acc, addend]), fmt)
 
@@ -2496,7 +2724,14 @@ def fpw_reference_gemm(geom: "TileGeometry", a, b, c,
     """
     w, groups = geom.w, geom.lam * geom.lmul
     assert geom.k_eff == groups * w, (geom.k_eff, groups, w)
-    out = [[0] * geom.n for _ in range(geom.m)]
+    # C is the *physical* M x N_max tile, not the active M x N one.  Columns
+    # at j >= N are inactive: the instruction does not write them, so they
+    # pass through carrying whatever C held on entry.  Returning a narrow
+    # M x N result and zero-filling the rest is the mistake this shape
+    # prevents -- it produced 177 partial-N failures that looked like an
+    # arithmetic bug and were a tail-policy bug.
+    assert len(c[0]) == geom.n_max, (len(c[0]), geom.n_max)
+    out = [[c[i][j] for j in range(geom.n_max)] for i in range(geom.m)]
     for i in range(geom.m):
         for j in range(geom.n):
             acc = c[i][j]
@@ -2537,13 +2772,13 @@ def fpw_golden_bytes(geom: "TileGeometry", tile, fmt_c: FpFormat) -> List[int]:
     over the *physical* M x M tile rather than the active M x N one, because
     that is what a C transfer moves.
     """
+    assert len(tile[0]) == geom.n_max, (len(tile[0]), geom.n_max)
     out: List[int] = []
     nbytes = fmt_c.width // 8
     for i in range(geom.m):
         for j in range(geom.n_max):
-            v = tile[i][j] if j < geom.n else 0
-            out.extend((v & ((1 << fmt_c.width) - 1)).to_bytes(nbytes,
-                                                               "little"))
+            out.extend((tile[i][j] & ((1 << fmt_c.width) - 1))
+                       .to_bytes(nbytes, "little"))
     return out
 
 
@@ -4001,6 +4236,10 @@ def fpw_operand_pool(fmt: FpFormat, rng: random.Random, n: int) -> List[int]:
     pool += [0, 1 << (fmt.width - 1), one, one | (1 << (fmt.width - 1))]
     pool.append(one | 1)                       # 1.0 + 1ulp: products inexact
     pool.append(one - 1)                       # just under 1.0
+    # Round eight: OFP8 pools also carry the encodings where an IEEE-shaped
+    # decoder goes wrong (OFP8_EDGE_OPERANDS).  Appended only for OFP8, so
+    # every IEEE pool -- and the rng stream behind it -- is unchanged.
+    pool += list(OFP8_EDGE_OPERANDS.get(fmt.name, ()))
     for _ in range(max(0, n - len(pool))):
         # A finite value with a modest exponent: large enough that a W-term
         # partial sum can lose bits, small enough that nothing overflows.
@@ -4011,6 +4250,37 @@ def fpw_operand_pool(fmt: FpFormat, rng: random.Random, n: int) -> List[int]:
     return pool[:max(n, 6)]
 
 
+#: Round eight.  Finite OFP8 encodings every golden-tier pool carries, each
+#: one a place a plausible decoder is wrong (OCP OFP8 Table 2, p.13):
+#:
+#:   E4M3  0x7E / 0xF9  +448 (max normal, exponent field ALL ONES) and -288:
+#:                      an IEEE-shaped decoder calls these NaN.
+#:         0x01 / 0x87  min subnormal 2^-9, -max subnormal -0.875*2^-6:
+#:                      a flush-to-zero decoder loses them.
+#:         0x08         min normal 2^-6, the subnormal/normal boundary.
+#:   E5M2  0x7B / 0xF8  +57344 (max normal) and -32768.
+#:         0x01 / 0x83  min subnormal 2^-16, -max subnormal -0.75*2^-14.
+#:         0x04         min normal 2^-14.
+#:
+#: NaN and Inf are deliberately NOT in the pools: one per K row would turn
+#: most of the tile into NaN and hide the rounding the golden tier exists to
+#: reach.  They get their own tier, :func:`fpw_special_case`.
+OFP8_EDGE_OPERANDS = {
+    "e4m3": (0x7E, 0xF9, 0x01, 0x87, 0x08),
+    "e5m2": (0x7B, 0xF8, 0x01, 0x83, 0x04),
+}
+
+#: The widening cells, split by the round that made them live.  Generators
+#: walk round seven's cells first, with round seven's rng, and round eight's
+#: after them with a separate rng -- so every round-seven program stays
+#: byte-identical even though (2, 16) and (4, 32) sort in between them.
+FPW_ROUND_SEVEN_CELLS = ((2, 32), (2, 64), (4, 64))
+FPW_ROUND_EIGHT_CELLS = ((2, 16), (4, 32), (8, 64))
+
+#: The OCP element formats, resolved or not.  "narrow" in the MX sense.
+OFP_FORMATS = ("e4m3", "e5m2", "e2m1")
+
+
 def fpw_case(geom: "TileGeometry", row, rng: random.Random):
     """One ``(A, B, C)`` case for a round-seven geometry and encoding row."""
     fmt_a, fmt_b, fmt_c = row
@@ -4019,7 +4289,9 @@ def fpw_case(geom: "TileGeometry", row, rng: random.Random):
     pc = fpw_operand_pool(fmt_c, rng, 24)
     a = [[rng.choice(pa) for _ in range(geom.k_eff)] for _ in range(geom.m)]
     b = [[rng.choice(pb) for _ in range(geom.k_eff)] for _ in range(geom.n)]
-    c = [[rng.choice(pc) for _ in range(geom.n)] for _ in range(geom.m)]
+    # C spans the physical tile width: inactive columns are part of the
+    # expected image because the instruction leaves them alone.
+    c = [[rng.choice(pc) for _ in range(geom.n_max)] for _ in range(geom.m)]
     return a, b, c
 
 
@@ -4054,13 +4326,75 @@ def fpw_exact_case(geom: "TileGeometry", row, rng: random.Random):
     # Bound the dot product so C + sum(A*B) stays well inside the integers
     # fmt_C represents exactly: |A|,|B| <= 3 gives |product| <= 9, and
     # K_eff of them plus |C| <= 64 is far below 2**24.
-    lim = 3
+    lim, c_hi = 3, 64
+    if fmt_c.prec < 24:
+        # Round eight: binary16 (integers exact to 2**11) and bfloat16 (to
+        # 2**8) accumulators at (W=2, SEW=16).  Shrink the bounds so every
+        # partial sum is still an exactly representable integer.  Never
+        # taken by a round-seven cell (all binary32/64), so their rng stream
+        # is untouched.
+        cap = 1 << fmt_c.prec
+        if lim * lim * geom.k_eff + c_hi > cap:
+            lim = 1
+        c_hi = min(c_hi, cap - lim * lim * geom.k_eff)
+        assert c_hi >= 0, (geom.describe(), fmt_c.name)
     def ints(fmt, n, hi):
         return [fpf_round(Fraction(rng.randrange(-hi, hi + 1)), fmt, FP_FRM)
                 for _ in range(n)]
     a = [ints(fmt_a, geom.k_eff, lim) for _ in range(geom.m)]
     b = [ints(fmt_b, geom.k_eff, lim) for _ in range(geom.n)]
-    c = [ints(fmt_c, geom.n, 64) for _ in range(geom.m)]
+    c = [ints(fmt_c, geom.n_max, c_hi) for _ in range(geom.m)]
+    return a, b, c
+
+
+def fpw_special_case(geom: "TileGeometry", row, rng: random.Random):
+    """Round eight's special-value tier: an fpw_case with OFP8 specials planted.
+
+    Golden tier semantics (the reference model is the authority), at fixed,
+    documented positions so a failure names the rule it broke:
+
+    * A row 0, k=0: a NaN of fmt_A -- a *non-canonical* one where the format
+      has more than one (E5M2 0xFD = -S.11111.01; E4M3 has only 0x7F/0xFF, so
+      the negative one) -- must give fmt_C's default NaN (spec 1872-1878).
+    * A row 1: +max and -max of fmt_A (E4M3 0x7E/0xFE, E5M2 0x7B/0xFB) at k=0
+      and k=1 -- finite, never NaN.
+    * A row 2, k=0: +Inf where fmt_A has one (E5M2 0x7C); E4M3 has none, so
+      its S.1111.000 = 256 goes there instead -- again finite.
+    * A row 3: +Inf at k=0 and -Inf at k=W (two different groups) when fmt_A
+      has infinities and there are >= 2 groups; with B columns 0 and W set to
+      +1.0 this is Inf + -Inf -> NaN (spec 1843-1845).
+    * A row 4: every k the minimum positive subnormal (no flush-to-zero).
+    * B row N-1, k=0: a NaN of fmt_B, so a NaN reaching through the *other*
+      operand is covered too (one C column, every C row).
+    """
+    fmt_a, fmt_b, fmt_c = row
+    a, b, c = fpw_case(geom, row, rng)
+    one_b = fpf_round(Fraction(1), fmt_b, FP_FRM)
+    w, groups = geom.w, geom.lam * geom.lmul
+    sign_a = 1 << (fmt_a.width - 1)
+    nan_a = (fpf_default_nan(fmt_a) | sign_a if fmt_a.nan_rule == "ocp_e4m3"
+             else ((fmt_a.emax << (fmt_a.prec - 1)) | 1 | sign_a))
+    assert fpf_is_nan(nan_a, fmt_a) and nan_a != fpf_default_nan(fmt_a)
+    max_a = fpf_max_finite(fmt_a)
+    inf_a = fmt_a.emax << (fmt_a.prec - 1) if fmt_a.has_inf else None
+    for j in range(geom.n):                  # known +1.0 at k=0 and k=W
+        b[j][0] = one_b
+        if w < geom.k_eff:
+            b[j][w] = one_b
+    if geom.m > 0:
+        a[0][0] = nan_a
+    if geom.m > 1:
+        a[1][0] = max_a
+        a[1][1] = max_a | sign_a
+    if geom.m > 2:
+        a[2][0] = inf_a if inf_a is not None else (fmt_a.emax << (fmt_a.prec - 1))
+    if geom.m > 3 and inf_a is not None and groups >= 2:
+        a[3][0] = inf_a
+        a[3][w] = inf_a | sign_a
+    if geom.m > 4:
+        a[4] = [1] * geom.k_eff
+    if geom.n > 1:
+        b[geom.n - 1][0] = fpf_default_nan(fmt_b)
     return a, b, c
 
 
@@ -4091,8 +4425,11 @@ def check_round_seven_format_table() -> None:
     assert FP_FORMAT_TABLE["e4m3"].prec == 4
     assert FP_FORMAT_TABLE["e5m2"].prec == 3
     assert FP_FORMAT_TABLE["e2m1"].sub_byte
-    # The three cells implementable today are exactly the ones reported.
-    assert fpw_resolved_cells() == [(2, 32), (2, 64), (4, 64)], \
+    # The cells implementable today are exactly the ones reported: round
+    # seven's three plus round eight's three OFP8-input cells (the OCP OFP8
+    # document is on disk; OCP MX, which defines E2M1, is not).
+    assert fpw_resolved_cells() == sorted(FPW_ROUND_SEVEN_CELLS
+                                          + FPW_ROUND_EIGHT_CELLS), \
         fpw_resolved_cells()
 
 
@@ -4149,7 +4486,7 @@ def check_round_seven_gemm() -> None:
     zero_c = 0
     a = [[one_a] * geom.k_eff for _ in range(geom.m)]
     b = [[one_a] * geom.k_eff for _ in range(geom.n)]
-    c = [[zero_c] * geom.n for _ in range(geom.m)]
+    c = [[zero_c] * geom.n_max for _ in range(geom.m)]
     out = fpw_reference_gemm(geom, a, b, c, fa, fb, fc)
     want = fpf_round(Fraction(geom.k_eff), fc, FP_FRM)
     assert all(v == want for row in out for v in row), (out[0][0], want)
@@ -4162,7 +4499,7 @@ def check_round_seven_gemm() -> None:
     g1 = TileGeometry(256, 32, 1, 1, 8, 2, kind="fpw")
     a1 = [[va] * g1.k_eff for _ in range(g1.m)]
     b1 = [[vb] * g1.k_eff for _ in range(g1.n)]
-    c1 = [[0] * g1.n for _ in range(g1.m)]
+    c1 = [[0] * g1.n_max for _ in range(g1.m)]
     out1 = fpw_reference_gemm(g1, a1, b1, c1, fa, fb2, fc)
     assert out1[0][0] == fpf_round(Fraction(15, 8) * g1.k_eff, fc, FP_FRM)
 
@@ -4172,7 +4509,7 @@ def check_round_seven_gemm() -> None:
     inexact = fpf_round(Fraction(1), fa, FP_FRM) | 1      # 1.0 + 1ulp
     big = fpf_round(Fraction(1 << 20), fc, FP_FRM)
     a2 = [[inexact] * g1.k_eff for _ in range(g1.m)]
-    c2 = [[big] * g1.n for _ in range(g1.m)]
+    c2 = [[big] * g1.n_max for _ in range(g1.m)]
     assert not fpw_selfcheck_exact(g1, a2, b1, c2, fa, fb2, fc)
 
 
@@ -4255,7 +4592,13 @@ def check_round_seven_negative_controls() -> None:
     rng = random.Random(7)
     fa, fb = fp_format("binary16"), fp_format("bfloat16")
     fc = fp_format("binary32")
-    geom = TileGeometry(256, 32, 2, 2, 32, 2, kind="fpw")
+    # A *legal* geometry, taken from the enumeration rather than built by
+    # hand: a hand-built one silently had N > N_max and every control below
+    # indexed past the end of B.  validate() is called for the same reason.
+    geom = next(g for g in fpw_legal_configs(256, full_vl_only=True)
+                if (g.w, g.sew) == (2, 32) and g.lam * g.lmul > 1
+                and g.emul_c != 16)
+    geom.validate()
     assert geom.lam * geom.lmul > 1, "need >1 group for the rnd control"
 
     # --- control 1: rnd=frm collapsed to rnd=xct -------------------------
@@ -4263,7 +4606,7 @@ def check_round_seven_negative_controls() -> None:
     # partial sum is inexact in fmt_C, which is why the pool is not
     # restricted to exactly-representable operands.
     def gemm_xct(a, b, c):
-        out = [[0] * geom.n for _ in range(geom.m)]
+        out = [row[:] for row in c]          # inactive columns pass through
         for i in range(geom.m):
             for j in range(geom.n):
                 acc = c[i][j]
@@ -4291,7 +4634,7 @@ def check_round_seven_negative_controls() -> None:
     one_b = fpf_round(Fraction(1), fb, FP_FRM)
     ax = [[one_a] * geom.k_eff for _ in range(geom.m)]
     bx = [[one_b] * geom.k_eff for _ in range(geom.n)]
-    cx = [[0] * geom.n for _ in range(geom.m)]
+    cx = [[0] * geom.n_max for _ in range(geom.m)]
     assert fpw_selfcheck_exact(geom, ax, bx, cx, fa, fb, fc)
     assert fpw_reference_gemm(geom, ax, bx, cx, fa, fb, fc) == \
         gemm_xct(ax, bx, cx), (
@@ -4324,7 +4667,7 @@ def check_round_seven_negative_controls() -> None:
     # exists to pin down, and it is detectable only because the rounding
     # points move -- which again needs inexact partial sums.
     def gemm_one_group(a, b, c):
-        out = [[0] * geom.n for _ in range(geom.m)]
+        out = [row[:] for row in c]
         for i in range(geom.m):
             for j in range(geom.n):
                 terms = [_fpw_mul_exact(a[i][k], fa, b[j][k], fb)
@@ -4342,6 +4685,171 @@ def check_round_seven_negative_controls() -> None:
     assert caught, (
         "collapsing LAMBDA*LMUL groups into one is undetectable -- the "
         "disclosed G would then be unobservable and the control has no teeth")
+
+
+def check_round_seven_nan_controls() -> None:
+    """NaN and infinity propagation, and three sabotages of it with teeth.
+
+    Not blocked by the OCP documents: binary16, bfloat16, binary32 and
+    binary64 all carry infinities and NaNs, so every rule the specification
+    states about special values is reachable in the three cells round seven
+    implements.  The rules exercised here are:
+
+    * spec 1839-1841 -- zero times infinity is an invalid operation
+      producing an internal NaN;
+    * spec 1846-1849 -- adding infinities of opposite signs likewise;
+    * spec 1872-1878 -- any NaN a shared helper materialises in a concrete
+      format is the *default* NaN for that format, so NaN payloads never
+      propagate and a bitwise compare is the right compare.
+
+    Each control below names the case that detects it and asserts the
+    detection, and each is checked to be silent on cases where it provably
+    cannot matter -- the discipline round six's two dead controls skipped.
+    """
+    fa, fb = fp_format("binary16"), fp_format("bfloat16")
+    fc = fp_format("binary32")
+    geom = next(g for g in fpw_legal_configs(256, full_vl_only=True)
+                if (g.w, g.sew) == (2, 32) and g.lam * g.lmul > 1
+                and g.emul_c != 16)
+    geom.validate()
+    inf_a = ((1 << fa.ebits) - 1) << (fa.prec - 1)
+    nan_a = fp_default_nan(fa.width, fa.name)
+    zero_b = 0
+    one_a = fpf_round(Fraction(1), fa, FP_FRM)
+    one_b = fpf_round(Fraction(1), fb, FP_FRM)
+    nan_c = fp_default_nan(fc.width, fc.name)
+
+    def tile(v, rows, cols):
+        return [[v] * cols for _ in range(rows)]
+
+    # C tiles span the physical width; A spans K_eff and B spans K_eff too.
+    cn = geom.n_max
+
+    # --- the rules themselves -------------------------------------------
+    # 0 x inf -> default NaN, and it poisons the whole output element.
+    a = tile(inf_a, geom.m, geom.k_eff)
+    b = tile(zero_b, geom.n, geom.k_eff)
+    c = tile(0, geom.m, cn)
+    out = fpw_reference_gemm(geom, a, b, c, fa, fb, fc)
+    assert all(v == nan_c for row in out for v in row), hex(out[0][0])
+
+    # A NaN operand propagates as the *default* NaN, payload discarded.
+    noisy = nan_a | 0x1                       # a different NaN payload
+    assert fpf_is_nan(noisy, fa)
+    a2 = tile(noisy, geom.m, geom.k_eff)
+    b2 = tile(one_b, geom.n, geom.k_eff)
+    out2 = fpw_reference_gemm(geom, a2, b2, c, fa, fb, fc)
+    assert all(v == nan_c for row in out2 for v in row), hex(out2[0][0])
+
+    # +inf + -inf -> default NaN (two groups, opposite signs).
+    assert geom.lam * geom.lmul >= 2
+    a3 = [[inf_a] * geom.k_eff for _ in range(geom.m)]
+    b3 = [[one_b] * geom.k_eff for _ in range(geom.n)]
+    for row in a3:                            # flip the sign of group 1
+        for k in range(geom.w, 2 * geom.w):
+            row[k] = inf_a | (1 << (fa.width - 1))
+    out3 = fpw_reference_gemm(geom, a3, b3, c, fa, fb, fc)
+    assert all(v == nan_c for row in out3 for v in row), hex(out3[0][0])
+
+    # A NaN already in C stays NaN whatever is accumulated into it.
+    out4 = fpw_reference_gemm(geom, tile(one_a, geom.m, geom.k_eff), b3,
+                              tile(nan_c, geom.m, cn), fa, fb, fc)
+    assert all(v == nan_c for row in out4 for v in row)
+
+    # --- control 4: NaN payload propagated instead of canonicalised ------
+    # Sabotage: return the operand's NaN bits rather than fp_defaultNaN.
+    # Detected on the noisy-payload case above, and provably NOT detectable
+    # on a case whose NaN is already canonical -- which is why the control
+    # must be scored on the noisy case specifically.
+    def gemm_payload(a_, b_, c_):
+        out_ = [[0] * geom.n for _ in range(geom.m)]
+        for i in range(geom.m):
+            for j in range(geom.n):
+                poison = next((a_[i][k] for k in range(geom.k_eff)
+                               if fpf_is_nan(a_[i][k], fa)), None)
+                if poison is not None:
+                    # widen the payload into fmt_C the naive way
+                    out_[i][j] = nan_c | (poison & 0xF)
+                else:
+                    out_[i][j] = fpw_reference_gemm(
+                        geom, a_, b_, c_, fa, fb, fc)[i][j]
+        return out_
+
+    assert fpw_reference_gemm(geom, a2, b2, c, fa, fb, fc) != \
+        gemm_payload(a2, b2, c), (
+            "payload propagation is undetectable on the noisy-NaN case -- "
+            "the control has no teeth")
+    # ... and silent where the payload happens to be canonical already,
+    # which is exactly why the operand pool must contain a non-canonical NaN.
+    a_canon = tile(nan_a, geom.m, geom.k_eff)
+    assert fpw_reference_gemm(geom, a_canon, b2, c, fa, fb, fc) == \
+        gemm_payload(a_canon, b2, c)
+
+    # --- control 5: 0 x inf treated as 0 ---------------------------------
+    # Sabotage: return zero for an infinity-times-zero product instead of
+    # raising invalid and producing NaN.  Detected on the first case above.
+    def gemm_zero_times_inf(a_, b_, c_):
+        out_ = [row[:] for row in c_]
+        for i in range(geom.m):
+            for j in range(geom.n):
+                acc = c_[i][j]
+                for g in range(geom.lam * geom.lmul):
+                    terms = []
+                    for k in range(g * geom.w, (g + 1) * geom.w):
+                        t = _fpw_mul_exact(a_[i][k], fa, b_[j][k], fb)
+                        ka, _sa, va = fpf_unpack(a_[i][k], fa)
+                        kb, _sb, vb = fpf_unpack(b_[j][k], fb)
+                        if {ka, kb} == {"inf", "num"} and 0 in (va, vb):
+                            t = ("num", Fraction(0))
+                        terms.append(t)
+                    acc = _fpw_add_into(acc, _fpw_reround(
+                        _fpw_sum_exact(terms), fc), fc)
+                out_[i][j] = acc
+        return out_
+
+    assert fpw_reference_gemm(geom, a, b, c, fa, fb, fc) != \
+        gemm_zero_times_inf(a, b, c), (
+            "0 x inf -> 0 is undetectable -- the control has no teeth")
+    # Silent where no operand is infinite, so it cannot fire spuriously on
+    # the ordinary population and mask itself as a general arithmetic break.
+    rng = random.Random(3)
+    finite, _b2, _c2 = fpw_exact_case(geom, (fa, fb, fc), rng)
+    assert fpw_reference_gemm(geom, finite, _b2, _c2, fa, fb, fc) == \
+        gemm_zero_times_inf(finite, _b2, _c2)
+
+    # --- control 6: inf - inf treated as inf -----------------------------
+    # Sabotage: keep the first infinity's sign instead of producing NaN.
+    # Detected on the opposite-signs case; silent on the same-signs one,
+    # which is the pair that proves the control is about cancellation and
+    # not merely about infinities being present.
+    def gemm_inf_keeps_sign(a_, b_, c_):
+        out_ = [row[:] for row in c_]
+        for i in range(geom.m):
+            for j in range(geom.n):
+                acc = c_[i][j]
+                for g in range(geom.lam * geom.lmul):
+                    terms = [_fpw_mul_exact(a_[i][k], fa, b_[j][k], fb)
+                             for k in range(g * geom.w, (g + 1) * geom.w)]
+                    infs = [t for t in terms if t[0] == "inf"]
+                    s = (("inf", infs[0][1]) if infs
+                         else _fpw_sum_exact(terms))
+                    acc_k, acc_s, _ = fpf_unpack(acc, fc)
+                    if acc_k == "inf" and s[0] == "inf":
+                        acc = _fpw_materialise(("inf", acc_s), fc)
+                    else:
+                        acc = _fpw_add_into(acc, _fpw_reround(s, fc), fc)
+                out_[i][j] = acc
+        return out_
+
+    assert fpw_reference_gemm(geom, a3, b3, c, fa, fb, fc) != \
+        gemm_inf_keeps_sign(a3, b3, c), (
+            "inf + -inf -> inf is undetectable -- the control has no teeth")
+    same = [[inf_a] * geom.k_eff for _ in range(geom.m)]
+    assert fpw_reference_gemm(geom, same, b3, c, fa, fb, fc) == \
+        gemm_inf_keeps_sign(same, b3, c), (
+            "the same-sign case must not distinguish them; if it does, the "
+            "control is firing on the presence of infinity rather than on "
+            "cancellation")
 
 
 def check_round_seven_golden_bytes() -> None:
@@ -4491,7 +4999,7 @@ def check_round_seven_mx_applicability() -> None:
     """
     for (w, sew), (eew, rows) in FP_CELLS.items():
         for key, (fa, fb, _fc, mx) in rows.items():
-            narrow = fa in OCP_PENDING_FORMATS and fb in OCP_PENDING_FORMATS
+            narrow = fa in OFP_FORMATS and fb in OFP_FORMATS
             # Necessary, not sufficient: a wide-input row is never MX.
             if not narrow:
                 assert not mx, (w, sew, key)
@@ -4520,19 +5028,14 @@ def check_round_seven_mx_applicability() -> None:
 
 
 def check_round_seven_ocp_gate() -> None:
-    """The three OFP formats must refuse to be modelled, loudly and by name.
+    """The formats whose document is missing must refuse, loudly and by name.
 
-    This is the check that keeps the round honest while the OCP documents
-    are missing.  It asserts the *absence* of a definition, so that nobody
-    can quietly populate E4M3 from a half-remembered IEEE analogy and have
-    the suite go green: filling the rows in without deleting this check
-    fails here first.
-
-    When the documents land, the edit is: populate FP_FORMATS_BY_NAME, empty
-    OCP_PENDING_FORMATS, and replace this check with one that exercises the
-    encodings against the worked values the documents state.
+    Round seven asserted this for all three OFP formats.  Round eight has the
+    OCP OFP8 v1.0 document, so E4M3 and E5M2 moved out; E2M1 (OCP MX v1.0,
+    still not on disk) must keep refusing, and every cell that touches it
+    must stay unjudgeable.  Filling E2M1 in without the document fails here.
     """
-    assert set(OCP_PENDING_FORMATS) == {"e4m3", "e5m2", "e2m1"}
+    assert set(OCP_PENDING_FORMATS) == {"e2m1"}, sorted(OCP_PENDING_FORMATS)
     for fmt in OCP_PENDING_FORMATS:
         assert fmt not in FP_FORMATS_BY_NAME, (
             f"{fmt} has been populated but OCP_PENDING_FORMATS still lists "
@@ -4547,18 +5050,38 @@ def check_round_seven_ocp_gate() -> None:
             raise AssertionError(f"fp_fields({width}, {fmt!r}) must refuse")
         else:
             raise AssertionError(f"{fmt} never raised OCPSpecUnavailable")
+        try:
+            fp_format(fmt)
+        except OCPSpecUnavailable:
+            pass
+        else:
+            raise AssertionError(f"fp_format({fmt!r}) must refuse")
+    # OFP8 is resolved, but only through the descriptor helpers: the
+    # IEEE-shaped fp_fields path must refuse it rather than misread E4M3.
+    for fmt in ("e4m3", "e5m2"):
+        assert FP_FORMAT_TABLE[fmt].resolved, fmt
+        assert fmt not in FP_FORMATS_BY_NAME, fmt
+        try:
+            fp_fields(8, fmt)
+        except ValueError:
+            continue
+        raise AssertionError(f"fp_fields(8, {fmt!r}) must refuse")
 
-    # Every round-seven cell whose inputs or accumulator is a pending format
-    # is therefore unjudgeable today.  Count them, so that the number in the
-    # round-seven report is derived rather than asserted by hand.
+    # Every cell whose inputs or accumulator is a pending format is
+    # unjudgeable.  Derived, so the report's number is not hand-asserted.
     blocked = [(w, sew) for (w, sew), (_e, rows) in FP_CELLS.items()
                if any(f in OCP_PENDING_FORMATS
                       for row in rows.values() for f in row[:3])]
-    assert sorted(blocked) == [(2, 8), (2, 16), (4, 16), (4, 32),
-                               (8, 32), (8, 64)], blocked
-    # ... and the three that are not: FP16/BF16 and FP32 inputs only.
+    assert sorted(blocked) == [(2, 8), (4, 16), (8, 32)], blocked
     clear = sorted(set(FP_CELLS) - set(blocked))
-    assert clear == [(2, 32), (2, 64), (4, 64)], clear
+    assert clear == sorted(FPW_ROUND_SEVEN_CELLS + FPW_ROUND_EIGHT_CELLS), \
+        clear
+    for cell in blocked:
+        try:
+            fpw_rows(*cell)
+        except OCPSpecUnavailable:
+            continue
+        raise AssertionError(f"{cell} resolved without OCP MX")
 
     # The width-keyed fallback must not become a back door.  fp_fields with
     # fmt=None models binary32/binary64 only, so an E4M3 accumulator cannot
@@ -4590,6 +5113,362 @@ def check_round_seven_geometry() -> None:
                    for g in ime_legal_configs(256, kinds=("int", "fp", "mx")))
 
 
+# --- round eight: OFP8 (E4M3 / E5M2) judges -------------------------------
+
+def _ocp_ofp8_table(name: str):
+    """All 256 codes of an OFP8 format, built straight from the OCP formulas.
+
+    Deliberately independent of FpFormat, _fpf_unpack_generic and every
+    helper above: the constants are typed in from OCP OFP8 v1.0 -- sec. 4.2
+    (p.11: E4M3 4 exponent bits, 3 mantissa bits, bias 7; E5M2 5, 2, 15),
+    sec. 5.1 (p.12: the normal and subnormal value formulas, "E4M3 ... does
+    not represent infinities and uses only two bit patterns for NaN") and
+    Table 2 (p.13: E4M3 NaN S.1111.111; E5M2 Inf S.11111.00, NaN
+    S.11111.{01,10,11}).  Returns code -> ("nan"|"inf"|"num", sign, value).
+    """
+    ebits, mbits, bias = {"e4m3": (4, 3, 7), "e5m2": (5, 2, 15)}[name]
+    out = {}
+    for code in range(256):
+        s = code >> 7
+        e = (code >> mbits) & ((1 << ebits) - 1)
+        m = code & ((1 << mbits) - 1)
+        if name == "e4m3" and e == 15 and m == 7:
+            out[code] = ("nan", s, Fraction(0))
+        elif name == "e5m2" and e == 31:
+            out[code] = ("inf" if m == 0 else "nan", s, Fraction(0))
+        elif e == 0:
+            out[code] = ("num", s, Fraction(2) ** (1 - bias)
+                         * Fraction(m, 2 ** mbits))
+        else:
+            out[code] = ("num", s, Fraction(2) ** (e - bias)
+                         * (1 + Fraction(m, 2 ** mbits)))
+    return out
+
+
+def check_round_eight_ofp8_decode() -> None:
+    """Every one of the 512 OFP8 codes against the OCP formulas, and anchors.
+
+    1. fpf_unpack (the path the reference GEMM uses) equals the independent
+       table for all 256 codes of each format.
+    2. The table itself reproduces OCP Table 1 / Table 2's stated values, so
+       a typo in the independent table cannot silently agree with a typo in
+       the descriptor.
+    3. The generic decoder is IEEE-correct where it should be: on all 65536
+       binary16 and bfloat16 codes it equals fp_unpack.
+    """
+    for name in ("e4m3", "e5m2"):
+        fmt = fp_format(name)
+        table = _ocp_ofp8_table(name)
+        for code in range(256):
+            assert fpf_unpack(code, fmt) == table[code], (
+                name, hex(code), fpf_unpack(code, fmt), table[code])
+            assert fpf_is_nan(code, fmt) == (table[code][0] == "nan")
+            assert fpf_is_inf(code, fmt) == (table[code][0] == "inf")
+    e4, e5 = _ocp_ofp8_table("e4m3"), _ocp_ofp8_table("e5m2")
+    # OCP Table 2, value by value.
+    assert e4[0x7E] == ("num", 0, Fraction(448))            # max normal
+    assert e4[0xFE] == ("num", 1, Fraction(448))
+    assert e4[0x08] == ("num", 0, Fraction(1, 2 ** 6))      # min normal
+    assert e4[0x07] == ("num", 0, Fraction(7, 8) / 2 ** 6)  # max subnormal
+    assert e4[0x01] == ("num", 0, Fraction(1, 2 ** 9))      # min subnormal
+    assert e4[0x78] == ("num", 0, Fraction(256))            # S.1111.000
+    assert [c for c in e4 if e4[c][0] == "nan"] == [0x7F, 0xFF]
+    assert not [c for c in e4 if e4[c][0] == "inf"]
+    assert e5[0x7B] == ("num", 0, Fraction(57344))
+    assert e5[0x04] == ("num", 0, Fraction(1, 2 ** 14))
+    assert e5[0x03] == ("num", 0, Fraction(3, 4) / 2 ** 14)
+    assert e5[0x01] == ("num", 0, Fraction(1, 2 ** 16))
+    assert [c for c in e5 if e5[c][0] == "inf"] == [0x7C, 0xFC]
+    assert [c for c in e5 if e5[c][0] == "nan"] == [0x7D, 0x7E, 0x7F,
+                                                    0xFD, 0xFE, 0xFF]
+    assert e4[0x00] == ("num", 0, 0) and e4[0x80] == ("num", 1, 0)
+    assert e5[0x00] == ("num", 0, 0) and e5[0x80] == ("num", 1, 0)
+    # Table 2 "Dynamic range": 18 and 32 binades (max normal / min subnormal).
+    assert Fraction(448) / Fraction(1, 2 ** 9) < 2 ** 18 <= \
+        2 * Fraction(448) / Fraction(1, 2 ** 9)
+    assert Fraction(57344) / Fraction(1, 2 ** 16) < 2 ** 32
+    # Table 1: bias / emax / emin, through the descriptor.
+    for name, bias, emax, emin in (("e4m3", 7, 8, -6), ("e5m2", 15, 15, -14)):
+        fmt = fp_format(name)
+        assert fmt.bias == bias, name
+        top = _fpf_unpack_generic(fpf_max_finite(fmt), fmt)[2]
+        assert _floor_log2(top) == emax, name
+        assert 1 - fmt.bias == emin, name
+    # Spec 1400-1405 significand widths agree with OCP's m + hidden bit.
+    assert fp_format("e4m3").prec == 3 + 1 and fp_format("e5m2").prec == 2 + 1
+    # OFP8_DISCLOSURE's default NaNs are NaNs, and positive.
+    for name, pat in OFP8_DISCLOSURE["default_nan"].items():
+        assert _ocp_ofp8_table(name)[pat][:2] == ("nan", 0), name
+        assert fpf_default_nan(fp_format(name)) == pat
+    # 3. The generic path against fp_unpack, exhaustively, for IEEE formats.
+    for ieee in ("binary16", "bfloat16"):
+        probe = replace(FP_FORMAT_TABLE[ieee], name=f"{ieee}_probe")
+        for code in range(1 << 16):
+            want = fp_unpack(code, 16, ieee)
+            assert _fpf_unpack_generic(code, probe) == want, (ieee, code)
+
+
+def check_round_eight_ofp8_round() -> None:
+    """RNE into OFP8 (OCP sec. 5.2.1, Table 3), both overflow modes.
+
+    No round-eight program rounds to OFP8 (every live accumulator is IEEE),
+    so this is the only place the rule is exercised.  It is exercised here
+    so the round that makes Zvvofp8mm / Zvvofp4ofp8mm live inherits a tested
+    rule instead of inventing one.
+    """
+    for name in ("e4m3", "e5m2"):
+        fmt = fp_format(name)
+        sat = replace(fmt, overflow="saturate")
+        table = _ocp_ofp8_table(name)
+        finite = sorted({(v if s == 0 else -v, c) for c, (k, s, v)
+                         in table.items() if k == "num" and v != 0})
+        # Every finite code round-trips, in both modes.
+        for code, (kind, sign, val) in table.items():
+            if kind != "num":
+                continue
+            v = -val if sign else val
+            if val == 0:
+                assert fpf_round(v, fmt) == 0     # Fraction has no -0
+                continue
+            assert fpf_round(v, fmt) == code, (name, hex(code))
+            assert fpf_round(v, sat) == code, (name, hex(code))
+        # Midpoints between adjacent positive codes round to the even one.
+        pos = [(v, c) for v, c in finite if v > 0]
+        for (v0, c0), (v1, c1) in zip(pos, pos[1:]):
+            mid = (v0 + v1) / 2
+            even = c0 if c0 % 2 == 0 else c1
+            assert fpf_round(mid, fmt) == even, (name, hex(c0), hex(c1))
+            assert fpf_round(-mid, fmt) == even | 0x80
+        # Below half the minimum subnormal: signed zero.  At exactly half:
+        # tie to even, which is zero.  Just above half: min subnormal.
+        tiny = table[0x01][2]
+        assert fpf_round(tiny / 2, fmt) == 0x00
+        assert fpf_round(-tiny / 2, fmt) == 0x80
+        assert fpf_round(tiny / 2 + tiny / 64, fmt) == 0x01
+        # Overflow (OCP Table 3, "greater than max OFP8 magnitude").
+        mx_code = fpf_max_finite(fmt)
+        mx = table[mx_code][2]
+        ulp = mx - table[mx_code - 1][2]
+        # max + half an ulp is a tie: E4M3 max 0x7E (mantissa 110) is even,
+        # so it stays; E5M2 max 0x7B (mantissa 11) is odd, so the tie goes UP
+        # to 2^16, above max -> overflow (NONSAT: +Inf).
+        assert fpf_round(mx + ulp / 2, fmt) == (
+            0x7E if name == "e4m3" else 0x7C), name
+        assert fpf_round(mx + ulp / 2, sat) == mx_code, name
+        big = mx + ulp                           # rounds above max
+        if name == "e4m3":
+            assert fpf_round(big, fmt) == 0x7F         # NONSAT -> NaN
+            assert fpf_round(-big, fmt) == 0x7F        # default NaN, sign 0
+        else:
+            assert fpf_round(big, fmt) == 0x7C         # NONSAT -> +Inf
+            assert fpf_round(-big, fmt) == 0xFC
+        assert fpf_round(big, sat) == mx_code          # SAT -> max normal
+        assert fpf_round(-big, sat) == mx_code | 0x80
+        # Inf source (Table 3 "+-Inf" row), through the materialiser.
+        assert _fpw_materialise(("inf", 0), sat) == mx_code
+        assert _fpw_materialise(("inf", 1), sat) == mx_code | 0x80
+        assert _fpw_materialise(("inf", 1), fmt) == (
+            0x7F if name == "e4m3" else 0xFC)
+        assert _fpw_materialise(("nan",), fmt) == \
+            OFP8_DISCLOSURE["default_nan"][name]
+    # E4M3's 464 = 1.8125 * 2^8 is a tie between 448 (mantissa 110, even)
+    # and 480 (111, odd, and above max): it rounds DOWN to 448 in both modes.
+    assert fpf_round(Fraction(464), fp_format("e4m3")) == 0x7E
+    assert fpf_round(Fraction(480), fp_format("e4m3")) == 0x7F
+
+
+def _live_geom(cell, need_groups=2, need_m=4):
+    return next(g for g in fpw_legal_configs(256, full_vl_only=True)
+                if (g.w, g.sew) == cell and g.emul_c != 16
+                and g.lam * g.lmul >= need_groups and g.m >= need_m)
+
+
+def _with_decoder(bad, fn):
+    """Run *fn* with _fpf_unpack_generic rebound to *bad* (a sabotage)."""
+    g = globals()
+    original = g["_fpf_unpack_generic"]
+    g["_fpf_unpack_generic"] = bad
+    try:
+        return fn()
+    finally:
+        g["_fpf_unpack_generic"] = original
+
+
+def check_round_eight_negative_controls() -> None:
+    """Every OFP8 sabotage must be caught on cases the live tiers generate.
+
+    Round six shipped controls that could not fail, so each one here is run
+    against the generators the directed suite actually uses (fpw_case for
+    golden, fpw_special_case for special) on a live round-eight geometry, and
+    the detection is asserted.  Where a control is provably invisible to a
+    tier (the exact tier's small-integer operands), that is asserted too, so
+    the report says which tier carries which check.
+    """
+    rng = random.Random(8008)
+    e4, e5 = fp_format("e4m3"), fp_format("e5m2")
+    f32 = fp_format("binary32")
+    geom = _live_geom((4, 32))
+    geom.validate()
+    good = _fpf_unpack_generic
+
+    def detects(bad, row, make, tries=12):
+        hits = 0
+        for _ in range(tries):
+            a, b, c = make(geom, row, rng)
+            want = fpw_reference_gemm(geom, a, b, c, *row)
+            got = _with_decoder(bad, lambda: fpw_reference_gemm(
+                geom, a, b, c, *row))
+            hits += want != got
+        return hits
+
+    def e4m3_only(sabotage):
+        def bad(bits, fmt):
+            return sabotage(bits, fmt) if fmt.name == "e4m3" else \
+                good(bits, fmt)
+        return bad
+
+    # 1. E4M3 <-> E5M2 swapped (the altfmt_A/B polarity inverted).
+    swap = lambda bits, fmt: good(bits, e5 if fmt.name == "e4m3" else e4)
+    for row in ((e4, e4, f32), (e5, e5, f32), (e4, e5, f32)):
+        assert detects(swap, row, fpw_case), ("swap", row)
+    # 2. E4M3 read IEEE-shaped: exponent field 15 is Inf (M=0) / NaN (M!=0),
+    #    so 0x7E and 0xFE (+-448) become NaN and 0x78 (256) becomes Inf.
+    ieee_e4 = replace(e4, has_inf=True, nan_rule="ieee", name="e4m3_ieee")
+    as_ieee = e4m3_only(lambda bits, fmt: good(bits, ieee_e4))
+    assert as_ieee(0x7E, e4)[0] == "nan" and as_ieee(0x78, e4)[0] == "inf"
+    assert detects(as_ieee, (e4, e4, f32), fpw_case)
+    assert detects(as_ieee, (e4, e4, f32), fpw_special_case)
+    # 3. E4M3 0x7F / 0xFF read as +-Inf instead of NaN.
+    def seven_f_inf(bits, fmt):
+        if bits & 0x7F == 0x7F:
+            return "inf", bits >> 7, Fraction(0)
+        return good(bits, fmt)
+    assert detects(e4m3_only(seven_f_inf), (e4, e4, f32), fpw_special_case)
+    # 4. Wrong bias (off by one either way), per format.
+    for fmt in (e4, e5):
+        for delta in (-1, 1):
+            def bad(bits, f, fmt=fmt, delta=delta):
+                k, s, v = good(bits, f)
+                if f.name == fmt.name and k == "num":
+                    v = v * _pow2(-delta)
+                return k, s, v
+            assert detects(bad, (fmt, fmt, f32), fpw_case), (fmt.name, delta)
+    # 5. Subnormal inputs flushed to zero.  Carried by the golden pool's
+    #    edge operands; provably invisible to the exact tier (integers).
+    def flush(bits, fmt):
+        k, s, v = good(bits, fmt)
+        if k == "num" and (bits >> (fmt.prec - 1)) & fmt.emax == 0:
+            return k, s, Fraction(0)
+        return k, s, v
+    for fmt in (e4, e5):
+        row = (fmt, fmt, f32)
+        assert detects(flush, row, fpw_case), fmt.name
+        assert detects(flush, row, fpw_special_case), fmt.name
+        assert not detects(flush, row, fpw_exact_case), (
+            f"{fmt.name}: the exact tier has only integer operands, so a "
+            f"subnormal flush cannot be visible there")
+    # 6. A/B formats swapped on a mixed row (E4M3 x E5M2 decoded as
+    #    E5M2 x E4M3) -- the altfmt_A / altfmt_B wiring crossed.
+    caught = 0
+    for _ in range(12):
+        a, b, c = fpw_case(geom, (e4, e5, f32), rng)
+        caught += (fpw_reference_gemm(geom, a, b, c, e4, e5, f32)
+                   != fpw_reference_gemm(geom, a, b, c, e5, e4, f32))
+    assert caught, "A/B format swap on a mixed row has no teeth"
+    # ... and on a same-format row the same swap is the identity, which is
+    # why the control is scored on mixed rows only.
+    a, b, c = fpw_case(geom, (e4, e4, f32), rng)
+    assert fpw_reference_gemm(geom, a, b, c, e4, e4, f32) == \
+        fpw_reference_gemm(geom, a, b, c, e4, e4, f32)
+    # 7. Saturating vs non-saturating overflow.  No live cell rounds to
+    #    OFP8, so this is scored on the reference with an OFP8 accumulator
+    #    -- the Zvvofp8mm / Zvvofp4ofp8mm shape -- and recorded as such.
+    for fmt in (e4, e5):
+        sat = replace(fmt, overflow="saturate")
+        big = fpf_max_finite(fmt)
+        a = [[big] * geom.k_eff for _ in range(geom.m)]
+        b = [[big] * geom.k_eff for _ in range(geom.n)]
+        c = [[0] * geom.n_max for _ in range(geom.m)]
+        nonsat_out = fpw_reference_gemm(geom, a, b, c, fmt, fmt, fmt)
+        sat_out = fpw_reference_gemm(geom, a, b, c, fmt, fmt, sat)
+        assert nonsat_out != sat_out, fmt.name
+        assert sat_out[0][0] == big, (fmt.name, hex(sat_out[0][0]))
+        assert nonsat_out[0][0] == (0x7F if fmt.name == "e4m3" else 0x7C)
+    # And no live round-eight row has an OFP8 accumulator, which is why 7
+    # cannot be scored on a program.
+    for cell in FPW_ROUND_EIGHT_CELLS:
+        for row in fpw_rows(*cell).values():
+            assert row[2].name not in OFP_FORMATS, (cell, row[2].name)
+
+
+def check_round_eight_nan_controls() -> None:
+    """OFP8 special values through the reduction, and sabotages of them.
+
+    The rules: an OFP8 NaN operand (E4M3 S.1111.111, any E5M2 S.11111.xx
+    with xx != 00) yields fmt_C's *default* NaN (spec 1872-1878); E5M2 Inf
+    times zero and Inf + -Inf are invalid -> default NaN (spec 1833-1845);
+    E4M3 has no Inf, so +-448 stays finite and overflows only in fmt_C.
+    """
+    e4, e5 = fp_format("e4m3"), fp_format("e5m2")
+    f16, f32 = fp_format("binary16"), fp_format("binary32")
+    geom = _live_geom((4, 32))
+    nan32 = fpf_default_nan(f32)
+    one4 = fpf_round(Fraction(1), e4)
+    one5 = fpf_round(Fraction(1), e5)
+    zero = [[0] * geom.n_max for _ in range(geom.m)]
+
+    def run(av, fa, bv, fb, fc=f32, c=None):
+        a = [[av] * geom.k_eff for _ in range(geom.m)]
+        b = [[bv] * geom.k_eff for _ in range(geom.n)]
+        return fpw_reference_gemm(geom, a, b, c or zero, fa, fb, fc)
+
+    for nan in (0x7F, 0xFF):
+        assert run(nan, e4, one5, e5)[0][0] == nan32
+    for nan in (0x7D, 0x7E, 0x7F, 0xFD, 0xFE, 0xFF):
+        assert run(one4, e4, nan, e5)[0][0] == nan32
+    assert run(0x7C, e5, 0x00, e4)[0][0] == nan32          # Inf x 0
+    assert run(0x7C, e5, one4, e4)[0][0] == 0x7F800000     # +Inf
+    # +-448: finite.  In binary32 exactly 448*448*K_eff; in binary16 the
+    # first group's product 200704 overflows to +Inf -- not NaN.
+    out = run(0x7E, e4, 0x7E, e4)
+    assert out[0][0] == fpf_round(Fraction(448 * 448 * geom.k_eff), f32)
+    g16 = _live_geom((2, 16))
+    a = [[0x7E] * g16.k_eff for _ in range(g16.m)]
+    b = [[0x7E] * g16.k_eff for _ in range(g16.n)]
+    c = [[0] * g16.n_max for _ in range(g16.m)]
+    assert fpw_reference_gemm(g16, a, b, c, e4, e4, f16)[0][0] == 0x7C00
+    # Special tier: row 0 (A NaN) and column N-1 (B NaN) are default NaN,
+    # row 1 (+-448) and row 4 (subnormals) are not.
+    rng = random.Random(88)
+    for cell in FPW_ROUND_EIGHT_CELLS:
+        sg = _live_geom(cell)
+        for row in fpw_rows(*cell).values():
+            a, b, c = fpw_special_case(sg, row, rng)
+            out = fpw_reference_gemm(sg, a, b, c, *row)
+            dn = fpf_default_nan(row[2])
+            assert all(out[0][j] == dn for j in range(sg.n)), (cell, row)
+            assert all(out[i][sg.n - 1] == dn for i in range(sg.m))
+            if row[0].has_inf:                      # E5M2 A: Inf - Inf
+                assert all(out[3][j] == dn for j in range(sg.n)), (cell, row)
+    # Sabotage: payload propagated (E5M2 0xFD kept as-is, widened).  Must be
+    # caught on the special tier, whose A NaN is deliberately non-canonical.
+    sg = _live_geom((4, 32))
+    a, b, c = fpw_special_case(sg, (e5, e5, f32), rng)
+    assert a[0][0] == 0xFD
+    good = fpw_reference_gemm(sg, a, b, c, e5, e5, f32)
+    bad = [r[:] for r in good]
+    bad[0][0] = 0xFF800000 | 0x1                      # "propagated" payload
+    assert good != bad and good[0][0] == nan32
+    # Sabotage: E5M2 Inf read as NaN.  Caught by row 2 of the special tier.
+    orig = _fpf_unpack_generic
+    def inf_as_nan(bits, fmt):
+        k, s, v = orig(bits, fmt)
+        return ("nan", s, v) if k == "inf" else (k, s, v)
+    got = _with_decoder(inf_as_nan,
+                        lambda: fpw_reference_gemm(sg, a, b, c, e5, e5, f32))
+    assert got != good, "E5M2 Inf -> NaN sabotage has no teeth"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256,
@@ -4618,12 +5497,17 @@ def main() -> int:
                   check_round_seven_gemm,
                   check_round_seven_tier_overlap,
                   check_round_seven_negative_controls,
+                  check_round_seven_nan_controls,
                   check_round_seven_golden_bytes,
                   check_round_seven_encoding_map,
                   check_round_seven_mx_lmul_table,
                   check_round_seven_mx_applicability,
                   check_round_seven_ocp_gate,
-                  check_round_seven_geometry):
+                  check_round_seven_geometry,
+                  check_round_eight_ofp8_decode,
+                  check_round_eight_ofp8_round,
+                  check_round_eight_negative_controls,
+                  check_round_eight_nan_controls):
         check()
         print(f"  ok  {check.__name__}")
 

@@ -3000,6 +3000,519 @@ def mx_directed_tiers(vlen: int, insns: Sequence[str], seed: int = 0
     return out
 
 
+# --- round seven: the widening floating-point programs --------------------
+#
+# Scope note, and it is a scope decision rather than a coverage one.  Round
+# seven implements the five Zvvm extensions whose element formats this
+# harness can define from the IME specification alone:
+#
+#     Zvvfp16fp32mm  Zvvbf16fp32mm   (W=2, SEW=32)
+#     Zvvfp32fp64mm                  (W=2, SEW=64)
+#     Zvvfp16fp64mm  Zvvbf16fp64mm   (W=4, SEW=64)
+#
+# The Zvvofp* extensions are declared unsupported.  See
+# constants.ROUND_SEVEN_SUPPORTED for the declaration and its reasoning; the
+# machinery that will judge them -- rvv_ref.OCP_PENDING_FORMATS, the
+# format-agnostic gemm, the sub-byte packer -- stays in place and unused.
+#
+# Two tiers, and the split is the whole design:
+#
+#   "golden"  Operands span the full range, including values whose partial
+#             sums are inexact in fmt_C.  Inexactness is round seven's new
+#             risk surface, so this tier must reach it.  Nothing on the DUT
+#             can recompute such a result with baseline rv64imafd, so the
+#             expected image is computed by rvv_ref and embedded as bytes.
+#             That makes the reference model the sole authority for this
+#             tier, which is stated plainly rather than hidden.
+#
+#   "exact"   Operands are small integers, so every product, partial sum and
+#             accumulation is exact and the result is independent of the
+#             disclosed (G, psm, rnd) tuple.  The DUT recomputes it from an
+#             integer dot product and one fcvt, so this tier consults no
+#             floating-point judgement of ours at all.  It is the check on
+#             the golden tier's authority.
+#
+# rvv_ref.check_round_seven_tier_overlap asserts that the two tiers cover the
+# same geometries and the same encoding rows, so a reference-model error that
+# changes an exact case is caught without the model.
+#
+# ROUND EIGHT UPDATE.  The OCP OFP8 v1.0 document is now on disk, so the three
+# OFP8-input cells are live: Zvvofp8fp16mm / Zvvofp8bf16mm (W=2, SEW=16),
+# Zvvofp8fp32mm (W=4, SEW=32) and Zvvofp8fp64mm (W=8, SEW=64 -- the first
+# vf8wmmacc.vv cell).  They add a third tier, "special": golden-bytes
+# programs with OFP8 NaN / Inf / max-normal / subnormal operands planted at
+# fixed positions (rvv_ref.fpw_special_case).  (W=2, SEW=16) has no exact
+# tier: baseline rv64imafd has no fcvt to binary16 or bfloat16.  Every E2M1
+# (OFP4) cell is still unsupported -- OCP MX v1.0 is not on disk -- and so
+# is Zvvofp8mm (vfmmacc.vv, SEW=8), with the other W=1 narrow cells.  See
+# constants.ROUND_EIGHT_SUPPORTED.  Round-seven programs are byte-identical:
+# fpw_directed_tiers walks round seven's cells first with round seven's rng.
+
+
+@dataclass(frozen=True)
+class FpwPlan:
+    """One round-seven program: a geometry, an encoding-map row, a case."""
+    geom: TileGeometry
+    key: tuple                  # (altfmt_A, altfmt_B, altfmt)
+    tier: str                   # "golden" or "exact"
+    a: Matrix
+    b: Matrix
+    c: Matrix
+    tag: str = ""
+
+    @property
+    def row(self):
+        return rvv_ref.fpw_rows(self.geom.w, self.geom.sew)[self.key]
+
+    @property
+    def altfmt(self) -> int:
+        return self.key[2]
+
+    @property
+    def altfmt_a(self) -> int:
+        return 0 if self.key[0] is None else self.key[0]
+
+    @property
+    def altfmt_b(self) -> int:
+        return 0 if self.key[1] is None else self.key[1]
+
+    def describe(self) -> str:
+        fa, fb, fc = self.row
+        mixed = "" if fa.name == fb.name else " MIXED"
+        return (f"{self.geom.describe()} {fa.name}x{fb.name}->{fc.name} "
+                f"altfmt={self.altfmt} tier={self.tier}{mixed}")
+
+
+def _fpw_configure(geom: TileGeometry, *, lmul: int, vl: int, key,
+                   comment: str) -> List[str]:
+    """:func:`_configure` with the three round-seven vtype format bits set.
+
+    Separate from ``_configure`` and from ``_mx_configure`` for the same
+    reason those two are separate from each other: each emits the literal
+    text of a round whose programs must not move.
+
+    All three of ``altfmt_A``, ``altfmt_B`` and ``altfmt`` are set on *every*
+    vsetvl, not only the compute one.  They cannot be reached by
+    vsetvli/vsetivli (the IME pair sits above the vtypei immediate, spec
+    1113-1116), and a program that set them once and then reconfigured for
+    the C transfer would be leaning on retention rules that are not what is
+    under test.
+    """
+    altfmt_a = 0 if key[0] is None else key[0]
+    altfmt_b = 0 if key[1] is None else key[1]
+    word = vtype_value(geom, lmul=lmul, altfmt=key[2],
+                       altfmt_a=altfmt_a, altfmt_b=altfmt_b)
+    return [
+        f"    # {comment}",
+        f"    li    t0, {vl}",
+        f"    li    t1, 0x{word:x}",
+        "    vsetvl x0, t0, t1",
+    ]
+
+
+def _fpw_ime_path(geom: TileGeometry, alloc: VectorAlloc, key) -> List[str]:
+    """The round-one tile sequence at vm=1, with the format bits configured.
+
+    Structurally :func:`_ime_path`: configure for the C transfer, load C,
+    configure for A/B, load both tiles, configure for compute, one
+    multiply-accumulate, configure back, store C.  The multiply-accumulate
+    is emitted at ``vm=1``, which spec 1349-1351 makes the unscaled form of
+    all three widening floating-point mnemonics; ``vm=0`` on the same funct6
+    is the microscaled form, which needs an OFP input format and is
+    therefore out of this round's scope entirely.
+    """
+    lam_imm = 0
+    out: List[str] = ["", "    # ---- IME path (unscaled, vm=1) ----"]
+    out += _fpw_configure(geom, lmul=geom.lmul_c, vl=geom.vl_c_full, key=key,
+                          comment=f"C tile transfer config (LMUL=EMUL_C="
+                                  f"{geom.emul_c}, VL={geom.vl_c_full})")
+    out += _check_lambda_retained(geom)
+    out += [
+        "    la    a0, c_init",
+        f"    li    a1, {geom.m}          # LD = M: row-major M x M block",
+        f"    {ime.insn(geom.load_mnemonic, vd=alloc.c, rs1=RS1_ADDR, rs2=RS2_LD, vm=1, **{'lambda': lam_imm})}"
+        f"    # {geom.load_mnemonic} v{alloc.c}, (a0), a1",
+    ]
+    out += _fpw_configure(geom, lmul=geom.lmul,
+                          vl=geom.lmul * geom.elems_per_reg, key=key,
+                          comment=f"A/B config (LMUL={geom.lmul}, full VL)")
+    for label, base in (("mat_a_tile", alloc.a), ("mat_b_tile", alloc.b)):
+        out += [
+            f"    la    a0, {label}",
+            f"    li    a1, {geom.linesize}",
+            f"    {ime.insn(geom.load_mnemonic, vd=base, rs1=RS1_ADDR, rs2=RS2_LD, vm=1, **{'lambda': lam_imm})}"
+            f"    # {geom.load_mnemonic} v{base}, (a0), a1",
+        ]
+    out += _fpw_configure(geom, lmul=geom.lmul, vl=geom.vl, key=key,
+                          comment=f"compute config (VL={geom.vl} -> "
+                                  f"N={geom.n})")
+    out += [
+        f"    {ime.insn(geom.mnemonic, vd=alloc.c, vs1=alloc.a, vs2=alloc.b, vm=1)}"
+        f"    # {geom.mnemonic} v{alloc.c}, v{alloc.a}, v{alloc.b}",
+    ]
+    out += _fpw_configure(geom, lmul=geom.lmul_c, vl=geom.vl_c_full, key=key,
+                          comment="back to the C tile config to store")
+    out += [
+        "    la    a0, c_ime",
+        f"    li    a1, {geom.m}",
+        f"    {ime.insn(geom.store_mnemonic, vs3=alloc.c, rs1=RS1_ADDR, rs2=RS2_LD, vm=1, **{'lambda': lam_imm})}"
+        f"    # {geom.store_mnemonic} v{alloc.c}, (a0), a1",
+    ]
+    return out
+
+
+#: Scalar integer-to-float conversion, by accumulator width.  Only binary32
+#: and binary64 appear: the exact tier's DUT-side reference needs a baseline
+#: rv64imafd conversion, and there is none to binary16, bfloat16 or OFP8.
+#: That is a real limit on which cells can carry an exact tier, and it is
+#: recorded as a table rather than as an assumption -- see
+#: :func:`fpw_exact_emittable`.
+_FCVT_BY_WIDTH = {32: ("fcvt.s.l", "fsw", "flw"), 64: ("fcvt.d.l", "fsd",
+                                                       "fld")}
+
+
+def fpw_exact_emittable(geom: TileGeometry) -> bool:
+    """Can the DUT recompute this geometry's result without our model?
+
+    True where the accumulator is binary32 or binary64, so that an exact
+    integer dot product converts with one baseline ``fcvt``.  All three
+    currently-resolved cells qualify.  A narrow accumulator would not, which
+    is exactly why the golden tier exists and why it cannot be replaced by
+    this one.
+    """
+    return geom.sew in _FCVT_BY_WIDTH
+
+
+def _fpw_exact_ref_path(plan: "FpwPlan") -> List[str]:
+    """Recompute C on the DUT in integers, then convert once.
+
+    The model-independent half of round seven.  Every A, B and C value in an
+    exact-tier case is a small integer (rvv_ref.fpw_exact_case), so::
+
+        C[i,j] = fcvt( C0[i,j] + sum_k A[i,k] * B[j,k] )
+
+    holds for *any* conforming (G, psm, rnd) tuple: with no rounding point
+    able to round, grouping and partial-sum policy cannot change the answer.
+    The DUT therefore checks itself, and the reference model's floating-point
+    judgement is not consulted at all -- which is the entire point, because
+    the golden tier's expected bytes come from that judgement.
+
+    The integer operand tables are emitted alongside the floating-point tile
+    images.  That is the same data in a second encoding, not a second
+    authority: what stays independent here is the *arithmetic*, which the DUT
+    performs, not the choice of inputs.
+    """
+    geom = plan.geom
+    fcvt, fst, _fld = _FCVT_BY_WIDTH[geom.sew]
+    esz = geom.sew // 8
+    out: List[str] = ["", "    # ---- exact reference (integer dot + fcvt) ----",
+                      "    la    a5, c_rvv"]
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            off = _c_off(geom, i, j) * esz
+            acc = _fpw_int_of(plan.c[i][j], plan.row[2])
+            if j >= geom.n:
+                # Inactive column: the instruction does not write it, so the
+                # expectation is C's entry value carried through unchanged.
+                out += [f"    li    t0, {acc}         # C[{i},{j}] inactive",
+                        f"    li    t1, {off}",
+                        "    add   t2, a5, t1",
+                        f"    {fcvt} ft0, t0",
+                        f"    {fst}   ft0, 0(t2)"]
+                continue
+            for k in range(geom.k_eff):
+                acc += (_fpw_int_of(plan.a[i][k], plan.row[0])
+                        * _fpw_int_of(plan.b[j][k], plan.row[1]))
+            out += [
+                f"    li    t0, {acc}         # C[{i},{j}] exact integer",
+                f"    li    t1, {off}",
+                "    add   t2, a5, t1",
+                f"    {fcvt} ft0, t0",
+                f"    {fst}   ft0, 0(t2)",
+            ]
+    return out
+
+
+def _fpw_int_of(bits: int, fmt) -> int:
+    """The integer an exact-tier operand encodes, or raise.
+
+    Refuses anything that is not an exact integer, so an exact-tier case that
+    silently acquired a fractional or special value fails here rather than
+    producing a DUT reference that disagrees with the architecture for a
+    reason nobody can see.
+    """
+    kind, sign, mag = rvv_ref.fpf_unpack(bits, fmt)
+    if kind != "num" or mag.denominator != 1:
+        raise ValueError(
+            f"exact-tier operand 0x{bits:x} in {fmt.name} is not an integer "
+            f"({kind}, {mag}); fpw_exact_case must produce integers only")
+    return int(-mag if sign else mag)
+
+
+def _fpw_tile_data(label: str, mat: Matrix, geom: TileGeometry) -> List[str]:
+    """A or B in tile-load memory layout, at the logical element width.
+
+    Goes through :func:`rvv_ref.fpw_pack_elements` rather than emitting a
+    width-keyed assembler directive directly, so that the sub-byte cells --
+    which this round does not build -- arrive to a path that already packs
+    them.  At EEW_AB >= 8 the packer is a plain little-endian widening and
+    the emitted bytes are what ``_matrix_data`` would have produced.
+    """
+    # Packing depends on the element *width*, not on which of the two
+    # formats a mixed row assigns to A -- E4M3 and E5M2 pack identically, and
+    # so do binary16 and bfloat16.  So the descriptor is synthesised from the
+    # cell's EEW rather than looked up per row, which also keeps a mixed row
+    # from appearing to need two different packers.
+    eew = rvv_ref.fpw_eew_ab(geom.w, geom.sew)
+    sub_byte = eew < 8
+    width = geom.ab_linesize
+    buf = rvv_ref.tile_layout_buffer(mat, width, geom)
+    chunked = [buf[i:i + width] for i in range(0, len(buf), width)]
+    if sub_byte:
+        nib = rvv_ref.FpFormat(f"pack{eew}", eew, 2, 2, False, "none", "none")
+        packed = [rvv_ref.fpw_pack_elements(line, nib) for line in chunked]
+        assert len(packed[0]) == geom.linesize * geom.sew // 8, geom.describe()
+        return _matrix_data(label, packed, 8)
+    return _matrix_data(label, chunked, geom.eew_ab)
+
+
+def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
+    """One round-seven program, in whichever of the two tiers *plan* names."""
+    geom = plan.geom
+    geom.validate()
+    if geom.kind != "fpw":
+        raise ValueError(f"{geom.describe()}: emit_fpw_test needs kind='fpw'")
+    if geom.emul_c == 16:
+        raise ValueError(
+            f"{geom.describe()}: EMUL_C=16 has no single-instruction C tile "
+            f"transfer (LMUL=16 is not a legal vtype)")
+    fmt_a, fmt_b, fmt_c = plan.row
+    rvv_ref.fpw_check_legality(geom.w, geom.lmul, geom.sew, geom.lam, 0, 1)
+    if plan.tier not in ("golden", "exact", "special"):
+        raise ValueError(f"unknown tier {plan.tier!r}")
+    if plan.tier == "exact" and not fpw_exact_emittable(geom):
+        raise ValueError(
+            f"{geom.describe()}: no baseline fcvt to {fmt_c.name}, so the "
+            f"exact tier cannot recompute this geometry on the DUT")
+    alloc = VectorAlloc.allocate(geom)
+    width = geom.sew
+    desc = plan.describe()
+
+    head = [
+        f"# {name}: {desc}",
+        "#",
+        "# Generated by ime_tests.py from rvv_ref.py -- do not edit by hand,",
+        "# and do not edit rvv_ref.py: it is the judge, not the defendant.",
+        "#",
+        f"# Round {_fpw_round_word(geom)}, tier {plan.tier}: {plan.tag}.",
+        f"# Encoding-map row (spec 7288-7370): altfmt_A={plan.key[0]} "
+        f"altfmt_B={plan.key[1]} altfmt={plan.key[2]} -> "
+        f"{fmt_a.name} x {fmt_b.name} -> {fmt_c.name}.",
+        f"# Disclosure: G={rvv_ref.FP_DISCLOSURE['G']} "
+        f"psm={rvv_ref.FP_DISCLOSURE['psm']} "
+        f"rnd={rvv_ref.FP_DISCLOSURE['rnd']} -- "
+        f"{geom.lam * geom.lmul} group(s) of W={geom.w} products, each "
+        f"summed exactly, rounded to {fmt_c.name}, then accumulated.",
+        "#",
+    ]
+    if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_EIGHT_CELLS:
+        # Round eight only: name the document the OFP8 inputs are defined by.
+        # Round-seven programs do not get these lines (byte-identity).
+        head += [
+            "# OFP8 inputs per OCP OFP8 v1.0 (specs/ime/ocp-ofp8-v1.0.txt):",
+            "#   E4M3 bias 7, no Inf, NaN only S.1111.111 (S.1111.110 = 448);",
+            "#   E5M2 bias 15, Inf S.11111.00, NaN S.11111.{01,10,11}.",
+            "#   altfmt_A/altfmt_B = 0 -> E4M3, 1 -> E5M2 (spec 1133-1140).",
+            "#",
+        ]
+    if plan.tier == "special":
+        head += [
+            "# Special-value tier (round eight): OFP8 NaN / Inf / max /",
+            "# subnormal operands planted at fixed positions (see",
+            "# rvv_ref.fpw_special_case).  Expected image from rvv_ref, as",
+            "# for the golden tier.",
+            "#",
+        ]
+    if plan.tier in ("golden", "special"):
+        head += [
+            "# Expected image: computed by rvv_ref and embedded below as",
+            "# bytes.  A narrow or inexact result cannot be recomputed on the",
+            "# DUT with baseline rv64imafd, so for this tier the reference",
+            "# model is the sole authority.  The 'exact' tier is the",
+            "# independent check on that authority.",
+            "#",
+        ]
+    else:
+        head += [
+            "# Expected image: recomputed on the DUT from an integer dot",
+            "# product and one fcvt.  Every value here is a small integer, so",
+            "# no rounding point can round and the result is the same under",
+            "# any conforming (G, psm, rnd).  This tier consults no",
+            "# floating-point judgement of the reference model.",
+            "#",
+        ]
+    head.append(f"# IME instructions are emitted as .insn (encodings from "
+                f"Zvvm v{ime.SPEC_VERSION}):")
+    for mnemonic in (geom.load_mnemonic, geom.mnemonic, geom.store_mnemonic):
+        head.append(f"#   {mnemonic}")
+    head += [
+        "",
+        "    .text",
+        "    .balign 4",
+        "    .globl main",
+        "main:",
+        "    addi  sp, sp, -64",
+        "    sd    ra, 56(sp)",
+        "    sd    s1, 48(sp)         # carries the exit status past printf",
+        "    sd    s2, 40(sp)",
+        "    sd    s3, 32(sp)",
+        "    sd    s4, 24(sp)",
+        "    sd    s5, 16(sp)",
+        "    sd    s6, 8(sp)",
+        "    sd    s7, 0(sp)",
+        f"    li    t0, {MSTATUS_VS_INITIAL}",
+        "    csrs  mstatus, t0        # enable vector state",
+        f"    li    t0, {MSTATUS_FS_INITIAL}",
+        "    csrs  mstatus, t0        # enable scalar FP state",
+        "    fsrmi 0                  # frm = RNE (spec 1495); not trusted "
+        "from reset",
+    ]
+
+    body = _fpw_ime_path(geom, alloc, plan.key)
+    if plan.tier == "exact":
+        body += _fpw_exact_ref_path(plan)
+    body += _compare(geom)
+
+    data = [
+        "", "    .data", "    .balign 8",
+        f'.Lfmt_pass:  .asciz "TITAN PASS {desc}\\n"',
+        f'.Lfmt_skip:  .asciz "TITAN SKIP lambda=%d (requested {geom.lam}) '
+        f'imm=%d {desc}\\n"',
+        f'.Lfmt_fail:  .asciz "TITAN FAIL row=%d col=%d {desc}\\n"',
+        f'.Lfmt_diff:  .asciz "TITAN DIFF r=%d c=%d '
+        f'exp={_hex_fmt(width)} got={_hex_fmt(width)}\\n"',
+        f'.Lfmt_cdump: .asciz "TITAN CDUMP r=%d:"',
+        f'.Lfmt_cref:  .asciz "TITAN CREF r=%d:"',
+        f'.Lfmt_elem:  .asciz " {_hex_fmt(width)}"',
+        '.Lfmt_nl:    .asciz "\\n"',
+        "    .balign 8",
+    ]
+    data += _matrix_data("c_init", plan.c, width)
+    data += ["    .balign 8"] + _fpw_tile_data("mat_a_tile", plan.a, geom)
+    data += ["    .balign 8"] + _fpw_tile_data("mat_b_tile", plan.b, geom)
+    data += ["    .balign 8", "c_ime:",
+             f"    .zero {geom.m * geom.m * width // 8}",
+             "    .balign 8", "c_rvv:"]
+    if plan.tier in ("golden", "special"):
+        tile = rvv_ref.fpw_reference_gemm(geom, plan.a, plan.b, plan.c,
+                                          fmt_a, fmt_b, fmt_c)
+        golden = rvv_ref.fpw_golden_bytes(geom, tile, fmt_c)
+        assert len(golden) == geom.m * geom.n_max * (width // 8)
+        # Emitted at the accumulator width rather than as raw bytes so that a
+        # mis-sized C image is a build error, not a silent short read.
+        words = [int.from_bytes(bytes(golden[i:i + width // 8]), "little")
+                 for i in range(0, len(golden), width // 8)]
+        data += [f"    # golden C tile, row-major M x N_max, from rvv_ref"]
+        data += _matrix_data("", [words[i:i + geom.n_max]
+                                  for i in range(0, len(words), geom.n_max)],
+                             width)[1:]
+    else:
+        data += [f"    .zero {geom.m * geom.m * width // 8}"]
+    return "\n".join(head + body + data) + "\n"
+
+
+def _fpw_round_word(geom: TileGeometry) -> str:
+    """"seven" or "eight": which round made this geometry's cell live."""
+    return ("eight" if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_EIGHT_CELLS
+            else "seven")
+
+
+def fpw_special_geometry(geoms: Sequence[TileGeometry]):
+    """The geometry a cell's special-value tier runs on, or None.
+
+    The first one (in enumeration order) with at least two groups -- so
+    Inf + -Inf can straddle a group boundary -- and at least four C rows, so
+    every planted row of rvv_ref.fpw_special_case exists.  Falls back to the
+    largest-M geometry with two groups, then to the first geometry.
+    """
+    for pred in (lambda g: g.lam * g.lmul >= 2 and g.m >= 5,
+                 lambda g: g.lam * g.lmul >= 2 and g.m >= 4,
+                 lambda g: g.lam * g.lmul >= 2,
+                 lambda g: True):
+        hit = [g for g in geoms if pred(g)]
+        if hit:
+            return hit[0]
+    return None
+
+
+def fpw_directed_tiers(vlen: int, insns: Sequence[str], seed: int = 0):
+    """``(name, asm, geometry)`` for every widening-FP program (rounds 7-8).
+
+    Both tiers over the same geometries and the same encoding rows -- the
+    overlap rvv_ref.check_round_seven_tier_overlap asserts.  Only the cells
+    whose formats are all resolved are emitted; the rest stay unbuilt rather
+    than being approximated.
+
+    Round seven's cells are walked first with round seven's rng, exactly as
+    before, so their programs are byte-identical; round eight's OFP8 cells
+    follow with their own rng (seed + 8000) and add a third, "special" tier
+    (one geometry per cell, every encoding row) carrying OFP8 NaN / Inf /
+    max / subnormal operands.
+    """
+    out = []
+    wanted = set(insns)
+    resolved = rvv_ref.fpw_resolved_cells()
+    passes = (
+        ([c for c in resolved if c in rvv_ref.FPW_ROUND_SEVEN_CELLS],
+         random.Random(seed + 7000), ("golden", "exact"), False),
+        ([c for c in resolved if c in rvv_ref.FPW_ROUND_EIGHT_CELLS],
+         random.Random(seed + 8000), ("golden", "exact"), True),
+    )
+    assert sorted(passes[0][0] + passes[1][0]) == resolved, resolved
+    for cells, rng, tiers, special in passes:
+        for (w, sew) in cells:
+            geoms = [g for g in rvv_ref.fpw_legal_configs(vlen,
+                                                          full_vl_only=True)
+                     if (g.w, g.sew) == (w, sew) and g.emul_c != 16
+                     and _allocatable_here(g)]
+            if not geoms:
+                continue
+            if geoms[0].mnemonic not in wanted:
+                continue
+            rows = rvv_ref.fpw_rows(w, sew)
+            for geom in geoms:
+                for key, row in rows.items():
+                    mixed = row[0].name != row[1].name
+                    for tier in tiers:
+                        if tier == "exact" and not fpw_exact_emittable(geom):
+                            continue
+                        case = (rvv_ref.fpw_exact_case(geom, row, rng)
+                                if tier == "exact"
+                                else rvv_ref.fpw_case(geom, row, rng))
+                        plan = FpwPlan(geom, key, tier, *case,
+                                       tag=("mixed-format row" if mixed
+                                            else "same-format row"))
+                        name = (f"ime_fpw_{tier}_w{w}_sew{sew}_"
+                                f"l{geom.lam}_m{geom.lmul}_"
+                                f"{plan.altfmt_a}{plan.altfmt_b}{plan.altfmt}")
+                        out.append((name, emit_fpw_test(plan, name), geom))
+            if not special:
+                continue
+            geom = fpw_special_geometry(geoms)
+            for key, row in rows.items():
+                mixed = row[0].name != row[1].name
+                case = rvv_ref.fpw_special_case(geom, row, rng)
+                plan = FpwPlan(geom, key, "special", *case,
+                               tag=("OFP8 special values, mixed-format row"
+                                    if mixed else
+                                    "OFP8 special values, same-format row"))
+                name = (f"ime_fpw_special_w{w}_sew{sew}_"
+                        f"l{geom.lam}_m{geom.lmul}_"
+                        f"{plan.altfmt_a}{plan.altfmt_b}{plan.altfmt}")
+                out.append((name, emit_fpw_test(plan, name), geom))
+    return out
+
+
 def directed_suite(vlen: int, seed: int = 0,
                    sews: Sequence[int] = (8, 16, 32, 64),
                    lmuls: Sequence[int] = (1, 2, 4, 8),
@@ -3153,12 +3666,249 @@ def directed_suite(vlen: int, seed: int = 0,
                  if m in insns]
     if round_six:
         out += mx_directed_tiers(vlen, round_six, seed)
+
+    # Round seven, appended last for the same byte-identity reason.  Like the
+    # round-six tiers this is not a sweep over the (prefix, sews, ws, tloads,
+    # kinds) table: the geometries are picked per encoding-map cell and each
+    # cell carries two tiers with different operand constructions.  See
+    # fpw_directed_tiers.
+    round_seven = [m for m in ("vfwmmacc.vv", "vfqmmacc.vv", "vf8wmmacc.vv")
+                   if m in insns]
+    if round_seven:
+        out += fpw_directed_tiers(vlen, round_seven, seed)
     return out
 
 
 # ---------------------------------------------------------------------------
 # self-test
 # ---------------------------------------------------------------------------
+
+def check_round_seven_emission() -> None:
+    """Every round-seven program, structurally, against rvv_ref.
+
+    Checks the things a program can get wrong without failing to assemble:
+    the vtype word actually carries the encoding-map row's format bits, the
+    golden image is the reference model's and is the right size, the exact
+    tier carries no embedded expectation at all, and the compare covers
+    every element of the physical tile.
+    """
+    import constants
+    r7 = set(rvv_ref.FPW_ROUND_SEVEN_CELLS)
+    progs = [p for p in fpw_directed_tiers(256, constants.ROUND_SEVEN_INSNS,
+                                           seed=0)
+             if (p[2].w, p[2].sew) in r7]
+    assert progs, "round seven emitted nothing"
+    golden = [p for p in progs if "_golden_" in p[0]]
+    exact = [p for p in progs if "_exact_" in p[0]]
+    assert golden and exact, (len(golden), len(exact))
+
+    seen_cells, seen_rows, seen_mixed = set(), set(), 0
+    for name, asm, geom in progs:
+        assert geom.kind == "fpw", name
+        cell = (geom.w, geom.sew)
+        seen_cells.add(cell)
+        assert cell in rvv_ref.fpw_resolved_cells(), (name, cell)
+        # No unsupported extension may appear anywhere in the pool.
+        for fmt in rvv_ref.OCP_PENDING_FORMATS:
+            assert fmt not in asm, (name, fmt)
+        # The multiply-accumulate is emitted once, at vm=1.
+        assert asm.count(f"# {geom.mnemonic} v") == 1, name
+        # Every vsetvl carries the row's format bits -- not only the
+        # compute one.  Recover the row from the program name's trailing
+        # altfmt triple and rebuild the word the generator should have used.
+        tail = name.rsplit("_", 1)[-1]
+        aa, ab, af = int(tail[0]), int(tail[1]), int(tail[2])
+        for lmul, vl in ((geom.lmul_c, geom.vl_c_full),
+                         (geom.lmul, geom.lmul * geom.elems_per_reg),
+                         (geom.lmul, geom.vl)):
+            word = vtype_value(geom, lmul=lmul, altfmt=af,
+                               altfmt_a=aa, altfmt_b=ab)
+            assert f"li    t1, 0x{word:x}" in asm, (name, lmul, hex(word))
+        key = next(k for k in rvv_ref.fpw_rows(geom.w, geom.sew)
+                   if (0 if k[0] is None else k[0],
+                       0 if k[1] is None else k[1], k[2]) == (aa, ab, af))
+        seen_rows.add((cell, key))
+        row = rvv_ref.fpw_rows(geom.w, geom.sew)[key]
+        if row[0].name != row[1].name:
+            seen_mixed += 1
+        # frm is set explicitly rather than trusted from reset (spec 1495).
+        assert "fsrmi 0" in asm, name
+        # The compare touches every element of the physical M x N_max tile.
+        assert asm.count("beq   t4, t5, 1f") == geom.m * geom.n_max, name
+
+    # Both tiers reach every resolved cell and every encoding row -- the
+    # overlap rvv_ref.check_round_seven_tier_overlap asserts at the model
+    # level, asserted here at the program level too.
+    assert seen_cells == r7, seen_cells
+    for tier_progs in (golden, exact):
+        cells = {(g.w, g.sew) for _n, _a, g in tier_progs}
+        assert cells == r7, cells
+    assert seen_mixed, "no mixed-format program emitted"
+
+    # The golden image is the reference model's, byte for byte.
+    for name, asm, geom in golden[:6]:
+        assert "golden C tile" in asm, name
+        assert "fcvt" not in asm, (
+            f"{name}: a golden-tier program must not compute a reference on "
+            f"the DUT -- that is the exact tier's job")
+    # The exact tier embeds no expectation and does compute one.
+    for name, asm, geom in exact[:6]:
+        assert "golden C tile" not in asm, name
+        assert "fcvt" in asm, name
+        assert "exact reference (integer dot + fcvt)" in asm, name
+
+
+def check_round_seven_golden_matches_model() -> None:
+    """The bytes a golden program embeds are exactly rvv_ref's output.
+
+    Regenerates the expected image independently of the emitter and parses
+    it back out of the assembly, so a packing or ordering mistake in the
+    emitter cannot hide behind the same mistake in the model.
+    """
+    rng = random.Random(4242)
+    for (w, sew) in rvv_ref.fpw_resolved_cells():
+        geom = next(g for g in rvv_ref.fpw_legal_configs(256,
+                                                         full_vl_only=True)
+                    if (g.w, g.sew) == (w, sew) and g.emul_c != 16
+                    and _allocatable_here(g))
+        for key, row in rvv_ref.fpw_rows(w, sew).items():
+            case = rvv_ref.fpw_case(geom, row, rng)
+            plan = FpwPlan(geom, key, "golden", *case, tag="selftest")
+            asm = emit_fpw_test(plan, "probe")
+            tile = rvv_ref.fpw_reference_gemm(geom, *case, *row)
+            want = rvv_ref.fpw_golden_bytes(geom, tile, row[2])
+            words = [int.from_bytes(bytes(want[i:i + sew // 8]), "little")
+                     for i in range(0, len(want), sew // 8)]
+            body = asm.split("golden C tile")[1]
+            got = [int(tok, 16) for tok in
+                   re.findall(r"0x[0-9a-f]+", body)]
+            assert got == words, (w, sew, key, got[:4], words[:4])
+
+
+def check_round_seven_declared_scope() -> None:
+    """The emitted pool matches the declared support, in both directions.
+
+    An implementation that declares an extension unsupported must not be
+    judged against it, and one that declares support must not quietly skip
+    it.  Both halves are asserted, because either alone is satisfiable by a
+    pool that emits nothing.
+    """
+    import constants
+    supported = set(constants.ROUND_SEVEN_SUPPORTED)
+    unsupported = set(constants.ROUND_SEVEN_UNSUPPORTED)
+    assert supported and unsupported
+    assert not supported & unsupported
+    # The five supported extensions are exactly the three resolved cells'
+    # worth of (input format, accumulator format) pairs.
+    cells = [c for c in rvv_ref.fpw_resolved_cells()
+             if c in rvv_ref.FPW_ROUND_SEVEN_CELLS]
+    assert cells == [(2, 32), (2, 64), (4, 64)], cells
+    pairs = set()
+    for (w, sew) in cells:
+        for row in rvv_ref.fpw_rows(w, sew).values():
+            for fmt_in in (row[0], row[1]):
+                pairs.add((fmt_in.name, row[2].name))
+    assert pairs == {("binary16", "binary32"), ("bfloat16", "binary32"),
+                     ("binary32", "binary64"),
+                     ("binary16", "binary64"), ("bfloat16", "binary64")}, \
+        sorted(pairs)
+    assert len(pairs) == len(supported)
+    # vf8wmmacc.vv is out of scope entirely: no resolved cell carries it.
+    assert "vf8wmmacc.vv" not in constants.ROUND_SEVEN_INSNS
+    assert all(rvv_ref.TileGeometry(256, sew, 1, 1, 1, w,
+                                    kind="fpw").mnemonic
+               in constants.ROUND_SEVEN_INSNS for (w, sew) in cells)
+
+
+def check_round_eight_emission() -> None:
+    """Every round-eight (OFP8-input) program, structurally, against rvv_ref.
+
+    The round-seven checks, restated for the three OFP8 cells, plus what is
+    new: the special tier exists for every cell and row, the exact tier
+    exists exactly where a baseline fcvt does (not at the binary16/bfloat16
+    accumulator of (W=2, SEW=16)), vf8wmmacc.vv is emitted, no E2M1 cell
+    is, and every round-seven program is unchanged by round eight's cells
+    being walked in the same generator.
+    """
+    import constants
+    insns = constants.ROUND_SEVEN_INSNS + constants.ROUND_EIGHT_INSNS
+    progs = fpw_directed_tiers(256, insns, seed=0)
+    r8 = set(rvv_ref.FPW_ROUND_EIGHT_CELLS)
+    r8p = [p for p in progs if (p[2].w, p[2].sew) in r8]
+    assert r8p, "round eight emitted nothing"
+    by_tier = {}
+    for name, asm, geom in r8p:
+        tier = name.split("_")[2]
+        by_tier.setdefault(tier, []).append((name, asm, geom))
+        assert geom.kind == "fpw", name
+        assert "e2m1" not in asm, name
+        assert asm.count(f"# {geom.mnemonic} v") == 1, name
+        assert "fsrmi 0" in asm, name
+        assert asm.count("beq   t4, t5, 1f") == geom.m * geom.n_max, name
+        assert "# Round eight, tier" in asm, name
+        assert "ocp-ofp8-v1.0.txt" in asm, name
+        tail = name.rsplit("_", 1)[-1]
+        aa, ab, af = int(tail[0]), int(tail[1]), int(tail[2])
+        for lmul, vl in ((geom.lmul_c, geom.vl_c_full),
+                         (geom.lmul, geom.lmul * geom.elems_per_reg),
+                         (geom.lmul, geom.vl)):
+            word = vtype_value(geom, lmul=lmul, altfmt=af,
+                               altfmt_a=aa, altfmt_b=ab)
+            assert f"li    t1, 0x{word:x}" in asm, (name, lmul, hex(word))
+        if tier in ("golden", "special"):
+            assert "golden C tile" in asm and "fcvt" not in asm, name
+        else:
+            assert "golden C tile" not in asm and "fcvt" in asm, name
+    assert set(by_tier) == {"golden", "exact", "special"}, sorted(by_tier)
+    for tier, want in (("golden", r8), ("special", r8),
+                       ("exact", {(4, 32), (8, 64)})):
+        cells = {(g.w, g.sew) for _n, _a, g in by_tier[tier]}
+        assert cells == want, (tier, cells)
+    # Every encoding row, mixed ones included, in golden and special.
+    for tier in ("golden", "special"):
+        seen = {((g.w, g.sew), n.rsplit("_", 1)[-1]) for n, _a, g
+                in by_tier[tier]}
+        for cell in r8:
+            rows = rvv_ref.fpw_rows(*cell)
+            want = {f"{k[0]}{k[1]}{k[2]}" for k in rows}
+            assert {t for c, t in seen if c == cell} == want, (tier, cell)
+    assert any(g.mnemonic == "vf8wmmacc.vv" for _n, _a, g in r8p)
+    # The round-seven subset of the same call is what round seven emitted.
+    r7_now = [(n, a) for n, a, g in progs
+              if (g.w, g.sew) in rvv_ref.FPW_ROUND_SEVEN_CELLS]
+    r7_alone = [(n, a) for n, a, g in fpw_directed_tiers(
+        256, constants.ROUND_SEVEN_INSNS, seed=0)
+        if (g.w, g.sew) in rvv_ref.FPW_ROUND_SEVEN_CELLS]
+    assert r7_now == r7_alone
+
+
+def check_round_eight_declared_scope() -> None:
+    """Round eight's declared support is exactly what is emitted."""
+    import constants
+    supported = set(constants.ROUND_EIGHT_SUPPORTED)
+    unsupported = set(constants.ROUND_EIGHT_UNSUPPORTED)
+    assert supported and unsupported and not supported & unsupported
+    assert not supported & set(constants.ROUND_SEVEN_SUPPORTED)
+    ext = {("binary16",): "Zvvofp8fp16mm", ("bfloat16",): "Zvvofp8bf16mm",
+           ("binary32",): "Zvvofp8fp32mm", ("binary64",): "Zvvofp8fp64mm"}
+    got = set()
+    for cell in rvv_ref.FPW_ROUND_EIGHT_CELLS:
+        assert cell in rvv_ref.fpw_resolved_cells(), cell
+        for row in rvv_ref.fpw_rows(*cell).values():
+            assert {row[0].name, row[1].name} <= {"e4m3", "e5m2"}, row
+            got.add(ext[(row[2].name,)])
+    assert got == supported, sorted(got)
+    # Every E2M1 extension stays unsupported, and its cells unresolved.
+    for cell in ((2, 8), (4, 16), (8, 32)):
+        assert cell not in rvv_ref.fpw_resolved_cells(), cell
+    assert {"Zvvofp4ofp8mm", "Zvvofp4fp16mm", "Zvvofp4bf16mm",
+            "Zvvofp4fp32mm"} <= unsupported
+    # Zvvofp8mm (vfmmacc.vv at SEW=8) is W=1, outside the widening family,
+    # and stays unsupported alongside Zvvfp16mm / Zvvbf16mm.
+    assert "Zvvofp8mm" in unsupported
+    assert constants.ROUND_EIGHT_INSNS == ("vf8wmmacc.vv",)
+    assert "vf8wmmacc.vv" in constants.ALL_INSNS
+
 
 def check_vtype_fields() -> None:
     """The IME fields must land where the spec puts them, below vill."""
@@ -4430,7 +5180,12 @@ def main() -> int:
                   check_mxs_emission,
                   check_mxn_emission,
                   check_mxl_emission,
-                  check_mx_verdict_contract):
+                  check_mx_verdict_contract,
+                  check_round_seven_emission,
+                  check_round_seven_golden_matches_model,
+                  check_round_seven_declared_scope,
+                  check_round_eight_emission,
+                  check_round_eight_declared_scope):
         check()
         print(f"  ok  {check.__name__}")
 

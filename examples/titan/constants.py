@@ -384,28 +384,187 @@ ROUND_SIX_INSNS = ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv")
 #:    tier rather than sharing one with the same-format cells: if they
 #:    shared, a failure could not be attributed between the mixing logic and
 #:    the per-format decode.
-ROUND_SEVEN_INSNS = ("vfwmmacc.vv", "vfqmmacc.vv", "vf8wmmacc.vv")
+#: Note which two, and why it is not three.  ``vf8wmmacc.vv`` (W=8) is
+#: absent: every one of its encoding-map cells takes an OFP input format --
+#: (W=8, SEW=32) is OFP4 -> binary32 and (W=8, SEW=64) is OFP8 -> binary64
+#: (spec 7362-7370) -- so with the OFP extensions declared unsupported it has
+#: no implementable cell at all.  It is not a partial implementation that was
+#: skipped; the instruction is entirely OFP-dependent and belongs to whatever
+#: round obtains the OCP documents.
+#:
+#: This was not obvious from the mnemonic list and was found by deriving the
+#: set rather than writing it down: rvv_ref.fpw_resolved_cells() reports
+#: which cells have defined formats, and ime_stress's
+#: check_pool_covers_every_instruction refused a hand-written third mnemonic
+#: that no geometry could back.  The derivation is kept for that reason.
+ROUND_SEVEN_INSNS = ("vfwmmacc.vv", "vfqmmacc.vv")
+
+#: The declared implementation scope for the Zvvm floating-point family.
+#:
+#: Titan implements the five widening floating-point extensions whose element
+#: formats the IME specification defines on its own, and declares the OFP
+#: extensions unsupported.  This is a scope decision, and it is a legal one:
+#:
+#:   * Spec 810-844 splits the Zvvm family into independent extensions, one
+#:     per (input type, accumulator type) pair, each separately named and
+#:     separately required.  Spec 805-806 notes that the microscaling-related
+#:     extensions are listed elsewhere again.
+#:   * No clause in the specification requires an implementation to support
+#:     any OFP extension.  The only "shall support at least one" requirement
+#:     in the document is about the LAMBDA configuration domain, not about
+#:     element formats.
+#:
+#: So an implementation that provides the five below and none of the
+#: Zvvofp* extensions is a conforming subset, and a program that uses an
+#: unimplemented one takes an illegal-instruction exception, which is the
+#: architecturally defined outcome.
+#:
+#: Supported:
+#:
+#:   Zvvfp16fp32mm, Zvvbf16fp32mm   vfwmmacc.vv  W=2, SEW=32
+#:                                  binary16 / bfloat16 -> binary32
+#:   Zvvfp32fp64mm                  vfwmmacc.vv  W=2, SEW=64
+#:                                  binary32 -> binary64
+#:   Zvvfp16fp64mm, Zvvbf16fp64mm   vfqmmacc.vv  W=4, SEW=64
+#:                                  binary16 / bfloat16 -> binary64
+#:
+#: Mixed-format operation (altfmt_A != altfmt_B) is supported wherever the
+#: encoding map allows it for these cells, which per spec 1480-1490 requires
+#: both of the paired extensions to be present.
+#:
+#: Not supported, and why:
+#:
+#:   Zvvofp4ofp8mm, Zvvofp8fp16mm, Zvvofp8bf16mm, Zvvofp4fp16mm,
+#:   Zvvofp4bf16mm, Zvvofp8fp32mm, Zvvofp4fp32mm, Zvvofp8fp64mm,
+#:   and every Zvvx*/Zvvxn* microscaled counterpart.
+#:
+#: These use the OFP8 (E4M3, E5M2) and OFP4 (E2M1) element formats.  The IME
+#: specification does not define those formats: it cites the OCP
+#: Microscaling Formats (MX) v1.0 specification normatively at lines
+#: 1908-1913 and leaves the corresponding SAIL helpers (fp_is_NaN,
+#: fp_defaultNaN, fp_zero, at 4831-4838) undefined, deferring to that
+#: document.  Spec 1400-1410 states only the significand widths.
+#:
+#: Those documents are not available to this project.  We therefore decline
+#: to implement the OFP extensions rather than reconstruct their semantics
+#: from secondary sources or by analogy with IEEE 754.  The reconstruction
+#: would not be sound: E4M3 encodes no infinity, so its overflow behaviour
+#: cannot be inferred from an IEEE rounding path, and its NaN set is not the
+#: IEEE "exponent all ones with nonzero significand" predicate.  Published
+#: secondary descriptions also disagree with each other in ways that are
+#: invisible without the specification to arbitrate -- one widely used
+#: reference implementation reports E4M3 as having five significand bits
+#: because of an internal convention -- so adopting one would be choosing a
+#: definition rather than implementing a standard.
+#:
+#: An incorrectly reconstructed format would not fail loudly.  It would
+#: produce a judge that is confidently wrong, and every disagreement with the
+#: hardware would be attributed to the hardware.  Declaring the extensions
+#: unsupported is the honest outcome of not having the specification; it is
+#: not a reduction in the coverage of what we do claim to implement.
+#:
+#: The machinery to judge the OFP cells is nonetheless built and tested:
+#: rvv_ref.FP_FORMAT_TABLE carries their rows unpopulated,
+#: rvv_ref.OCP_PENDING_FORMATS names what each needs, the reference GEMM and
+#: operand packer are format-agnostic and the sub-byte path is exercised
+#: against a synthetic descriptor.  If the documents are obtained, the work
+#: is to fill in three table rows.
+ROUND_SEVEN_SUPPORTED = (
+    "Zvvfp16fp32mm", "Zvvbf16fp32mm",
+    "Zvvfp32fp64mm",
+    "Zvvfp16fp64mm", "Zvvbf16fp64mm",
+)
+
+#: The extensions this implementation declares it does not provide.  Kept as
+#: data so that a test can assert no program is generated for them.
+ROUND_SEVEN_UNSUPPORTED = (
+    "Zvvofp4ofp8mm", "Zvvofp8fp16mm", "Zvvofp8bf16mm", "Zvvofp4fp16mm",
+    "Zvvofp4bf16mm", "Zvvofp8fp32mm", "Zvvofp4fp32mm", "Zvvofp8fp64mm",
+)
+
+#: Round eight: the OFP8 (E4M3 / E5M2) input cells of the widening family.
+#:
+#: What changed: the OCP 8-bit Floating Point Specification (OFP8) Revision
+#: 1.0 is now on disk (titan/ocp-spec/*.pdf; text for the agents at
+#: specs/ime/ocp-ofp8-v1.0.txt, gitignored like the adoc).  It defines E4M3
+#: and E5M2 completely (OFP8 p.11-15); rvv_ref.FP_FORMAT_TABLE now carries
+#: both rows, with every OCP citation and Titan's disclosures for what OCP /
+#: the IME adoc leave open in rvv_ref.OFP8_DISCLOSURE.  OCP Microscaling
+#: Formats (MX) v1.0, which defines E2M1 (OFP4), is still NOT on disk.
+#:
+#: Which cells that makes live is derived, not listed: a cell is live when
+#: every format in every one of its encoding-map rows (spec 7288-7370) is
+#: resolved -- rvv_ref.fpw_resolved_cells().  From the adoc's table:
+#:
+#:   (W=2, SEW=16)  vfwmmacc.vv   E4M3/E5M2 x E4M3/E5M2 -> binary16 / bfloat16
+#:                                Zvvofp8fp16mm, Zvvofp8bf16mm    LIVE
+#:   (W=4, SEW=32)  vfqmmacc.vv   E4M3/E5M2 x E4M3/E5M2 -> binary32
+#:                                Zvvofp8fp32mm                   LIVE
+#:   (W=8, SEW=64)  vf8wmmacc.vv  E4M3/E5M2 x E4M3/E5M2 -> binary64
+#:                                Zvvofp8fp64mm                   LIVE
+#:   (W=2, SEW=8)   vfwmmacc.vv   E2M1 x E2M1 -> E4M3 / E5M2
+#:                                Zvvofp4ofp8mm        needs E2M1 (MX)
+#:   (W=4, SEW=16)  vfqmmacc.vv   E2M1 x E2M1 -> binary16 / bfloat16
+#:                                Zvvofp4fp16mm, Zvvofp4bf16mm   needs E2M1
+#:   (W=8, SEW=32)  vf8wmmacc.vv  E2M1 x E2M1 -> binary32
+#:                                Zvvofp4fp32mm        needs E2M1 (MX)
+#:
+#: So the live cells take OFP8 as INPUTS only; every accumulator is IEEE.
+#: No round-eight program rounds to OFP8.  The adoc's two OFP8-accumulator
+#: extensions are Zvvofp4ofp8mm (needs E2M1) and Zvvofp8mm -- vfmmacc.vv at
+#: SEW=8, W=1 -- which is outside the widening family and sits with
+#: Zvvfp16mm / Zvvbf16mm, the W=1 narrow cells round four deferred (no
+#: baseline scalar arithmetic at 8/16 bits) and no round has built since.
+#: Both stay unsupported.  The OFP8 rounding rule (RNE; overflow
+#: non-saturating, disclosed) is nevertheless encoded and negative-controlled
+#: in rvv_ref so that whichever round builds them inherits it.
+#:
+#: All four altfmt_A / altfmt_B combinations, mixed E4M3 x E5M2 included,
+#: are covered by the one OFP8 extension per output format (spec 1445-1451),
+#: so every live cell is judged on its mixed rows too.
+#:
+#: vf8wmmacc.vv enters ALL_INSNS here: (W=8, SEW=64) is its first cell with
+#: a generator behind it, so ime_stress's check_pool_covers_every_instruction
+#: can be satisfied honestly.  vfwmmacc.vv / vfqmmacc.vv were already there;
+#: round eight adds cells to them, not mnemonics.
+#:
+#: Still unsupported, and why:
+#:   Zvvofp4ofp8mm, Zvvofp4fp16mm, Zvvofp4bf16mm, Zvvofp4fp32mm
+#:       E2M1 is defined by OCP MX v1.0, which is not on disk; rvv_ref keeps
+#:       raising OCPSpecUnavailable for it and these cells stay out of every
+#:       pool.  A program that uses one takes an illegal-instruction trap.
+#:   Zvvofp8mm
+#:       vfmmacc.vv at SEW=8 (W=1, OFP8 accumulator); see above.
+#:   Zvvxofp8* / Zvvxnofp8* (and all MX FP counterparts)
+#:       vm=0 microscaled FP operation is not built for any cell yet.
+ROUND_EIGHT_INSNS = ("vf8wmmacc.vv",)
+
+ROUND_EIGHT_SUPPORTED = (
+    "Zvvofp8fp16mm", "Zvvofp8bf16mm",
+    "Zvvofp8fp32mm",
+    "Zvvofp8fp64mm",
+)
+
+ROUND_EIGHT_UNSUPPORTED = (
+    "Zvvofp4ofp8mm", "Zvvofp4fp16mm", "Zvvofp4bf16mm", "Zvvofp4fp32mm",
+    "Zvvofp8mm",
+)
 
 #: Every instruction the generators know how to emit and judge.  The order is
 #: round order, so an index into this is an implementation milestone.
 #:
-#: ROUND_SEVEN_INSNS is deliberately *not* here yet.  The name says "the
-#: generators know how to emit and judge", and ime_stress's
-#: ``check_pool_covers_every_instruction`` reads it as exactly that; the
-#: round-seven directed and stress generators cannot be finished until the
-#: OCP documents land, because every one of them has to materialise an OFP8
-#: or OFP4 operand.  Adding the mnemonics early would make that stress check
-#: pass vacuously over an empty pool -- a judge lying about its own coverage,
-#: which is the one failure mode this harness exists to prevent.  The single
-#: edits that enable round seven are: append ROUND_SEVEN_INSNS here, add
-#: ``"seven"``/``"7"`` to the named map in :func:`instruction_scope` (it
-#: validates against ALL_SCOPE, so the two must move together), and flip
-#: IMPLEMENTED_INSNS / NEW_INSNS below.  Everything else this round adds --
-#: rvv_ref.FP_CELLS and its legality helpers, the kind='fpw' geometry, the
-#: sim_check sweep -- is already wired to ROUND_SEVEN_INSNS by name and is
-#: exercised by the self-tests today.
+#: ROUND_SEVEN_INSNS joined this tuple when its generators landed.  It was
+#: deliberately held out while they did not exist: ime_stress's
+#: ``check_pool_covers_every_instruction`` reads this tuple as "geometries
+#: exist for these", so listing a mnemonic with no pool behind it would have
+#: made a coverage check pass vacuously -- a judge lying about its own
+#: reach.  The three mnemonics are here now because fpw_directed_tiers emits
+#: programs across the five supported extensions; the OFP cells are
+#: absent from that pool by construction (rvv_ref.fpw_resolved_cells derives
+#: it from which formats are defined), not by omission.
 ALL_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
-             + ROUND_FOUR_INSNS + ROUND_SIX_INSNS)
+             + ROUND_FOUR_INSNS + ROUND_SIX_INSNS + ROUND_SEVEN_INSNS
+             + ROUND_EIGHT_INSNS)
 
 #: Round five adds no instruction.  It adds a *check* over instructions that
 #: are already in ALL_INSNS, so it is named as a tier token rather than as a
@@ -438,8 +597,11 @@ ALL_SCOPE = ALL_INSNS + ROUND_FIVE_TIERS
 #: them and every prompt names the right halves: rounds one and two are the
 #: regression surface, round three is the work.
 IMPLEMENTED_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
-                     + ROUND_FOUR_INSNS)
-NEW_INSNS = ROUND_SIX_INSNS
+                     + ROUND_FOUR_INSNS + ROUND_SIX_INSNS + ROUND_SEVEN_INSNS)
+# Round 8 (2026-09-24) adds OFP8 (E4M3/E5M2) input *cells*: the new mnemonic
+# vf8wmmacc plus new cells of vfwmmacc/vfqmmacc, whose IEEE cells are round 7
+# and must keep passing.  Hence the overlap with IMPLEMENTED_INSNS.
+NEW_INSNS = ROUND_EIGHT_INSNS + ROUND_SEVEN_INSNS
 
 
 def _scope_insns() -> tuple:
@@ -476,6 +638,8 @@ def _scope_insns() -> tuple:
              "four": ROUND_FOUR_INSNS, "4": ROUND_FOUR_INSNS,
              "five": ROUND_FIVE_TIERS, "5": ROUND_FIVE_TIERS,
              "six": ROUND_SIX_INSNS, "6": ROUND_SIX_INSNS,
+             "seven": ROUND_SEVEN_INSNS, "7": ROUND_SEVEN_INSNS,
+             "eight": ROUND_EIGHT_INSNS, "8": ROUND_EIGHT_INSNS,
              "all": ALL_SCOPE, "": ALL_SCOPE}
     if raw.lower() in named:
         return named[raw.lower()]
@@ -690,7 +854,10 @@ STRESS_TEST_VRUN_FRACTION = float(
     os.environ.get("TITAN_STRESS_VRUN_FRACTION", "0.5"))
 
 # --- LLM -------------------------------------------------------------------
-LLM_MODEL = os.environ.get("TITAN_LLM_MODEL", "claude-opus-4-7")
+# 2026-09-23 改用 Opus 5.5（round 7 起）。需要 llm 容器內 Claude Code >= 2.1.280；
+# image 內建的是 2.1.252，容器重建後要再 `docker exec -u root <llm 容器> npm i -g
+# @anthropic-ai/claude-code@latest`，否則 API 回 400 unsupported model。
+LLM_MODEL = os.environ.get("TITAN_LLM_MODEL", "claude-opus-5-5")
 LLM_EXTRA_ARGS = ["--effort", "max"]
 LLM_TIMEOUT_SECONDS = int(os.environ.get("TITAN_LLM_TIMEOUT_SECONDS", "1800"))
 
@@ -909,3 +1076,13 @@ def _default_db_root() -> str:
 
 
 DB_ROOT_DEFAULT = _default_db_root()
+
+
+#: Stage 3 的測試程式在 riscv_build 容器裡組譯，所以工作目錄必須是那個容器
+#: 掛載得到的路徑。專案的 ``out/`` 沒有掛進去 —— r22 的 S3 就是在這裡以
+#: PermissionError 當掉的。``titan_scratch`` 是每個 node type 都有掛的共用
+#: scratch（cluster.yaml 的 TMPDIR 也指向它），而且在 /share1 上。
+STRESS_WORK_DIR = os.environ.get(
+    "TITAN_STRESS_WORK_DIR",
+    f"/share1/saves/{__import__('getpass').getuser().removesuffix('_l')}"
+    "/titan_scratch/node_tmp/titan-stress")
