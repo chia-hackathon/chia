@@ -250,6 +250,8 @@ def run_sweep(args) -> int:
     ref_path = os.path.join(seed_root, C.REFERENCE_SOURCE)
     reference_source = (open(ref_path).read()
                         if os.path.exists(ref_path) else "")
+    design_note = (open(args.design_note).read().strip()
+                   if args.design_note else "")
     winner_designs = [open(os.path.join(C.WINNER_DESIGNS_DIR, f)).read()
                       for f in sorted(os.listdir(C.WINNER_DESIGNS_DIR))
                       if f.endswith(".md")]
@@ -432,9 +434,21 @@ def run_sweep(args) -> int:
                           f"(struct {pre['struct_name']}); no agent call",
                           flush=True)
                     return pre
+                if args.serial_variants and args.arm != "offline":
+                    gone = get(agents.clear_agent_scratch.chia_remote())
+                    if gone:
+                        print(f"[gen {gen}] {vid}: cleared {len(gone)} leftovers "
+                              f"from /tmp before designing", flush=True)
+                fb = last_feedback.get(parent.variant_id, "")
+                if design_note:
+                    # A direction the operator wants this run to try, in front
+                    # of whatever the lineage learned on its own.  It rides the
+                    # feedback slot because that is already the part of the
+                    # prompt the agent reads as "what to do about the parent".
+                    fb = design_note + ("\n\n" + fb if fb else "")
                 return _propose(
                     args.arm, vllms.get(vid), parent, archive, rng,
-                    feedback=last_feedback.get(parent.variant_id, ""),
+                    feedback=fb,
                     generation=gen, vid=vid,
                     offline_args=offline_args.get(parent.variant_id),
                     reference_source=reference_source,
@@ -625,7 +639,8 @@ def _propose(arm, llm, parent, archive, rng, *, feedback, generation, vid,
         parent_summary=parent.summary(),
         archive_summary=_archive_summary(archive),
         feedback=feedback, generation=generation,
-        reference_source=reference_source, winner_design=winner_design)
+        reference_source=reference_source, winner_design=winner_design,
+        work_dir=f"/tmp/bpe_{vid}")
 
 
 def _preloaded_design(dirpath: str | None, vid: str) -> dict | None:
@@ -1227,6 +1242,50 @@ def _report(archive, db, held_out, args):
 # Held-out scoring
 # ---------------------------------------------------------------------------
 
+def rescore(args) -> int:
+    """Re-score an archive's elites on the current trace set and window.
+
+    The sweep already does this on resume (:func:`_rescore_archive`), but only
+    when the trace count changed. The instruction window is an environment
+    variable, so an archive scored run-to-end and one scored at 40M look
+    identical to that check and are silently mixed. This command re-scores on
+    demand, with no sweep attached, and writes the result somewhere new rather
+    than over its input.
+    """
+    if args.local:
+        init_local_ray(args.local_cbp_slots)
+    else:
+        init_cluster_ray()
+
+    archive_path = args.archive or (C.OUT_DIR / "archive.json")
+    if not os.path.exists(archive_path):
+        print(f"no archive at {archive_path}", file=sys.stderr)
+        return 2
+    archive = Archive.from_json(open(archive_path).read())
+
+    all_traces = resolve_traces(args.trace_dir, args.host_trace_dir)
+    inner, _, _ = split_traces(
+        all_traces, inner=args.inner_traces,
+        held_out_fraction=C.HELD_OUT_FRACTION, seed=C.TRACE_SUBSET_SEED)
+    if not inner:
+        print("the split left no inner traces", file=sys.stderr)
+        return 2
+
+    print(f"re-scoring {archive_path} -> {args.rescore}\n"
+          f"  {len(inner)} traces, window {C.SIM_INSTRUCTIONS} instructions, "
+          f"warmup {C.WARMUP_INSTRUCTIONS}", flush=True)
+    with CbpNgNode(require_colocated=False) as cbp_node:
+        fresh = _rescore_archive(archive, inner, cbp_node, args)
+
+    if not len(fresh):
+        print("every elite was dropped; not writing", file=sys.stderr)
+        return 1
+    os.makedirs(os.path.dirname(os.path.abspath(args.rescore)), exist_ok=True)
+    open(args.rescore, "w").write(fresh.to_json())
+    print(f"wrote {args.rescore}", flush=True)
+    return 0
+
+
 def score_held_out(args) -> int:
     """Re-score an archive's front on traces no feedback ever came from.
 
@@ -1496,6 +1555,10 @@ def main(argv=None) -> int:
                         "ordering survives")
     p.add_argument("--archive", default=None,
                    help="archive.json to score (default: <out>/archive.json)")
+    p.add_argument("--rescore", default=None, metavar="OUT.json",
+                   help="re-score --archive's elites on the current trace set "
+                        "and BPE_SIM_INSTRUCTIONS window and write the result "
+                        "here; cells are re-derived, the input is not touched")
     p.add_argument("--resume-archive", default=None,
                    help="archive.json from an interrupted sweep: reload it, skip "
                         "generation 0, and continue at the generation after the "
@@ -1526,6 +1589,9 @@ def main(argv=None) -> int:
                         "which is precisely when the agent's first move is "
                         "being measured; without this it would be told no "
                         "design has ever been evaluated. Repeatable.")
+    p.add_argument("--design-note", default=None, metavar="PATH",
+                   help="file whose text is put in front of every variant's "
+                        "feedback: a direction to try this run")
     p.add_argument("--notes", default="")
     args = p.parse_args(argv)
     if args.tune_bounds and args.bounds_rule is not None:
@@ -1536,6 +1602,8 @@ def main(argv=None) -> int:
 
     if args.selftest:
         return selftest(args)
+    if args.rescore:
+        return rescore(args)
     if args.score_held_out:
         return score_held_out(args)
     try:

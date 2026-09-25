@@ -59,6 +59,17 @@ REFERENCE_SOURCE = os.environ.get("BPE_REFERENCE_SOURCE",
 # 1_, 2_, 3_). Variant k of a generation is shown entry k+1.
 WINNER_DESIGNS_DIR = PROMPTS_DIR / "cbpng_winners"
 
+# Which design prompt to send.  BPE_DESIGN_PROMPT=design_noref.md is the
+# hermetic control: the same file with every CBP-NG-winner-derived passage
+# removed -- the winners' digest and ${REFERENCE_SOURCE}, the rotating
+# ${WINNER_DESIGN} write-up, the MORSL-derived "what the archive keeps not
+# doing", and the two sentences elsewhere that quote a winner's MPKI or name
+# ahead-pipelining as the technique to use.  The llm node bind-mounts no
+# cbp-ng checkout, so that file is the whole of what the agent is told about
+# the winners; REFERENCE_SOURCE and WINNER_DESIGNS_DIR still load on the
+# driver and simply find no placeholder to fill.
+DESIGN_PROMPT = os.environ.get("BPE_DESIGN_PROMPT", "design.md")
+
 # -- trace budget ------------------------------------------------------------
 #
 # The 168 CBP-NG traces hold 4,989,128,151 instructions between them -- median

@@ -187,6 +187,76 @@ your parent; do not copy its struct name):
 ${REFERENCE_SOURCE}
 ```
 
+## What the archive keeps not doing
+
+The techniques above have been in this prompt since generation 15 and the
+archive has spent seventy variants on them. What it bought was a plateau: the
+best cell gained 0.0015 VFS over generations 24 to 29 and nothing at all over
+30 to 34. The reason is not that the ideas are wrong. It is that each variant
+edits its parent in one session, and a change that pays for itself only after
+the surrounding structure is rebuilt loses every time to a safer small one.
+The small ones are used up.
+
+So this is worth saying plainly: **spending your whole variant on one
+structural change is a legitimate use of it**, and a variant that reorganises
+the prediction cycle and lands slightly below its parent is more useful to the
+search than a third decimal place. Say in your rationale what you rebuilt and
+what it measured, so the next design starts from your numbers.
+
+The concrete thing the lineage has never tried, though this prompt has asked
+for it since generation 15:
+
+* **Resolve the rank in the tag comparison, not behind it.** The line the
+  archive's designs are on gives an entry NB direction bits (plus, in the
+  best one, NB confidence bits) and lets one entry serve every rank in the
+  block, so after the tags answer, a mux still has to pick the rank out of the
+  entry. MORSL puts the lane in the top 2 bits of its 12-bit tag: an entry is
+  {tag, 3-bit counter, 1 useful bit} and serves exactly one rank, so the rank
+  is chosen on the way through the comparator rather than in a layer behind
+  it. That layer is real time. The archive's best design fought it for
+  timing -- folding the match vector into the rank's bits ahead of the
+  priority encoder moved its P1 from 299 to 263 ps -- and it is still there.
+
+Why this is where the time is. That design measured a sixth tagged table at
+5.31 MPKI, better than the 5.35 it shipped, and rejected it because it came to
+302 ps: two picoseconds over the cycle, which rounds to two cycles and costs
+half the throughput. MORSL runs **eight** history lengths at 286 ps, and its
+critical path is not the read or the select at all -- it is a 4-bit saturating
+meta-counter in the update. Eight tables in one cycle is not a wall. It is a
+consequence of how little is left in the prediction cycle. So the question to
+ask of your parent is not "what can I add" but **"what is still happening in
+the prediction cycle that could happen a block earlier, in the update, or
+inside the comparator?"** Whatever leaves is what pays for more tables.
+
+Three answers that were measured, not guessed:
+
+* Compute the index *and the bank mapping* one block ahead; build the tag from
+  the current block's PC and history and compare it in the prediction cycle.
+  MORSL's bank + filter path is 580 ps and its effective latency 280 ps.
+* Split RAMs by write frequency, not by what one lookup wants together: tag
+  and prediction bit, which do not change on a correct prediction, in one
+  array; hysteresis and useful bits, which change constantly, in another,
+  banked to emulate a second port. Moving confidence *into* the entry instead
+  buys the prediction path a look at it but costs a repair cycle to write it:
+  in the archive's best design that is 9.5% of blocks against 4.9%, and
+  T 8.97 -> 8.73. Banking is the other way to pay for it.
+* Choose per component. MORSL's base bimodal and TC-bias read the current PC
+  because they fit in the cycle and are more accurate that way.
+
+And two things not to spend the freed time on, both already measured:
+
+* **Decoration.** MORSL's two tagged correctors were worth +0.0002 and
+  +0.0003 VFS, and it wrote that at one cycle, accuracy buys little per
+  mechanism. What separates it from this archive is the plain MPKI, 4.803
+  against 5.34, from eight well-spread histories in a cycle that had room.
+* **A fast P1 with a slower P2.** When P2 is slower than P1 the misprediction
+  penalty goes from 9 cycles to 10, which needs about a 10% MPKI improvement
+  to break even before a single P1/P2 disagreement is paid for, and each
+  disagreement then costs a cycle or two of its own. The third-place CBP-NG
+  entry dropped its fast/slow pair for exactly this reason. Two cycles on both
+  levels is worse still: the archive's one such design runs at T 4.39 against
+  8.7.
+
 ## One winning design in detail
 
 The write-up of one CBP-NG 2025 winning entry: what it built and why, with
@@ -200,8 +270,10 @@ ${WINNER_DESIGN}
 ## Building and testing before you reply
 
 A CBP-NG checkout is at `/home/ray/cbp-ng` (`harcom.hpp`, `cbp.cpp`,
-`cbp.hpp`, `predictors/`, and `gcc_test_trace.gz`). Copy it somewhere under
-`/tmp` to work in. The compiler is `x86_64-conda-linux-gnu-g++`, and zlib comes
+`cbp.hpp`, `predictors/`, and `gcc_test_trace.gz`). Copy it to `${WORK_DIR}`
+and work only there. Anything else you find under `/tmp` was left by a
+different variant's session: it is not your parent and not a newer design, so
+do not read it or start from it -- your parent is the source above. The compiler is `x86_64-conda-linux-gnu-g++`, and zlib comes
 from the conda prefix, so the build line is:
 
 ```

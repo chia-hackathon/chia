@@ -25,7 +25,7 @@ import re
 import time
 from string import Template
 
-from chia.base.ChiaFunction import get
+from chia.base.ChiaFunction import ChiaFunction, get
 from chia.base.llm_call import QueryResult
 
 import constants as C
@@ -174,10 +174,49 @@ def _validate_source_reply(obj: dict, key: str = "source") -> tuple[bool, str]:
 # Design
 # ---------------------------------------------------------------------------
 
+# What in the llm container's /tmp is not a design session's leftovers: Ray's
+# session (which holds the working_dir the CLI runs from), the Claude CLI's own
+# state, and what the image put there.
+_TMP_KEEP_PREFIXES = ("ray", "claude-", "cc-socks", "node-compile-cache", "uv-",
+                      "conda_install.log")
+
+
+@ChiaFunction(resources={"llm": C.LLM_RESOURCE})
+def clear_agent_scratch() -> list[str]:
+    """Delete what earlier design sessions left in the llm container's /tmp.
+
+    The container outlives every session, so a design agent that lists /tmp
+    finds the last variant's predictor, takes it for "the newest design" and
+    tunes that instead of its own parent: gen033_1 and gen033_2 came back
+    branch-for-branch identical to gen033_0 and gen032_1 while the database
+    recorded gen003_0 and gen010_2 as their parents.  Only safe while no other
+    session is running, so the loop calls it only for serial variants.
+    """
+    import os
+    import shutil
+    removed = []
+    uid = os.getuid()
+    for name in os.listdir("/tmp"):
+        if name.startswith(".") or name.startswith(_TMP_KEEP_PREFIXES):
+            continue
+        path = os.path.join("/tmp", name)
+        try:
+            if os.lstat(path).st_uid != uid:
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+            removed.append(name)
+        except OSError:
+            pass
+    return removed
+
+
 def design(llm, *, parent_source: str, parent_summary: dict,
            archive_summary: str, feedback: str, generation: int,
            reference_source: str = "", winner_design: str = "",
-           tools=None) -> dict:
+           work_dir: str = "/tmp/bpe_design", tools=None) -> dict:
     """Propose one new predictor by editing a parent's HARCOM source.
 
     The parent is drawn from the archive by the caller, not chosen here: which
@@ -185,7 +224,7 @@ def design(llm, *, parent_source: str, parent_summary: dict,
     belong to the framework.
     """
     prompt = _load(
-        "design.md",
+        C.DESIGN_PROMPT,
         PARENT_SOURCE=parent_source,
         PARENT_SUMMARY=json.dumps(parent_summary, indent=2),
         ARCHIVE=archive_summary,
@@ -193,6 +232,7 @@ def design(llm, *, parent_source: str, parent_summary: dict,
         GENERATION=str(generation),
         REFERENCE_SOURCE=reference_source or "// (reference not available)",
         WINNER_DESIGN=winner_design or "(no winning design to show)",
+        WORK_DIR=work_dir,
     )
     try:
         return _ask_json(llm, prompt, _validate_source_reply, tools,
