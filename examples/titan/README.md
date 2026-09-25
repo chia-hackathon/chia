@@ -146,10 +146,17 @@ agent 生出成本與編輯都不在帳上的 sub-agent。見本分支的第一�
 | `r6_stageM_spike_model_sail.diff` | Stage 0 的 Spike IME 模型（依 SAIL 重寫後的版本） |
 | `r12_rtl_a3.diff` | **第一輪設計，4 條指令**（A3 修正後的 RTL + 模型） |
 | `r13_round2.diff` | **第二輪**，加入 `vqmmacc.vv` |
-| `r15_round3.diff` | **第三輪，最終 8 條指令設計** |
+| `r15_round3.diff` | **第三輪**，8 條指令設計 |
+| `r16_round4_rtl.diff` | 第四輪（`vfmmacc.vv`）Gate 時的 RTL（只含 RTL 半邊） |
+| `r17_round5_rtl.diff` | 第五輪（C tile 讀回、修轉置）收斂的 RTL（只含 RTL 半邊） |
+| `r19_round6_last_attempt.diff` | 第六輪（MX）最後一次嘗試的模型 + RTL（該輪未收斂） |
+| `r21_round7.diff` | 第七輪（`vfwmmacc`/`vfqmmacc`）的模型 + RTL，由 r23 完整收斂驗證 |
+| `r24_round8_final.diff` | **第八輪，最終 15 條指令設計**（OFP8，模型 + RTL），r24 收斂、r25 以 1,024 支 S3 重驗 |
 | `round3_design.md` | 全 15 條指令調查、第三輪批次決策、依賴的 SAIL 行號、編碼與實作 |
 | `r15_full_verify.json` | 最終驗證結果（directed 80/80、S2 full 837/0、排除清單） |
-| `ledger.md` | 全部 19 次 run 的時間 / 成本 / 結果（累計 46h11m、$837.13） |
+| `ledger.md` | 前 19 次 run（到 r15）的時間 / 成本 / 結果，含逐列敘述（累計 46h11m、$837.13） |
+| `run_ledger.md` | **全部 26 次 run**（r1–r25）的時間 / 成本 / 結果（累計 94h39m、$1,164.07），由 `titan_runs/tools/ledger.py` 產生 |
+| `rounds.json` | 第六至八輪逐 run 的結構化紀錄（階段結果、成本、發現、更正） |
 | `report_data.md` | 全語料庫的逐項證據與根因分析 |
 | `ppa_method.md` / `ppa_results.json` | 結構性 RTL proxy 比較的方法與結果（非真實 PPA） |
 | `report.html` | 已發布的完整報告 |

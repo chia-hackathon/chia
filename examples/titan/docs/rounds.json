@@ -1,0 +1,1053 @@
+[
+ {
+  "round": 6,
+  "id": "r6_prep_0919_1722",
+  "kind": "judge-authoring (no cluster job submitted)",
+  "started": "2026-09-19T17:22+08:00",
+  "ended": "2026-09-19T18:44+08:00",
+  "wall_minutes": 115,
+  "llm_cost_usd": 0.0,
+  "cluster_cost": "none - no ray job submitted; chipyard/verilator_run untouched",
+  "insns": [
+   "vfwimmacc.vv",
+   "vfqimmacc.vv",
+   "vf8wimmacc.vv"
+  ],
+  "result": "judges + prompts complete; blocked only on chipyard",
+  "done": [
+   "titan_runs/round6_design.md",
+   "rvv_ref.py: FP_FORMATS_BY_NAME + fmt= threaded through fp_fields/is_nan/is_inf/default_nan/unpack/round/mul/add (rounds 1-5 byte-identical)",
+   "rvv_ref.py: round-six model (E8M0 decode, mx_block_scale, int_block_dot, int_scaled_gemm_reference, exactness bounds, int4 packing, mx_legal_configs)",
+   "rvv_ref.py: 8 new self-tests incl. 2 negative controls, both verified to have teeth",
+   "constants.py: ROUND_SIX_INSNS, ALL_INSNS, IMPLEMENTED/NEW, TITAN_INSNS=six",
+   "ime_tests.py: VectorAlloc.reserve_v0 (v0 held for E8M0 scales)",
+   "ime_stress.py: round-six pool tier; check_pool_covers_every_instruction green",
+   "ime_encodings.py: VTYPE_BASE_FIELDS altfmt (C accumulator format; keyed by absolute lsb, not offset-below-XLEN like the IME fields)",
+   "ime_tests.py: four directed tiers (ime_mx_/ime_mxs_/ime_mxn_/ime_mxl_), mx_scale_image, mx_element_plan, integer-only on-DUT reference path, --emit-mx, 6 new check_*",
+   "ime_stress.py: mx geometries routed to emit_mx_test (fixed a KeyError:4 that my own earlier pool wiring introduced)",
+   "sim_check.py: MX execution branch (int_scaled_gemm, no G/psm/rnd, no LMUL step loop), Machine.bs / .altfmt / .altfmt_ab, v0 paired-scale read, scalar `sub`",
+   "sim_check.py: sub-byte (MXINT4) element addressing in Machine.vget/vset -- round six is the first family with EEW_A=4; this was a real bug the meta-judge caught",
+   "sim_check.py: mx tier in _every_geometry, _allocatable passes reserve_v0, simulate() routes mx via mx_random_plan/emit_mx_test",
+   "sim_check.py: 3 new checks -- scale-layout control (teeth), one-sided nibble-order control (teeth), and a proof that the modulo-2**SEW sabotage is structurally unobservable in this tier",
+   "prompts/: implement.md, system.md, debug.md, spike_task.md retargeted to round six; added the four lessons not already covered (fpMatrix FU classification, no fus.size-merging to dodge checks, OCP MX v1.0 for OFP8/OFP4 special values, +max-cycles vs real failure); reps=3 majority was already covered in all three; removed two stale hard-coded 27/27 pass counts"
+  ],
+  "remaining": [
+   "rebase RTL base onto r18_0919_1725/best_rtl.diff once its regression completes",
+   "submit the loop when chipyard frees up"
+  ],
+  "regression": "rvv_ref 27/27, ime_tests 8/8, ime_encodings ok, ime_stress pool ok; S1 gate still emits 638 programs with identical tier counts to r17",
+  "notes": "no ray job submitted, so tools/ledger.py (which scans r*/trace/) has no new row",
+  "verification": {
+   "rounds_1_5_byte_identical": "re-verified after the sim_check work: 638/638 unchanged, 0 changed, 0 missing",
+   "gate_counts": "638 -> 771 (+133 mx: 41 W=2, 58 W=4, 34 W=8); the eight pre-existing tier counts unchanged",
+   "self_tests": "rvv_ref 27, ime_encodings 7, ime_tests 17, ime_stress 4, sim_check 12+3 -- all green",
+   "assembly": "all 133 new programs assemble with riscv64-unknown-elf-gcc via docker exec (no cluster)",
+   "sim_check": "830 geometries / 2430 executions, 0 failed (was 638 / 1854); all 192 mx geometries in the meta-judge"
+  },
+  "incidents": [
+   "the ime_tests subagent ran preflight.py, which submits to the Ray cluster, against instruction; it was killed during the Saturn elaborate step. Verified afterwards: no leaked job (the only RUNNING entrypoints are the other agents' verify_rtl_diff.py and run_membound.py) and git status shows five Python files, no RTL."
+  ],
+  "findings": [
+   "Machine.vget/vset computed width = eew//8, which is 0 for MXINT4, so every Int4 A/B read returned 0. Found by the meta-judge sweep, not by inspection. All 88 bfloat16-cell failures traced to this one line.",
+   "A modulo-2**SEW block dot product is PROVABLY undetectable by round six's directed tier: p_C < SEW in all seven cells (11<16, 8<16, 24<32, 53<64) and every program bounds |dot| by 2**p_C, so the wrap is the identity. Shipped as a checked arithmetic proof rather than a green-but-meaningless control. The property is witnessed instead by rvv_ref's own control (free to use peak native operands) and by Stage 3 lockstep.",
+   "A nibble-order control must sabotage ONE side only: swapping both A and B reorders the terms of a sum and changes nothing."
+  ]
+ },
+ {
+  "round": 6,
+  "id": "r19_0919_2116",
+  "kind": "CHIA loop run",
+  "started": "2026-09-19T21:17+08:00",
+  "ended": "2026-09-20T05:22+08:00",
+  "wall_minutes": 486,
+  "llm_cost_usd": 153.8918,
+  "insns": [
+   "vfwimmacc.vv",
+   "vfqimmacc.vv",
+   "vf8wimmacc.vv"
+  ],
+  "submission_id": "titan-r19_0919_2116",
+  "entrypoint": "tools/run_loop.py (thin wrapper: installs verify_rtl_diff's rotated-worker-log retry, then calls titan_loop.main())",
+  "model_seed": {
+   "path": "r17_round5.diff",
+   "sha256_12": "f7e2b14f4e78",
+   "why": "--model-seed not --model-diff: round six adds instructions, so Stage M must RUN on top of the converged round-five model rather than be skipped"
+  },
+  "rtl_diff": {
+   "path": "r18_0919_1725/best_rtl.diff",
+   "sha256": "0ead0527075509208b0035f6c0d1cbae6dfe3be132d6c81b3f2e3e431be90400",
+   "why": "r17 + the AddrGen tile page-carry fix (1 bit -> full page-number delta); verified by negative control on r17, key test on r18, and a full unsampled 837-test RVV regression with 0 failing"
+  },
+  "env": {
+   "TITAN_LOG_ROOT": "/share1/.../titan_runs (explicit; the default /tmp/titan violates the project rule)",
+   "TITAN_REGRESSION_SAMPLE": "150 (explicit; default 0 means no sampling)",
+   "TITAN_INSNS": "all",
+   "TITAN_MAX_ITERS": "10"
+  },
+  "resources_at_submit": "chipyard 0/1, verilator_run 0/16, riscv_build 0/4, 0 running jobs",
+  "result": "stopped deliberately at S1 attempt7; directed 255/255, S2 blocked by a structural flaw (below), Gate and S3 never reached",
+  "stage_m": {
+   "seed": "255 total: 122 pass (all of rounds 1-5), 133 failing (exactly the new tier: 82 ime_mx + 25 ime_mxn + 23 ime_mxs + 3 ime_mxl)",
+   "attempt2": "252 pass, 2 failing (ime_mxl_vfqimmacc, ime_mxl_vf8wimmacc), 1 skip",
+   "attempt3": "252 pass, 2 failing (same as attempt2); the turn itself diagnosed the cause and recorded a fix, so the numbers repeat by construction -- attempt4 measures it. Turn cost $13.31, 949.7s, 48 turns.",
+   "attempt4": "255/255 CONVERGED -- all 122 rounds 1-5 programs and all 133 new round-six programs pass on the Spike model",
+   "cost": "4 LLM turns, $42.82 total (4.75 + 9.36 + 13.31 + 15.40), 4009s of turn time, wall 21:21-22:31 (70 min)"
+  },
+  "findings": [
+   "r19 Stage M attempt2: the 2 remaining failures are case 0 of the mxl tier -- the CANONICAL LEGAL cell -- where the Spike model writes vtype.lambda=0 for a requested lambda=1 at SEW=32 (vfqimmacc) and SEW=64 (vf8wimmacc) but retains it at SEW=16 (vfwimmacc). Verified this is a MODEL defect and not a judge bug by running all three ime_mxl_ programs against the rvv_ref reference model in sim_check: all three PASS.",
+   "The ime_mxl_ tier had NO meta-judge: it is emitted per-mnemonic rather than per-geometry, so sim_check geometry sweep never reached it, and sim_check could not even assemble it (no CSR or trap support). Closed by adding IllegalInstruction, mtvec/mepc/mcause, mret, text-label la and the _TEXT_STRIDE convention, plus check_mxl_tier and a permissive-model negative control.",
+   "The ime_mxl_ verdict could not say WHICH case skipped, which is what made the above misattribution possible and cost the Stage M agent an iteration. Fixed: each case now loads its index into a3 and the skip format carries case=%d. Verified by injecting a vill-setting vsetvl into the model and observing case=3. Scope checked: exactly the 3 ime_mxl_ programs changed, rounds 1-5 byte-identical."
+  ],
+  "corrections": [
+   "CORRECTION to my earlier report: I attributed the 2 mxl failures to case 0, the canonical legal cell. That was wrong. The mxl TITAN SKIP line printed the program NOMINAL geometry header, not the failing case, so it did not identify which case skipped. The real culprit is case 3 (altfmt=1 reserved at SEW=32/64) and its altfmt_A/altfmt_B siblings.",
+   "CORRECTION: I said all three ime_mxl_ programs passing in sim_check proved the judge right. That evidence was weaker than presented -- sim_check passes them partly BECAUSE its _vsetvl never models vill, so it could not reproduce the disputed behaviour. The conclusion still holds, but on different evidence: every check_*_legality call in the Sail sits inside an INSTRUCTION body (5583-5913), never in a vsetvl path, and the only vill mentions in the spec concern reading IME fields when vill is already 1. Legality therefore belongs to the consuming instruction; vsetvl must retain lambda. The Stage M agent reached the same conclusion independently via objdump and fixed it."
+  ],
+  "stage_s1": {
+   "started": "2026-09-19T22:31+08:00",
+   "rtl_base": "r18 applied as rtl_resume.diff; AddrGen page-carry fix present",
+   "attempt0": "255 total: 122 pass (all rounds 1-5 intact on the r18 RTL), 133 failing = exactly the new tier. All 133 are MISMATCH, not trap -- the RTL executes something for vm=0 on funct6 0x39/0x3a/0x3b rather than rejecting it, i.e. it is still running the vm=1 integer path. All three ime_mxl_ programs fail, which is the vm split being wrong.",
+   "independent_signal": "122/122 on the directed suite is a second, independent confirmation that the r18 AddrGen page-carry fix broke nothing, alongside the 837-test RVV regression run before it."
+  },
+  "attempts": [
+   {
+    "stage": "model",
+    "attempt": "seed",
+    "files": {
+     "diff": "20260919_212135_model_seed.diff",
+     "build": "20260919_212221_model_seed_build.stdout.txt",
+     "json": "20260919_212232_model_seed.json",
+     "simlogs": "20260919_212232_model_seed.simlogs.txt",
+     "other": "20260919_212232_model_seed_note.md"
+    },
+    "outcome": {
+     "total": 255,
+     "counts": {
+      "bad_geometry": 37,
+      "mismatch": 3,
+      "pass": 122,
+      "trap": 93
+     },
+     "failing": 133,
+     "failing_by_tier": {
+      "ime_mx": 82,
+      "ime_mxs": 23,
+      "ime_mxn": 25,
+      "ime_mxl_vfwimmacc": 1,
+      "ime_mxl_vfqimmacc": 1,
+      "ime_mxl_vf8wimmacc": 1
+     }
+    },
+    "sim_plus_queue_seconds": 11.6,
+    "ended": "2026-09-19T21:22:32+08:00"
+   },
+   {
+    "stage": "model",
+    "attempt": "attempt1",
+    "files": {
+     "llm": "20260919_215108_model_llm_attempt1.md",
+     "build": "20260919_215146_model_build_attempt1.stdout.txt"
+    },
+    "cost_usd": 15.3996,
+    "turn_seconds": 1708.6,
+    "turns": 109,
+    "summary": "",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 15.3996,
+    "outcome": {
+     "build_failed": true,
+     "evidence": "a later artifact exists, so the loop moved past this attempt without a verdict",
+     "note": "no verdict json and no simlogs: the tree did not build, so this attempt has no pass/fail numbers"
+    },
+    "build_seconds": 38.8,
+    "ended": "2026-09-19T21:51:46+08:00"
+   },
+   {
+    "stage": "model",
+    "attempt": "attempt2",
+    "files": {
+     "llm": "20260919_220440_model_llm_attempt2.md",
+     "build": "20260919_220450_model_build_attempt2.stdout.txt",
+     "json": "20260919_220454_model_attempt2.json",
+     "simlogs": "20260919_220454_model_attempt2.simlogs.txt"
+    },
+    "cost_usd": 9.3613,
+    "turn_seconds": 770.6,
+    "turns": 39,
+    "summary": "## 修正\n\n1. **`riscv/ime_mx_ext_macros.h`** 重寫成純 macros:四個 `IME_MX_DEFAULT_NAN_*` 常數 + 一個 `IME_MX_INT_SCALED_GEMM_LOOP(FP_BITS_T, DEFAULT_NAN, DECODE_SCALE, IS_NAN, FMUL, FADD, ITOFP)` 巨集,把 SAIL `int_scaled_gemm` 的內迴圈逐字展開。內部用底線前綴的區域變數名避開與 insn scope 名稱衝突。\n\n2. **三個 insn shell** 保留原本的 require/geometry/legality checks,把 fmt_C 相關的 helpers 改成**區域 lambdas**(函式範圍內合法),然後透過 macro 展開共用迴圈。每個 insn shell 依 (SEW, altfmt) 分派到正確的分支並用適當的 `FP_BITS_T` (`uint16_t` / `uint32_t` / `uint64_t`) 與 lambdas 名稱來 invoke macro。\n\n3. **保留 attempt 1 的**:`vector_unit.cc` 的 `altfmt=1` 放寬(修 37 個 bad_geometry 失敗)、`encoding.h` 註解更新。\n\n語意跟 attempt 1 完全相同 —— 只是換了 C++ 結構讓它能在函式主體內部被 include 而不觸發 nested-function/template 錯誤。",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 24.7609,
+    "outcome": {
+     "total": 255,
+     "counts": {
+      "bad_geometry": 2,
+      "pass": 252,
+      "skip": 1
+     },
+     "failing": 2,
+     "failing_by_tier": {
+      "ime_mxl_vfqimmacc": 1,
+      "ime_mxl_vf8wimmacc": 1
+     }
+    },
+    "build_seconds": 10.1,
+    "sim_plus_queue_seconds": 3.9,
+    "ended": "2026-09-19T22:04:54+08:00"
+   },
+   {
+    "stage": "model",
+    "attempt": "attempt3",
+    "files": {
+     "llm": "20260919_222046_model_llm_attempt3.md",
+     "build": "20260919_222055_model_build_attempt3.stdout.txt",
+     "json": "20260919_222058_model_attempt3.json",
+     "simlogs": "20260919_222058_model_attempt3.simlogs.txt"
+    },
+    "cost_usd": 13.3147,
+    "turn_seconds": 949.7,
+    "turns": 48,
+    "summary": "## 修正\n\n`riscv/vector_unit.cc` 一個變更:把 SEW=16/SEW=8 的兩個特例 fallback 換成單一 `else ill_altfmt = false;` catchall。\n\n理由 (寫在新註解裡):\n1. RVV spec 說 `vtype` 中 reserved 的欄位是 WARL,不能因為它們設成沒定義的值就強制 `vill=1`。\n2. IME spec 明確說 `bs`/`altfmt_A`/`altfmt_B` 的合法性檢查是**延遲到消費它們的 instruction**,不是在 vsetvl 檢查。對 `altfmt` (Zvfbfa 的 bit) 套用同樣的原則,以配合 WARL 掃描測試的期望。\n3. 微縮 insn shells 已經自己用 `require()` 檢查每個 fmt_C 的 altfmt 限制;基本 FP 指令在 SEW>=32 時忽略 altfmt。所以放寬 vsetvl 不會漏測任何非法組合。\n4. 保留原本的 extension-based accept checks (`EXT_ZVQBDOT8I`/`16I`/`ZVFWBDOT16BF`) 當作 silicon 實作的文件參考。\n\n沒有變更其他檔案。",
+    "refuted_hypotheses": [
+     "2. IME spec 明確說 `bs`/`altfmt_A`/`altfmt_B` 的合法性檢查是**延遲到消費它們的 instruction**,不是在 vsetvl 檢查。對 `altfmt` (Zvfbfa 的 bit) 套用同樣的原則,以配合 WARL 掃描測試的期望。"
+    ],
+    "stage_cost_to_date_usd": 38.0756,
+    "outcome": {
+     "total": 255,
+     "counts": {
+      "bad_geometry": 2,
+      "pass": 252,
+      "skip": 1
+     },
+     "failing": 2,
+     "failing_by_tier": {
+      "ime_mxl_vfqimmacc": 1,
+      "ime_mxl_vf8wimmacc": 1
+     }
+    },
+    "build_seconds": 8.7,
+    "sim_plus_queue_seconds": 3.4,
+    "ended": "2026-09-19T22:20:58+08:00"
+   },
+   {
+    "stage": "model",
+    "attempt": "attempt4",
+    "files": {
+     "llm": "20260919_223041_model_llm_attempt4.md",
+     "build": "20260919_223126_model_build_attempt4.stdout.txt",
+     "json": "20260919_223130_model_attempt4.json",
+     "simlogs": "20260919_223130_model_attempt4.simlogs.txt"
+    },
+    "cost_usd": 4.7477,
+    "turn_seconds": 579.7,
+    "turns": 12,
+    "summary": "## 修正\n\n`riscv/vector_unit.h` 一個變更:`ime_lambda_supported()` 改成 `emul_c != 0 && (emul_c & (emul_c - 1)) == 0`,只要是正整數 2 次冪就接受,不再與字面集合比對。每個 multiply-accumulate insn shell 本來就用自己的 `require()` 強制執行 `{1,2,4,8,16}`,所以如果排到 EMUL_C=32 的指令仍會 trap;SEW=8 迭代在 mxl_ 測試中也另外因為 SEW=8 是保留編碼 (vfqimmacc 要求 sew ∈ {16,32},vf8wimmacc 要求 sew ∈ {32,64}) 而 trap,這正是測試 `beq x25, 1` 所預期的行為。\n\n沒有變更其他檔案。",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 42.8233,
+    "outcome": {
+     "total": 255,
+     "counts": {
+      "pass": 255
+     },
+     "failing": 0,
+     "failing_by_tier": {}
+    },
+    "build_seconds": 45.4,
+    "sim_plus_queue_seconds": 3.9,
+    "ended": "2026-09-19T22:31:30+08:00"
+   },
+   {
+    "stage": "s1",
+    "attempt": "attempt0",
+    "files": {
+     "build": "20260919_223355_impl_resume_build_attempt0.stdout.txt",
+     "json": "20260919_224648_impl_resume_directed_attempt0.json",
+     "simlogs": "20260919_224648_impl_resume_directed_attempt0.simlogs.txt"
+    },
+    "outcome": {
+     "total": 255,
+     "counts": {
+      "mismatch": 133,
+      "pass": 122
+     },
+     "failing": 133,
+     "failing_by_tier": {
+      "ime_mx": 82,
+      "ime_mxs": 23,
+      "ime_mxn": 25,
+      "ime_mxl_vfwimmacc": 1,
+      "ime_mxl_vfqimmacc": 1,
+      "ime_mxl_vf8wimmacc": 1
+     }
+    },
+    "sim_plus_queue_seconds": 772.6,
+    "ended": "2026-09-19T22:46:48+08:00"
+   },
+   {
+    "stage": "s1",
+    "attempt": "attempt1",
+    "files": {
+     "llm": "20260919_235325_impl_llm_attempt1.md",
+     "diff": "20260919_235327_impl_diff_attempt1.diff",
+     "build": "20260919_235546_impl_build_attempt1.stdout.txt",
+     "json": "20260920_000630_impl_directed_attempt1.json",
+     "simlogs": "20260920_000630_impl_directed_attempt1.simlogs.txt"
+    },
+    "cost_usd": 32.5563,
+    "turn_seconds": 3992.9,
+    "turns": 183,
+    "summary": "",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 32.5563,
+    "outcome": {
+     "total": 255,
+     "counts": {
+      "mismatch": 95,
+      "pass": 160
+     },
+     "failing": 95,
+     "failing_by_tier": {
+      "ime_mx": 44,
+      "ime_mxs": 23,
+      "ime_mxn": 25,
+      "ime_mxl_vfwimmacc": 1,
+      "ime_mxl_vfqimmacc": 1,
+      "ime_mxl_vf8wimmacc": 1
+     }
+    },
+    "build_seconds": 140.2,
+    "sim_plus_queue_seconds": 644.3,
+    "ended": "2026-09-20T00:06:30+08:00"
+   },
+   {
+    "stage": "s1",
+    "attempt": "attempt2",
+    "files": {
+     "llm": "20260920_010223_impl_llm_attempt2.md",
+     "diff": "20260920_010224_impl_diff_attempt2.diff",
+     "build": "20260920_010439_impl_build_attempt2.stdout.txt",
+     "json": "20260920_011514_impl_directed_attempt2.json",
+     "simlogs": "20260920_011514_impl_directed_attempt2.simlogs.txt"
+    },
+    "cost_usd": 21.1379,
+    "turn_seconds": 3348.8,
+    "turns": 151,
+    "summary": "",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 53.6942,
+    "outcome": {
+     "total": 255,
+     "counts": {
+      "mismatch": 81,
+      "pass": 174
+     },
+     "failing": 81,
+     "failing_by_tier": {
+      "ime_mx": 30,
+      "ime_mxs": 23,
+      "ime_mxn": 25,
+      "ime_mxl_vfwimmacc": 1,
+      "ime_mxl_vfqimmacc": 1,
+      "ime_mxl_vf8wimmacc": 1
+     }
+    },
+    "build_seconds": 136.5,
+    "sim_plus_queue_seconds": 635.0,
+    "ended": "2026-09-20T01:15:14+08:00"
+   },
+   {
+    "stage": "s1",
+    "attempt": "attempt3",
+    "files": {
+     "llm": "20260920_015339_impl_llm_attempt3.md",
+     "diff": "20260920_015340_impl_diff_attempt3.diff",
+     "build": "20260920_015555_impl_build_attempt3.stdout.txt",
+     "json": "20260920_020308_impl_directed_attempt3.json",
+     "simlogs": "20260920_020308_impl_directed_attempt3.simlogs.txt"
+    },
+    "cost_usd": 16.5659,
+    "turn_seconds": 2300.7,
+    "turns": 106,
+    "summary": "",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 70.2601,
+    "outcome": {
+     "total": 255,
+     "counts": {
+      "mismatch": 51,
+      "pass": 204
+     },
+     "failing": 51,
+     "failing_by_tier": {
+      "ime_mxs": 23,
+      "ime_mxn": 25,
+      "ime_mxl_vfwimmacc": 1,
+      "ime_mxl_vfqimmacc": 1,
+      "ime_mxl_vf8wimmacc": 1
+     }
+    },
+    "build_seconds": 135.9,
+    "sim_plus_queue_seconds": 433.0,
+    "ended": "2026-09-20T02:03:08+08:00"
+   },
+   {
+    "stage": "s1",
+    "attempt": "attempt4",
+    "files": {
+     "llm": "20260920_023658_impl_llm_attempt4.md",
+     "diff": "20260920_023659_impl_diff_attempt4.diff",
+     "build": "20260920_023919_impl_build_attempt4.stdout.txt",
+     "json": "20260920_024116_impl_directed_attempt4.json",
+     "simlogs": "20260920_024116_impl_directed_attempt4.simlogs.txt"
+    },
+    "cost_usd": 13.2142,
+    "turn_seconds": 2025.4,
+    "turns": 90,
+    "summary": "",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 83.4743,
+    "outcome": {
+     "total": 255,
+     "counts": {
+      "mismatch": 3,
+      "pass": 252
+     },
+     "failing": 3,
+     "failing_by_tier": {
+      "ime_mxl_vfwimmacc": 1,
+      "ime_mxl_vfqimmacc": 1,
+      "ime_mxl_vf8wimmacc": 1
+     }
+    },
+    "build_seconds": 141.6,
+    "sim_plus_queue_seconds": 116.8,
+    "ended": "2026-09-20T02:41:16+08:00"
+   },
+   {
+    "stage": "s1",
+    "attempt": "attempt5",
+    "files": {
+     "llm": "20260920_033201_impl_llm_attempt5.md",
+     "diff": "20260920_033203_impl_diff_attempt5.diff",
+     "build": "20260920_033840_impl_cosim_build_attempt5.stdout.txt",
+     "json": "20260920_035911_impl_regression_attempt5.json",
+     "simlogs": "20260920_035911_impl_regression_attempt5.simlogs.txt"
+    },
+    "cost_usd": 20.216,
+    "turn_seconds": 3041.2,
+    "turns": 134,
+    "summary": "",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 103.6903,
+    "outcome": {
+     "kind": "regression",
+     "failing": 40,
+     "modes": {
+      "died before committing": 16,
+      "bootrom divergence": 17,
+      "deep divergence": 7
+     }
+    },
+    "build_seconds": 398.3,
+    "sim_plus_queue_seconds": 1231.4,
+    "ended": "2026-09-20T03:59:11+08:00"
+   },
+   {
+    "stage": "s1",
+    "attempt": "attempt6",
+    "files": {
+     "llm": "20260920_043730_impl_llm_attempt6.md",
+     "diff": "20260920_043732_impl_diff_attempt6.diff",
+     "build": "20260920_044423_impl_cosim_build_attempt6.stdout.txt",
+     "json": "20260920_050010_impl_regression_attempt6.json",
+     "simlogs": "20260920_050010_impl_regression_attempt6.simlogs.txt"
+    },
+    "cost_usd": 6.0936,
+    "turn_seconds": 2295.5,
+    "turns": 77,
+    "summary": "",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 109.7839,
+    "outcome": {
+     "kind": "regression",
+     "failing": 39,
+     "modes": {
+      "died before committing": 18,
+      "bootrom divergence": 14,
+      "deep divergence": 7
+     }
+    },
+    "build_seconds": 412.3,
+    "sim_plus_queue_seconds": 947.8,
+    "ended": "2026-09-20T05:00:10+08:00"
+   },
+   {
+    "stage": "s1",
+    "attempt": "attempt7",
+    "files": {
+     "llm": "20260920_051753_impl_llm_attempt7.md",
+     "diff": "20260920_051755_impl_diff_attempt7.diff",
+     "build": "20260920_052015_impl_build_attempt7.stdout.txt"
+    },
+    "cost_usd": 1.2846,
+    "turn_seconds": 1058.8,
+    "turns": 28,
+    "summary": "",
+    "refuted_hypotheses": [],
+    "stage_cost_to_date_usd": 111.0685,
+    "outcome": {
+     "build_failed": true,
+     "evidence": "a later artifact exists, so the loop moved past this attempt without a verdict",
+     "note": "no verdict json and no simlogs: the tree did not build, so this attempt has no pass/fail numbers"
+    },
+    "build_seconds": 141.9,
+    "ended": "2026-09-20T05:20:15+08:00"
+   }
+  ],
+  "cost_by_stage_usd": {
+   "model": 42.8233,
+   "s1": 111.0685
+  },
+  "analysis": {
+   "s1_attempt1": {
+    "result": "160 pass / 95 failing (from 122/133). +38 programs, all of them in the ime_mx_ exactness tier (82 -> 44 failing).",
+    "unmoved": "ime_mxs_ 23/23, ime_mxn_ 25/25, ime_mxl_ 3/3 all still failing -- the E8M0 scale front-end, the NaN early exit and the vm/legality decode are untouched so far.",
+    "failing_cells": {
+     "W=2 SEW=16 altfmt=1": 14,
+     "W=4 SEW=16 altfmt=0": 10,
+     "W=4 SEW=16 altfmt=1": 10,
+     "W=8 SEW=32 altfmt=0": 10
+    },
+    "passing_cells": [
+     "W=2 SEW=16 altfmt=0 (Int8 -> binary16)",
+     "W=4 SEW=32 altfmt=0 (Int8 -> binary32)",
+     "W=8 SEW=64 altfmt=0 (Int8 -> binary64)"
+    ],
+    "diagnosis": "The split is exact and separates into TWO independent defects, not a general arithmetic error: (1) every cell with MXINT4 inputs (EEW_A = SEW/W = 4) fails and every MXINT8 cell passes -> sub-byte unpacking is not implemented; (2) the one Int8 cell with altfmt=1 (bfloat16 accumulator) fails while its binary16 sibling passes -> the bfloat16 C format is not implemented. No third pattern is needed to explain all 44.",
+    "note": "This mirrors the bug found earlier in the meta-judge: sim_check computed width = eew//8, which is 0 at EEW_A=4. Round six is the first family in the project with sub-byte A/B elements, so the model, the RTL and the simulator each had to learn it independently.",
+    "cost_signal": "$32.5563 / 183 turns / 3993s of LLM time for +38 programs. This single attempt is 76% of the entire Stage M ($42.82, 4 attempts). Watch attempt2: if it costs the same order and moves fewer programs, that is a signal to raise rather than keep burning.",
+    "correction": "Sharper reading of the SAME numbers, from tools/mx_triage.py: attempt 1 did NOT partly fix the two named defects. int4 held at 30->30 and bf16 at 24->24, both UNCHANGED. What it fixed was the THIRD group -- the plain MXINT8 -> binary16/binary32/binary64 cells carrying neither defect -- which went 38->0, FIXED. So +38 is one group completely done and zero movement on either named defect, which is a different situation from -38 spread across them.",
+    "tooling": "tools/mx_triage.py triages a verdict by defect class rather than pass count. Its first version tracked only int4 and bf16 and therefore flagged attempt 1 as SUSPICIOUS -- a group it did not track (neither) had moved. Fixed to track all three; an untracked group is one whose progress looks like an anomaly. --check asserts its cell table against rvv_ref.MX_CELLS so the two cannot drift."
+   },
+   "s1_attempt2": {
+    "result": "174 pass / 81 failing (from 160/95). +14.",
+    "by_defect": "bf16-only 14 -> 0 FIXED (the bfloat16 accumulator defect is resolved; every surviving bf16 case is a W=4 SEW=16 cell also carrying int4). int4 30 -> 30 UNCHANGED, untouched. neither 0 -> 0.",
+    "unmoved": "ime_mxs_ 23, ime_mxn_ 25, ime_mxl_ 3 -- all three still at 100% failing, unchanged across BOTH attempts.",
+    "cost": "$21.1379 / 151 turns / 3349s. Cheaper than attempt1 but $1.51 per program fixed vs attempt1 $0.86 -- cost per program nearly doubled.",
+    "tooling": "mx_triage gained a sole-vs-compound distinction: bf16 read as partial (24->10) only because the compound int4+bf16 cells are counted under both. bf16-only went 14->0, which is the true state. A compound class can hide a fully resolved defect."
+   },
+   "cost_signal_raised": {
+    "as_of": "S1 attempt2",
+    "numbers": "2 S1 attempts, $53.69, directed 122 -> 174 pass (+52 of 133). Cumulative run cost $96.52 (Stage M $42.82 + S1 $53.69).",
+    "concern": "The 51 programs in ime_mxs_ / ime_mxn_ / ime_mxl_ have moved ZERO across both attempts. Those three tiers are the E8M0 scale front-end, the NaN early exit and the vm/legality decode -- i.e. essentially all of round six's actual novelty. Both attempts so far worked only inside ime_mx_, the tier with scales pinned to 1.0 and a single block.",
+    "projection": "81 programs remain. At attempt2's $1.51/program that is ~$122 more if the rate holds, and the remaining work is the harder, untouched machinery rather than more of the same, so the rate is more likely to worsen than hold. TITAN_MAX_ITERS=10 leaves 8 attempts."
+   },
+   "s1_attempt3": {
+    "result": "204 pass / 51 failing (from 174/81). +30. The whole ime_mx_ tier is now clean: 82 -> 0 across three attempts.",
+    "by_defect": "int4 30 -> 0 FIXED. bf16 10 -> 0 FIXED (its residue was the compound int4 cells). Both named defects are closed.",
+    "unmoved": "ime_mxs_ 23, ime_mxn_ 25, ime_mxl_ 3 -- unchanged across all THREE attempts. The remaining 51 failures are exactly these three tiers.",
+    "cost": "$16.5659 / 106 turns / 2301s. $0.55 per program fixed -- the best rate of the three (a1 $0.86, a2 $1.51, a3 $0.55), so the worsening trend I flagged after attempt2 did not hold.",
+    "static_signal": "Checked the diff before the verdict: every scale-front-end marker (read_block_scales, E8M0, scale_A, S_blocks/block_size) was byte-identical in count to attempt2, while nibble markers went 23 -> 27. attempt3 worked only on int4, which the verdict then confirmed.",
+    "decision": "mx_triage --decide returned CONTINUE (exit 0) on the int4-reaches-zero branch, not on tier movement. The stop rule was written to treat this as progress precisely because finishing int4 forces the work onto the scale front-end."
+   },
+   "s1_attempt4_prediction": {
+    "made_at": "02:37, before the build and verdict",
+    "markers": {
+     "scale front-end": "39 -> 60 GREW",
+     "NaN early exit": "17 -> 46 GREW",
+     "vm / legality": "297 -> 302 GREW",
+     "int4 / nibble": "45 -> 45 unchanged",
+     "bfloat16 / altfmt": "146 -> 151 GREW"
+    },
+    "prediction": "All three stuck tiers were ATTEMPTED this time -- the first attempt in the run to touch them. int4 will not move (it is already 0). Whether the three tiers actually fall is unknown: a grown marker group says only that the machinery was written, not that it works.",
+    "to_validate": "Compare against the verdict. If the three tiers stay at 23/25/3 despite all three marker groups growing, that is a MISSED PREDICTION and worth recording: it would mean the markers name the machinery correctly but the implementation is wrong, which is a different situation from the agent not having attempted it.",
+    "cost": "$13.2142 / 90 turns / 2025s -- the cheapest S1 attempt so far."
+   },
+   "s1_attempt4": {
+    "result": "252 pass / 3 failing (from 204/51). +48. ime_mxs_ 23->0 and ime_mxn_ 25->0 both cleared. Only ime_mxl_ (3 legality programs) remains.",
+    "prediction_outcome": "HIT. The pre-verdict probe predicted all three stuck tiers were attempted (scale front-end 39->60, NaN 17->46, vm/legality 297->302 all GREW) and that int4 would not move. Two of the three attempted tiers fell completely; ime_mxl_ was attempted but did not move, which is exactly the asymmetry the probe is documented to have -- a grown marker means attempted, not working.",
+    "cost": "$13.2142 / 90 turns / 2025s = $0.28 per program fixed, by far the best of the five attempts (a1 $0.86, a2 $1.51, a3 $0.55, a4 $0.28).",
+    "cost_caveat_outcome": "I warned against extrapolating $0.55 to the remaining 51 because they were untouched machinery. That caution was right to make but wrong in direction: the scale front-end and NaN exit came in CHEAPER, not dearer. Recording the miss rather than quietly dropping it.",
+    "decision": "mx_triage --decide: CONTINUE (exit 0), on the tier-movement branch. Not reseeding."
+   },
+   "s1_attempt5_prediction": {
+    "made_at": "03:33, before build and verdict",
+    "markers": {
+     "vm / legality": "302 -> 309 GREW",
+     "bfloat16 / altfmt": "151 -> 158 GREW",
+     "scale front-end": "60 -> 60 unchanged",
+     "NaN early exit": "46 -> 46 unchanged",
+     "int4": "45 -> 45 unchanged"
+    },
+    "prediction": "ime_mxl_ was attempted. Both grown groups are consistent with the known target: the three survivors are reserved-altfmt / altfmt_A cases, which touch the legality path and the altfmt decode together.",
+    "limit_of_the_probe": "The probe predicts MOVEMENT, not direction. For ime_mxs_ / ime_mxn_ / ime_mx_, which are already at 0, unchanged markers predict they stay at 0 -- but a REGRESSION would also be movement that unchanged markers failed to anticipate. The probe cannot see that, so the verdict must be checked for regressions in the already-cleared tiers, not only for progress in ime_mxl_.",
+    "cost": "$20.2160 / 134 turns / 3041s"
+   },
+   "s1_attempt5": {
+    "result": "255 / 255. The directed suite is CLEAN -- all four tiers at 0, including the 133 new round-six programs and the 122 rounds 1-5 regression programs.",
+    "prediction_outcome": "HIT. ime_mxl_ 3 -> 0. And the regression risk the probe explicitly could not see did not materialise: ime_mx_, ime_mxs_ and ime_mxn_ all held at 0.",
+    "cost": "$20.2160 / 134 turns / 3041s.",
+    "stage_totals": "S1: 5 attempts, $103.69, directed 122/255 -> 255/255. Run cumulative $146.51 (Stage M $42.82 + S1 $103.69)."
+   },
+   "s1_attempt6": {
+    "result": "NO CODE CHANGE. The attempt6 diff is byte-identical to attempt5 (sha256 31a6987d2ece063b on both, 5176 lines each). best_rtl.diff is therefore UNCONTAMINATED -- the quarantine flag I raised is resolved by the agent not having taken the bait.",
+    "what_the_agent_did": "Handed 40 RVV regression failures, it investigated instead of patching, and concluded all 40 were trace-bridge false reports.",
+    "its_evidence": [
+     "run_rvv_start(\"failing\", reps=3): 36/40 passed 3/3 reps, 4/40 passed 2/3 (flaky, majority pass), REAL failures 0.",
+     "Several tests marked failed contain *** PASSED *** in their own sim logs (vaadd_vx-3, vfnmacc_vv-0, vfsub_vf-0).",
+     "Uniform fingerprint: PC mismatch in the bootrom wfi/jal loop with the DUT reporting PC 0x10000, which would require a reset. The bootrom contains no vsetvli, so the divergence cannot originate in any IME change.",
+     "Read cospike_impl.cc: it compares only (PC, int/fp rd wdata) and does NOT compare vtype/vconfig, so attempt5 WARL change to vtype.lambda cannot cause divergence. VType.vl() uses vsew/vlmul only, not lambda."
+    ],
+    "cost": "$6.0936 / 77 turns / 2296s -- the cheapest S1 attempt, and it bought a verified negative result rather than a change.",
+    "independence": "This corroborates my own diagnosis by a DIFFERENT route. Mine was failure-mode classification plus the uniform 4-byte PC skew across unrelated instruction families; the agent used reps=3 majority, direct log inspection, and reading the cosim comparator source. Neither used the other input.",
+    "note_on_my_prediction": "diff_probe predicted no tier movement because no marker group grew. It was right for an unanticipated reason: nothing grew because NOTHING changed at all. The probe cannot distinguish \"changed elsewhere\" from \"changed nothing\"; comparing the diffs directly is what settled it."
+   }
+  },
+  "stop_rule": {
+   "agreed_at": "after S1 attempt2",
+   "evaluate_at": "S1 attempt3 verdict",
+   "continue_if": [
+    "any of ime_mxs_ / ime_mxn_ / ime_mxl_ moves off 23 / 25 / 3",
+    "int4 reaches 0 (the sub-byte defect is finished, so the work is forced to move on)"
+   ],
+   "stop_and_reseed_if": "three attempts, ~$75, with all three tiers untouched -- take best_rtl.diff as the intermediate result and resubmit with a note directing the E8M0 scale front-end first. No further approval needed.",
+   "encoded_in": "tools/mx_triage.py --decide <cur.json> <prev.json>; exit 0 = continue, exit 3 = stop and reseed",
+   "dry_run_against_attempt2": "STOP AND RESEED (as expected -- attempt2 is only the second attempt, so the rule is being validated, not applied)",
+   "applied_at_attempt3": "CONTINUE -- int4 reached zero. Not reseeding. Re-evaluate at attempt4: the three tiers have now been static for three attempts and there is no shallower work left, so attempt4 must move them or the same concern returns with nothing left to explain it.",
+   "fix": {
+    "bug": "The int4 clause read the STATE int4 == 0, which becomes permanently true once int4 is fixed. Every later attempt would then be handed a CONTINUE regardless of how stuck the three tiers were -- exactly the situation the rule exists to catch.",
+    "fix": "Both clauses are now differences against the previous attempt. int4 is an EVENT: nonzero -> zero in THIS attempt.",
+    "regression": {
+     "a1 vs a0": "STOP (exit 3)",
+     "a2 vs a1": "STOP (exit 3)",
+     "a3 vs a2": "CONTINUE (exit 0), on the int4-finished-here branch",
+     "hypothetical a4 unchanged vs a3": "STOP (exit 3) -- the case the bug would have got wrong, now correct"
+    }
+   },
+   "attempt4_criterion": "Single condition: any of ime_mxs_ / ime_mxn_ / ime_mxl_ moves off 23 / 25 / 3 -> CONTINUE; otherwise STOP AND RESEED and execute tools/reseed_r20.sh without asking. There is no other branch left, because the shallow work is done."
+  },
+  "tooling": {
+   "diff_probe": {
+    "what": "tools/diff_probe.py counts marker groups over the ADDED lines of an attempt diff and predicts which tier was worked on, in about a second, as soon as the LLM turn ends -- before the build and simulation that produce the verdict.",
+    "validated": "Retro-run on attempt3: scale front-end 39->39, NaN 17->17, vm/legality 297->297 all unchanged; int4/nibble 23->45 GREW. Predicted only int4 moves and the three tiers stay stuck. The verdict matched exactly (int4 30->0, tiers 23/25/3 unchanged).",
+    "asymmetry": "A group that did not grow is strong evidence its tier will not move. A group that grew says only that it was attempted, not that it worked. A missed prediction is itself worth recording: it means the markers are wrong for that machinery, or the tier depends on something they do not name."
+   },
+   "mx_triage_third_fix": "The SUSPICIOUS check fired wrongly for the third time. It compares the total gain against \"tracked groups\" but only counted the ime_mx_ defect classes, ignoring tier movement -- which it prints two lines earlier. Same class of error as the first two (an untracked group makes its own progress look anomalous; a compound group hides a resolved defect): a suspicion check must consider EVERY dimension it tracks, not a subset. Fixed; tier movement now counts.",
+   "mx_triage_fourth_fix": "\"still stuck\" was printed for any unchanged tier including 0 -> 0, which is cleared-and-holding, the goal. Fourth slip of one shape: a label asserted from a comparison without checking the value being described. Now distinguishes stuck (unchanged, nonzero) from cleared (unchanged, zero)."
+  },
+  "cost_note": "Do NOT extrapolate the attempt1-3 unit cost ($0.86 / $1.51 / $0.55 per program) to the remaining 51. Those three attempts worked inside ime_mx_, machinery that was already partly present; the remaining 51 are the E8M0 scale front-end, the NaN early exit and the vm/legality decode, none of which has been touched. The curve does not transfer.",
+  "s2_blind_spot": {
+   "fact": "S2 has not run once in r19. titan_loop._iterate does `if summary[\"failing\"]: continue`, so the RVV regression runs only after the directed suite is completely clean. Directed still has 51 failing, so four attempts have produced zero S2 evidence.",
+   "by_design": "Intentional, and the in-code rationale is sound: \"Built only once directed passes, so most iterations pay for one elaboration, not two.\"",
+   "skewed_cost": "The design is not a bug but its cost distribution is skewed. What it SAVES is a little build time every iteration. What it DEFERS is the risk of discovering, only after the most expensive work is finished, that something has to be redone. In a round with a known history of FU-structure disturbance that default is not obviously right.",
+   "round7_action": "When round seven adds instructions, reconsider forcing one S2 run on any attempt that changes the FU structure, rather than waiting for directed to go clean.",
+   "risk_shape_for_the_report": "EVIDENCE STATUS, to be stated exactly this way and not upgraded: the claim \"the FP matrix FU does not disturb the shared int/fp issue path\" currently rests on STATIC evidence only -- fpMatrix is a separate list and MatrixFPMultiplyFactory is not in integerMatrix. Empirical evidence is ZERO: no .vf test has been run against this tree. A static check must not be written up as verified.",
+   "precedent": "r16 is the reason this matters: the sampled S2 passed and the gate's full 837 then found 12 .vf failures. \"S2 clean\" has a false-negative record in this project.",
+   "decision": "Option (2), agreed: do nothing now (running S2 would contend with attempt4 for chipyard, total 1). After r19 ends, run tools/verify_rtl_diff.py --s2-only over the final diff with the FULL UNSAMPLED 837, not the 150 sample. Zero LLM cost, one elaboration."
+  },
+  "s2_first_result": {
+   "when": "2026-09-20T03:59, after directed reached 255/255",
+   "result": "40 failing out of the 150-test sample. r17, with the same harness config, had 0/150.",
+   "none_are_known_baseline": "Checked against rvv_baseline_failures.json (4 known-excluded tests): NONE of the 40 is in it.",
+   "failure_modes": {
+    "simulator died (exit 2) after 0 committed instructions -- no verdict": 16,
+    "diverged after 17 committed instructions, spike pc 0x10038 vs DUT 0x10000 (bootrom)": 17,
+    "diverged deep (18k-188k committed instructions)": 7
+   },
+   "key_observation": "33 of 40 never produced a meaningful verdict at all -- they either died before committing an instruction or diverged in the bootrom. The bootrom signature is the one constants.py names as a known Shuttle DebugROB DPI hazard.",
+   "the_7_deep_ones": "Every single one has the DUT exactly 4 bytes BEHIND spike: 8003a032/8003a02e, 80026002/80025ffe, 8008e002/8008dffe, 80050042/8005003e, 80015608/80015604, 8000f23e/8000f23a, 80037ff2/80037fee. A uniform one-instruction PC skew, across integer (vdiv, vsaddu, vror), floating-point (vfcvt, vfdiv, vfwadd) and segment load/store (vlsseg2e8) tests that share no functional path.",
+   "reading": "A uniform 4-byte skew across unrelated instruction families is the signature of a commit-trace reporting offset, not of an arithmetic fault in any of them. Combined with the 33 that never ran, this looks like a trace-bridge / DebugROB integration problem rather than an RVV regression. A plausible mechanism exists and is tied to round six: the new FP matrix FU changes the commit stream, and the DebugROB bridge is sensitive to that -- but that would be a commit-reporting fault, not an MX arithmetic fault, and the fix would be in a different place entirely.",
+   "discipline": "NOT A VERDICT. The loop S2 is knowingly single-run with a documented ~12% per-test flip rate. 40/150 = 27% is well above that, so noise alone does not explain it -- but neither does one run establish it. reps=3 majority is required before this drives any RTL change.",
+   "risk": "The loop has already handed these 40 to the agent as a failure message. r9/r10/r11 is the precedent: the agent spent three rounds blindly changing RTL over .vf failures whose real cause was elsewhere.",
+   "ratios": {
+    "40/150 = 26.7%": "all failures",
+    "24/150 = 16.0%": "excluding the 16 that died before committing any instruction",
+    "7/150 = 4.7%": "excluding those AND the 17 bootrom divergences -- i.e. only the tests that actually executed",
+    "interpretation": "4.7% sits BELOW the documented ~12% bridge flip rate. Once the two infrastructure-shaped failure classes are removed, what remains is entirely within known noise. This is the strongest indirect evidence so far that round six did not disturb the RVV regression -- but it remains INDIRECT. It must not be written up as verified; empirical confirmation requires a clean-disk re-run."
+   }
+  },
+  "disk_incident": {
+   "discovered": "2026-09-20 ~04:02, while launching the S2 control experiment -- a raylet file_system_monitor warning surfaced in the experiment log.",
+   "state": "Root filesystem / at 100%: 4.8 GB free of 877 GB, and still falling (5.15 -> 4.64 GB observed over a few minutes). /share1 unaffected (885 GB free).",
+   "composition": {
+    "/tmp": "131 GB, almost entirely other users: research28_q35 67 GB, hf_r27 52 GB (HuggingFace cache), gto-mgpu 7.3 GB",
+    "docker": "161.9 GB of images at /var/lib/docker (on the root disk), 135.7 GB nominally reclaimable",
+    "my own /tmp/claude-1002": "63 MB -- not a contributor"
+   },
+   "precedent": "ledger.md line 21: | r7_0909_1935 | 0:04:19 | 0 | $0.00 | 0 | no | 啟動即失敗：根碟滿 |. This is the SECOND time this project has met this failure mode.",
+   "actions_taken": [
+    "1. Snapshotted the 255/255 RTL to preserved/r19_round6_S1_directed_255of255_pre_S2_bfc953c8973e63ce.diff with a README, BEFORE anything else -- $146.51 of LLM spend was riding on one file in a run that a full disk can kill outright.",
+    "2. docker builder prune -f: reclaimed 14.58 GB of buildkit cache. docker image prune -f (NO -a): 0 B, no dangling images.",
+    "Root went 4.3 GB -> 27 GB free, 100% -> 97%."
+   ],
+   "deliberately_not_done": [
+    "docker system prune -a -- would destroy the aether-chisel-build container writable layer, which is the chipyard build cache; CLAUDE.md forbids it.",
+    "Touching the 119 GB of other users /tmp data.",
+    "Stopping the loop -- the cost of losing the warm build cache and session state exceeds the benefit; contamination is guarded by the snapshot plus the recorded motive flag instead."
+   ]
+  },
+  "contamination_flag": "RESOLVED. attempt6 made no change, so nothing motivated by the suspect S2 list entered the tree. The preserved/ snapshot and r19 best_rtl.diff are the same content.",
+  "s2_control_experiment": {
+   "purpose": "Run the 7 deep-divergence tests from r19 S2 against the r18 tree (same bridge, same environment, NO round-six FP matrix FU) -- the one check needing no prior classification by me.",
+   "completed": {
+    "machine_vdiv_vx-1": "match=True on 3/3 reps, STABLE",
+    "machine_vfcvt_rtz_x_f_v-0": "match=True on 3/3 reps, STABLE",
+    "machine_vfdiv_vf-2": "rep1 match=True, incomplete"
+   },
+   "reading": "Both completed tests pass stably on r18. The agent independently showed the same tests pass 3/3 on the r19 tree. Both trees pass, so the r19 S2 failures were bridge flakes, not something round six introduced.",
+   "limitation": "Not a perfectly matched comparison: the agent used run_rvv_start(reps=3) on r19, this used nondet.py on r18. Both are reps=3 against the same stock spike digest (6d78935237dd) but through different harness paths. The conclusion rests on three independent lines converging, not on this one alone.",
+   "stopped_early": "Yes, at 3 of 7 tests, deliberately. The loop had entered S2/Gate and pending verilator tasks went 41 -> 131 while this ran; the Gate is the critical path to finishing round six. With the question answered from three directions, the remaining 4 tests (40-80 min; vdiv_vx-1 alone is 610s per rep) were worth less than the delay they imposed. Recording that an approved experiment was cut short, and why."
+  },
+  "s2_natural_experiment": {
+   "setup": "attempt6 made NO code change (diff sha256 31a6987d2ece063b identical to attempt5), so its S2 run is a second sample of the SAME binary. Unplanned, but it is exactly the controlled repeat the question needed.",
+   "attempt5": "40 failing (died 16, bootrom 17, deep 7), disk at 4.8 GB free",
+   "attempt6": "39 failing (died 18, bootrom 14, deep 7), disk at 27 GB free",
+   "churn": "Overlap only 9. 31 of attempt5 40 failures (78%) passed on the re-run; 30 of attempt6 39 had passed before. Symmetric difference over union = 87%.",
+   "conclusion": "On a byte-identical binary the failing SET is almost entirely resampled between runs. A real RTL defect fails the same test every time. This is reporting nondeterminism, and at a far higher rate than the documented ~12% -- which itself is worth noting: the 12% figure understates what this harness is currently doing.",
+   "status": "This is now DIRECT empirical evidence, not inference. It needed no failure-mode classification by me and no argument about which instructions share a datapath."
+  },
+  "refuted_hypotheses": [
+   "MINE, REFUTED: I proposed that the full root disk (4.8 GB free) explained the 16 \"simulator died (exit 2) after 0 committed instructions\" cases. The natural experiment refutes it. After reclaiming 14.58 GB (27 GB free), the died count did not fall -- it rose, 16 -> 18, and the total was flat at 40 -> 39. The disk was a real problem worth fixing on its own merits (ledger.md line 21 records it killing r7 outright), but it was NOT the cause of the S2 failures. I had presented it as the most likely explanation for that class; the data says otherwise.",
+   "MINE, WEAKENED: I computed 4.7% residual (7 deep divergences out of 150) as being below the 12% flip rate and called it the strongest indirect evidence. The churn data shows the deep class is stable in COUNT (7 in both runs) while its MEMBERSHIP changes, so the 4.7% figure was measuring something less meaningful than I thought. The churn measurement supersedes it."
+  ],
+  "final_state": {
+   "directed": "255/255, all four tiers at 0",
+   "s2": "never clean -- the single-run sample reports ~39 flaky failures every time",
+   "gate": "NEVER RAN",
+   "s3": "NEVER RAN",
+   "converged": false,
+   "why_stopped": "attempts 5, 6 and 7 produced byte-identical diffs (sha256 31a6987d2ece063b): the agent correctly refused to change a tree that was already 255/255, and its cost fell 6.09 -> 1.28 as it converged on that. Three more iterations would each have run a 150-test S2 sample, occupying the verilator capacity the full-837 certification needs, for zero new information -- and with negative expected value, since a correct tree can only be left alone or made worse.",
+   "preserved": "preserved/r19_round6_S1_directed_255of255_pre_S2_bfc953c8973e63ce.diff, sha256 verified identical to the live best_rtl.diff at stop time"
+  },
+  "DESIGN_FLAW_round6_retrospective": {
+   "headline": "An unreliable single-run check is on the critical path as a gate, which makes the Gate structurally unreachable.",
+   "mechanism": "titan_loop line ~1799: result[\"s1_s2\"] = ok; if not ok: return result. The Gate runs ONLY when S1 and S2 both pass. S2 is knowingly single-run -- the code comment says \"SINGLE-RUN VERDICT, knowingly\" and accepts a documented ~12% per-test flip rate to save per-iteration cost.",
+   "measured_reality": "On a byte-identical binary, two consecutive S2 samples shared only 9 of ~40 failures: 78% of one run failures passed on the other, symmetric difference over union 87%. The real churn is far above the 12% the design budgeted for, so \"S2 clean\" is not merely unlikely, it is effectively unreachable.",
+   "consequence": "r19 finished round six work -- directed 255/255 including all 133 new programs -- and could not be certified by its own loop. No full 837 regression, no S3 lockstep.",
+   "not_a_round6_bug": "This is a design property, not something round six introduced. Any round whose S2 sample is flaky hits it.",
+   "fix_before_round7": "Either run the pre-Gate S2 with reps=3 and judge by majority, or let the Gate proceed when reps=3 shows zero real failures. The agent-facing tool already has reps (tools.run_rvv_start) -- the loop own gate path does not use it."
+  },
+  "certification": {
+   "s2_full_run1": {
+    "when": "2026-09-20 06:35",
+    "suite": "837, unsampled",
+    "failing": 281,
+    "pct": "33.6%",
+    "modes": {
+     "died (0 instructions committed)": 126,
+     "bootrom divergence": 108,
+     "deep": 47
+    },
+    "infrastructure_share": "234 of 281 = 83% of the failures, 28.0% of the whole suite",
+    "deep_share": "47/837 = 5.6%",
+    "digests": "rtl 82a4a3e6d35c, stock spike 6d78935237dd (same golden model as r17)",
+    "shape": "Identical in shape and proportion to both 150-test samples (26.7% and 26.0%), which is itself evidence the behaviour is a property of the harness, not of the sample."
+   },
+   "method_note": "The 47 deep failures need reps=3. Running nondet.py over them would be serial -- it repeats one test at a time and single reps have taken up to 610s, so 141 simulations would be 4-12 hours. The full 837 run is highly parallel (4176s for 837 = ~5s/test effective). Re-running the whole suite twice more therefore costs ~140 minutes and yields a genuine reps=3 majority over ALL 837 tests, not just the 47 -- strictly more evidence for less time.",
+   "s2_full_run2": {
+    "when": "2026-09-20 09:40",
+    "failing": 248,
+    "pct": "29.6%",
+    "modes": {
+     "died": 115,
+     "bootrom": 99,
+     "deep": 34
+    }
+   },
+   "churn_on_the_full_suite": {
+    "rep1 vs rep2": "intersection 81, union 448 -> 82% resampled between runs on a byte-identical binary.",
+    "why_this_is_stronger": "The 150-test samples gave 87% churn on a base of ~40 failures. This reproduces it at 82% on a base 5.6x larger, so it is not a small-sample artefact. The deep class also moved, 47 -> 34, with membership changing.",
+    "still_pending": "rep3, then a per-test pass count across all three runs. The two questions that matter: does ANY test fail all three times (the only shape that needs chasing), and after majority vote how many real failures remain in the deep union."
+   },
+   "process_failure": {
+    "what": "rep3 did not start for 45 minutes after rep2 finished at 09:40. I launched rep2 and ended my turn with nothing arranged to start rep3 when it completed.",
+    "root_cause": "Same shape as the earlier background-task problem: a long job was launched with no mechanism to pick up its completion across a turn boundary.",
+    "fix_applied": "rep3 and the --full-sweep run are now chained in ONE detached shell script (out/certify/chain.sh) with sequential execution, so the sequence no longer depends on me being present between steps. A Monitor watches chain.log and CHAIN_DONE, and also warns if / drops below 10G or the verify process disappears.",
+    "cost": "45 minutes of idle cluster."
+   },
+   "pgrep_self_match": "Noted twice now: pgrep -f / pkill -f match THIS shell command line when the pattern text appears in it, including inside a heredoc. The [v]erify bracket trick does not help when the plain string also appears elsewhere in the command. Use ps -eo args | grep \"pattern-with-[b]racket\" and act on PIDs.",
+   "reps3_full_suite": {
+    "runs": {
+     "rep1": "281/837 (33.6%) died 126 bootrom 108 deep 47",
+     "rep2": "248/837 (29.6%) died 115 bootrom 99 deep 34",
+     "rep3": "249/837 (29.7%) died 99 bootrom 102 deep 48"
+    },
+    "per_test_vote": {
+     "union of all failures": 559,
+     "failed 1/3": 364,
+     "failed 2/3": 171,
+     "failed 3/3": 24
+    },
+    "statistical_test": "Mean per-run failure rate 0.310. If each run failed tests independently at random, 837*0.310^3 = 24.9 tests would fail all three times. Observed: 24. The 3/3 population is exactly what independent random failure predicts -- there is no excess needing explanation.",
+    "mode_consistency": "Of the 24 that failed 3/3, only 3 kept the SAME failure mode across all three runs. The other 21 changed between died / bootrom / deep. A test failing three times in three different ways is not failing for a consistent reason.",
+    "CONCLUSION_NOT_ZERO": "I was about to write \"real failures 0\". That would have been WRONG."
+   },
+   "REAL_FAILURE_FOUND": {
+    "test": "machine_vdivu_vx-0",
+    "evidence": "All three runs diverge at the IDENTICAL point: after exactly 55255 committed instructions, cycle 0x136a5e, PC mismatch spike 0x8002c002 vs DUT 0x8002c000. Byte-for-byte identical reason string in all three artifacts.",
+    "why_this_is_different": "Random harness failure does not reproduce a divergence point bit-for-bit three times. Every other 3/3 failure either changed mode or carries the generic bootrom signature.",
+    "note": "The PC delta is 2 bytes here (0x8002c002 vs 0x8002c000), not the 4 bytes seen in the flaky deep divergences -- a compressed-instruction boundary disagreement rather than a one-instruction skew.",
+    "status": "UNATTRIBUTED. Whether round six caused it is NOT established. The decisive test is running the same test against the r18 tree (no round-six FP matrix FU). That control has not been run yet -- the --full-sweep job is using the cluster.",
+    "two_bootrom_3of3": "machine_vslideup_vi-0 and machine_vnclipu_wx-0 also reproduce identically, but with the generic bootrom signature (spike 0x10038 vs DUT 0x10000 at 17 instructions) that ~12% of tests show in any given run. Expected 3/3 count by chance is 1.6; observed 2. Consistent with chance, and the signature is the known infrastructure one.",
+    "CORRECTED": {
+     "the_claim_I_made": "I wrote that machine_vdivu_vx-0 is \"a REAL, DETERMINISTIC failure\" and \"the only bit-for-bit reproducible real divergence\", on the strength of three identical reason strings from the verify_rtl_diff S2 runs.",
+     "what_the_control_shows": "Arm A -- the SAME r19 tree, the SAME test, run in ISOLATION via nondet.py -- passes 3/3, each run matching exactly 95455 instructions. STABLE, 1 distinct outcome.",
+     "the_corrected_statement": "machine_vdivu_vx-0 is reproducible under the parallel 837-test S2 harness and does not reproduce in isolation. It is not a deterministic RTL failure.",
+     "why_I_was_wrong": "I treated bit-for-bit reproducibility as proof of an RTL fault. It only proves the behaviour is a deterministic function of SOMETHING held constant across those three runs -- and the parallel load pattern was held constant too, not just the RTL. Reproducibility identifies determinism, not location.",
+     "the_sharper_evidence": "Both environments are deterministic and disagree: in isolation the test runs to 95455 every time; under the parallel harness it diverges at 55255 every time. Random noise would scatter; two stable but different outcomes is the signature of a load- or timing-dependent path, which is the DebugROB/cospike DPI bridge under an 837-test parallel storm.",
+     "build_flags_ruled_out": "Both harnesses build with --threads 8 and +define+RANDOM=0, so the difference is not the build configuration nondet.py was written to vary. Concurrency is what remains."
+    }
+   },
+   "full_sweep_directed": {
+    "when": "2026-09-20 11:52",
+    "result": "771 programs, 0 failing, kinds={pass: 771}",
+    "what_it_covers": "The Gate directed tier at full strength: the complete partial-N sweep, 638 rounds 1-5 programs plus the 133 new round-six programs. This is the directed half of what the Gate would have run, obtained without the loop.",
+    "significance": "Round six now has Gate-strength directed evidence. Nothing in the directed suite fails at any geometry, including partial-N tail behaviour."
+   },
+   "vdivu_attribution": {
+    "launched": "2026-09-20 11:53, two arms chained in one script so neither stalls waiting for me",
+    "arm_A": "r19 preserved snapshot (has the round-six FP matrix FU), machine_vdivu_vx-0, reps=3",
+    "arm_B": "r18 best_rtl.diff (control, no round-six FU), same test, reps=3",
+    "decision_rule": "If arm B diverges at the same point (55255 instructions, cycle 0x136a5e, spike 0x8002c002 / DUT 0x8002c000), the fault predates round six and round six is cleared. If only arm A diverges, it is a genuine round-six regression and must be fixed before the round can be called done.",
+    "note": "Same harness (nondet.py) on both arms, unlike the earlier partial control which compared run_rvv_start on r19 against nondet on r18. This one is properly matched.",
+    "unexpected": {
+     "observation": "Arm A rep1 (r19 tree, the SAME diff that diverged at 55255 in all three verify_rtl_diff S2 runs) PASSED: match=True, 95455 instructions matched, i.e. it ran FURTHER than the 55255 point and completed.",
+     "not_a_build_difference": "Checked: both harnesses build with --threads 8 and +define+RANDOM=0. The build flags match on the axes nondet.py was written to vary.",
+     "HYPOTHESIS_load_dependence": "The remaining difference is CONCURRENCY. verify_rtl_diff runs the 837-test suite in parallel across the cluster (4176s for 837 = ~5s/test effective, so heavy parallelism). nondet.py runs one test at a time, alone. If the DebugROB/cospike DPI bridge misbehaves under parallel load, then the divergence is a property of the load pattern rather than of the RTL -- and its bit-for-bit reproducibility across the three verify runs would reflect a reproducible load pattern, not a deterministic hardware fault.",
+     "what_would_confirm": "Arm A passing 3/3 in isolation. That would mean machine_vdivu_vx-0 is not a deterministic RTL failure at all, and my earlier statement that it is \"a REAL, DETERMINISTIC failure\" needs correcting to \"reproducible under the parallel S2 harness, not reproducible in isolation\".",
+     "status": "reps 2 and 3 of arm A pending, then arm B."
+    },
+    "result": {
+     "arm_A_r19": "3/3 match=True, matched=95455 every run, STABLE (1 distinct outcome)",
+     "arm_B_r18_control": "3/3 match=True, matched=95455 every run -- the SAME instruction count as r19",
+     "conclusion": "In isolation the two trees behave identically on this test, down to the instruction count. The divergence seen under the parallel 837-test harness is not attributable to round six, and is not an RTL fault at all.",
+     "harness_symmetry": "Both arms used nondet.py, unlike the earlier partial control which compared run_rvv_start on r19 against nondet on r18."
+    }
+   },
+   "ROUND_SIX_VERDICT": {
+    "what_can_be_said": "Round six directed evidence is complete and at Gate strength: 771/771 programs pass in the full partial-N sweep, covering the 638 rounds 1-5 regression programs and all 133 new round-six programs. On the RVV side there is NO EVIDENCE of a round-six regression: across three full unsampled 837-test runs the number of tests failing all three times (24) is what independent random failure predicts (24.9), 21 of those 24 failed in a different way each time, and the single bit-for-bit reproducible candidate passes 3/3 in isolation and behaves identically on an r18 tree that lacks the round-six FU.",
+    "what_CANNOT_be_said": "That the RVV regression is clean. The S2 harness fails ~31% of tests per run with 82-87% churn between runs on a byte-identical binary; a harness in that state cannot certify anything positively. \"No evidence of a regression\" is the strongest claim the data supports, and it is not the same as \"verified correct\".",
+    "limitations": [
+     "S3 randomised lockstep NEVER RAN. Round six has no stress coverage. Not padded over, not worked around.",
+     "The .vf / shared issue-path question still rests on the same three full-suite runs, which are themselves unreliable; the FU classification was additionally checked STATICALLY (fpMatrix is a separate list, MatrixFPMultiplyFactory is not in integerMatrix).",
+     "The cosim/DebugROB trace bridge is the limiting instrument for the whole S2 stage and should be treated as such until it is fixed."
+    ]
+   }
+  },
+  "tmp_violation_fixed": {
+   "what": "verify_rtl_diff wrote its summary to /tmp/titan/r19_certify_s2full/ because TITAN_LOG_ROOT was not set and constants.py defaulted it to tempfile.gettempdir()/titan.",
+   "fix": "Changed the DEFAULTS so forgetting the variable can no longer put anything on /tmp: constants.TITAN_LOG_ROOT -> OUT_DIR/logs, constants TITAN_SYNTH_OBJ_ROOT -> OUT_DIR/synth, ime_stress.fill_pool work_dir -> OUT_DIR/stress. All three now resolve under /share1. No gettempdir call remains in either file.",
+   "verified": "constants, ime_stress, rvv_ref, ime_tests and ime_encodings self-tests all still pass.",
+   "why_it_matters": "This was a landmine that fires on any caller who forgets the variable, which is exactly how it fired here. Fixing the default is the durable fix; setting the variable at each call site is not."
+  }
+ },
+ {
+  "round": 7,
+  "id": "r20_0923_0131",
+  "kind": "CHIA loop run (aborted, superseded by r21_0923_0202)",
+  "started": "2026-09-23T01:31+08:00",
+  "ended": "2026-09-23T02:00+08:00",
+  "wall_minutes": 29,
+  "insns": [
+   "vfwmmacc.vv",
+   "vfqmmacc.vv"
+  ],
+  "submission_id": "titan-r20_0923_0131",
+  "llm_model": "claude-opus-4-7",
+  "model_seed": {
+   "path": "r19_0919_2116/20260920_033203_impl_diff_attempt5.diff",
+   "why": "converged round-6 Spike model (50 riscv-isa-sim hunks); --model-seed so Stage M runs"
+  },
+  "rtl_diff": {
+   "path": "preserved/r19_round6_S1_directed_255of255_pre_S2_bfc953c8973e63ce.diff"
+  },
+  "env": {
+   "TITAN_LOG_ROOT": "titan_runs",
+   "TITAN_REGRESSION_SAMPLE": "150",
+   "TITAN_MAX_ITERS": "10",
+   "TITAN_REGRESSION_MAX_INFLIGHT": "0 (hostload decides)"
+  },
+  "result": "stopped deliberately during Stage M attempt 1 at user request to switch the loop LLM to claude-opus-5-5; no stage result",
+  "stage_m": {
+   "seed": "361 total: 255 pass (all rounds 1-6), 106 trap (exactly the new ime_fpw tier at VLEN 256: 56 cell(2,32), 40 cell(4,64), 10 cell(2,64)); rounds 1-6 unbroken by the seed"
+  },
+  "llm_cost_usd": null,
+  "llm_cost_note": "turn killed before the CLI reported total_cost_usd. Tokens from the session transcript (88 assistant messages, opus-4-7): input 97, cache_write 269,639, cache_read 13,651,926, output 103,432. ESTIMATE at Opus 4.x list price ($5 in / $25 out / 0.1x cache read / 1.25-2x cache write): ~$11-12. Not a measured figure.",
+  "process": [
+   "Container Claude Code CLI was 2.1.252; opus-5-5 needs >=2.1.280 (API 400). Upgraded in place via npm -g inside titan-claude-code container (not a rebuild; aether container untouched). Probe: opus-5-5 --effort max OK, $0.16.",
+   "constants.LLM_MODEL default changed claude-opus-4-7 -> claude-opus-5-5; job stopped and resubmitted as r21_0923_0202 with identical seed/RTL/env."
+  ]
+ },
+ {
+  "round": 7,
+  "id": "r21_0923_0202",
+  "kind": "CHIA loop run",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-09-23T02:02+08:00",
+  "ended": "2026-09-23T04:42+08:00",
+  "wall_minutes": 160,
+  "llm_cost_usd": 26.8226,
+  "insns": [
+   "vfwmmacc.vv",
+   "vfqmmacc.vv"
+  ],
+  "submission_id": "titan-r21_0923_0202",
+  "model_seed": {
+   "path": "r19_0919_2116/20260920_033203_impl_diff_attempt5.diff"
+  },
+  "rtl_diff": {
+   "path": "preserved/r19_round6_S1_directed_255of255_pre_S2_bfc953c8973e63ce.diff"
+  },
+  "env": {
+   "TITAN_LOG_ROOT": "titan_runs",
+   "TITAN_REGRESSION_SAMPLE": "150",
+   "TITAN_MAX_ITERS": "10",
+   "TITAN_LLM_MODEL": "claude-opus-5-5"
+  },
+  "result": "CRASHED after a clean S2 (NameError: _merge_failing) -- Stage M and S1 both converged in ONE attempt each; Gate and S3 not reached",
+  "stage_m": {
+   "seed": "361: 255 pass (rounds 1-6), 106 trap (new ime_fpw tier)",
+   "attempt1": "361/361 CONVERGED, $12.3994 (new riscv/ime_fp_exact.h transcribing Sail fp_gemm; exact 640-bit fixed-point group sum, one rounding under frm via softfloat roundPack)"
+  },
+  "s1": {
+   "attempt0": "255 pass / 106 trap (RTL had no fpw)",
+   "attempt1": "361/361, $14.4232 (exact 560-bit group sum; OFP cells, vf8wmmacc and vm=0 trap as illegal)"
+  },
+  "s2": {
+   "attempt1": "150-test sample, 0 reported failing, confirm skipped (no failures); [hostload] window 4 (others 15.5/96 cores, 113 GB free)"
+  },
+  "findings": [
+   "Opus 5.5 converged Stage M and S1 in one attempt each ($26.82 total) vs round 6 on Opus 4.7: Stage M 4 attempts $42.82, S1 7 attempts. Different instructions, so not a controlled comparison.",
+   "LOOP BUG: commit ee1cc0a (round-seven S2 confirmation / hostload edits) deleted def _merge_failing and def _dump_regression_logs from titan_loop.py while leaving 3+1 call sites. The first clean S2 in project history hit it: NameError at titan_loop.py:1115. py_compile does not catch undefined names; an AST undefined-name scan now does. Restored both verbatim from b1f72f1.",
+   "MONITORING GAP: the job died at 04:42 and nothing noticed until the user asked at 20:30 -- ~16h idle."
+  ],
+  "next": "r22_0923_2031: --model-diff and --rtl-diff both = r21 impl_diff_attempt1.diff (converged model + 361/361 RTL), skip Stage M, goes S1 -> S2 -> Gate -> S3"
+ },
+ {
+  "round": 7,
+  "id": "r22_0923_2031",
+  "kind": "CHIA loop run (resume)",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-09-23T20:31+08:00",
+  "ended": "2026-09-24T03:19+08:00",
+  "wall_minutes": 408,
+  "llm_cost_usd": 17.5498,
+  "insns": [
+   "vfwmmacc.vv",
+   "vfqmmacc.vv"
+  ],
+  "submission_id": "titan-r22_0923_2031",
+  "model_diff": "r21_0923_0202/20260923_034658_impl_diff_attempt1.diff",
+  "rtl_diff": "same file (RTL half)",
+  "rtl_digest": "9290932c94fb",
+  "result": "GATE PASSED -- directed full sweep 877/877; RVV regression 837/837 unsampled, 0 single-run failures (unanimity confirm skipped: nothing to confirm), 12246 s. Then Stage 3 (stress) crashed building its pool: PermissionError. S3 not run.",
+  "stages": {
+   "resume_attempt0": "directed 361/361; S2 sample 150, 0 failing",
+   "impl_iter1_agent_turn": "$17.55, 3648 s, 185 turns. Agent edited MatrixFPMultiplyPipe.scala (E8M0 0x00 decode, bf16 per-op rounding, set_fflags from matrix FP unit): directed stayed 361/361 but the cosim binary died on EVERY RVV test at 0 committed instructions ('Cosim: Unknown interrupt 0', incl. integer vadd) -- deterministic. Arith-only variant: 8/12 .vf wdata mismatch. Agent reverted itself to the byte-identical iter0 tree; its own reruns 12/12 RVV + 361/361 directed.",
+   "impl_attempt1_S2": "150 sample, 0 failing (23:39)",
+   "gate": "directed 877/877 (23:52); RVV 837/837 (03:16), sweep_17 archived"
+  },
+  "findings": [
+   "Pure scope-creep turn: the tree was already converged; the loop design always hands a clean resume to an agent turn before the gate. Fixed: RESUME_FAST_PATH (titan_loop.py) -- clean attempt 0 (directed + S2 sample) goes straight to the gate; gate failures still re-enter the agent via the gate-debug path.",
+   "S3 crash is ours: the /tmp cleanup moved ime_stress.fill_pool's work_dir to examples/titan/out/stress, which is not mounted in the riscv_build container. Fixed: constants.STRESS_WORK_DIR = /share1/saves/max410011/titan_scratch/node_tmp/titan-stress (mounted, verified writable from the container).",
+   "Agent's change A (possibly real round-6 gaps: E8M0 0x00, bf16 rounding, fflags) is NOT in round 7 and unjudged; agent backup at /home/ray/titan_work/backup_r22_iter1/ in the llm container; knowledge notes r22_0923_2031/work/knowledge_rtl.md L46-73.",
+   "My ray job stop at 03:22 hit an already-FAILED job (it had ended 03:19); no effect. My subagent's report said the turn was still running -- true when it looked, stale by the time I acted; I did not re-check before stopping."
+  ],
+  "next": "r23_0924_0325: same diff, fast path -> gate -> S3"
+ },
+ {
+  "round": 7,
+  "id": "r23_0924_0325",
+  "kind": "CHIA loop run (resume, fast path)",
+  "llm_model": "claude-opus-5-5 (not invoked)",
+  "started": "2026-09-24T03:25+08:00",
+  "ended": "2026-09-24T08:12+08:00",
+  "wall_minutes": 287,
+  "llm_cost_usd": 0.0,
+  "insns": [
+   "vfwmmacc.vv",
+   "vfqmmacc.vv"
+  ],
+  "submission_id": "titan-r23_0924_0325",
+  "model_diff": "r21_0923_0202/20260923_034658_impl_diff_attempt1.diff",
+  "rtl_diff": "same file (RTL half)",
+  "rtl_digest": "9290932c94fb",
+  "model_digest": "187e4648eff8",
+  "result": "CONVERGED -- round 7's first converged run (Stage M reseed -> S1 -> S2 -> Gate -> S3). Correction 2026-09-25: NOT the first converged run in project history; r12, r13, r15, r17 also have converged=true with S3 64/64.",
+  "stages": {
+   "model_reseed": "ok",
+   "resume_attempt0": "directed 361/361; S2 sample 150, 0 failing",
+   "fast_path": "taken -- no agent turn",
+   "gate": "directed full sweep 877/877; RVV 837/837 unsampled, 0 single-run failures, 12263 s (second independent clean gate on digest 9290932c94fb after r22)",
+   "S3": "64/64 lockstep programs matched RTL vs the independently written Spike model (pool exhausted). Pool coverage by instruction occurrences: vmtl 192, vmts 96, vmttl 64, vmmacc 50, vmtts 32, vwmmacc 14, vfwimmacc 12, vfqimmacc 12, vfmmacc 12, vf8wimmacc 10, vfwmmacc 8, vqmmacc 6, vfqmmacc 2, v8wmmacc 2."
+  },
+  "findings": [
+   "Both fixes from r22 validated in production: RESUME_FAST_PATH taken; STRESS_WORK_DIR writable from riscv_build.",
+   "S3 coverage of the two new instructions is thin (vfwmmacc 8, vfqmmacc 2 occurrences in 64 programs); STRESS_TEST_CASES_PER_GEOM=64 ends by pool exhaustion in ~7 min, far below the 24 h budget.",
+   "My background completion watcher never fired: it matched 'Status for job ... : RUNNING' but a finished job prints a different line. Needs a fixed pattern."
+  ],
+  "round7_total": {
+   "runs": [
+    "r20 (aborted, est. $11-12 unmeasured)",
+    "r21 $26.82",
+    "r22 $17.55",
+    "r23 $0"
+   ],
+   "measured_llm_usd": 44.37
+  }
+ },
+ {
+  "round": 8,
+  "id": "r24_0924_2217",
+  "kind": "CHIA loop run (model-seed + rtl-diff)",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-09-24T22:17+08:00",
+  "ended": "2026-09-25T04:49+08:00",
+  "wall_minutes": 392,
+  "llm_cost_usd": 27.05,
+  "insns": [
+   "vf8wmmacc.vv",
+   "vfwmmacc.vv (OFP8 cells)",
+   "vfqmmacc.vv (OFP8 cells)"
+  ],
+  "scope": "OFP8 inputs (E4M3/E5M2): Zvvofp8fp16mm, Zvvofp8bf16mm, Zvvofp8fp32mm, Zvvofp8fp64mm. Unsupported: OFP4/E2M1 cells (OCP MX v1.0 unavailable), Zvvofp8mm (W=1).",
+  "submission_id": "titan-r24_0924_2217",
+  "model_seed": "r21_0923_0202/20260923_034658_impl_diff_attempt1.diff",
+  "rtl_diff": "same file (RTL half)",
+  "judges": "round-8 judges built 2026-09-24 (rvv_ref 43/43, ime_tests 22/22, sim_check 1010 geoms / 2970 exec / 0 failed, rounds 1-7 CHANGED=0); S1 gate at VLEN=256 = 1045 programs (was 877)",
+  "result": "CONVERGED end to end (Stage M -> S1 -> S2 -> Gate -> S3) on the first attempt of each stage",
+  "llm_calls": 2,
+  "stages": {
+   "model": "Stage M 1 attempt ($13.82), directed 529/529",
+   "impl": "1 attempt ($13.23), directed 529/529",
+   "S2": "sample 150, 0 single-run failures, 0 survived 7-rep unanimity",
+   "gate": "directed 1045/1045; RVV 837/837 unsampled, 0 single-run failures, 13090 s",
+   "S3": "64/64 lockstep (stress_done 64)"
+  },
+  "model_digest": "c24d535beaca",
+  "rtl_digest_seed": "9290932c94fb",
+  "best_rtl_diff": "r24_0924_2217/best_rtl.diff (sha 27bd664e)",
+  "ppa": "ppa5: 4,065,532.92 um2 (+27.0% vs baseline), ABC longest path 296.6 ns in MatrixFPMultiplyPipe (unpipelined widening FP path from round 7)"
+ },
+ {
+  "round": 8,
+  "id": "r25_0925_0450",
+  "kind": "verification-only rerun (model-diff + rtl-diff, fast path expected) with enlarged S3",
+  "llm_model": "claude-opus-5-5 (not invoked; fast path)",
+  "started": "2026-09-25T04:50+08:00",
+  "ended": "2026-09-25T11:03+08:00",
+  "wall_minutes": 372,
+  "llm_cost_usd": 0.0,
+  "submission_id": "titan-r25_0925_0450",
+  "model_diff": "r24_0924_2217/20260924_234913_impl_diff_attempt1.diff",
+  "rtl_diff": "same file",
+  "settings": "TITAN_STRESS_CASES_PER_GEOM=1024, TITAN_STRESS_TEST_HOURS=4, TITAN_MAX_ITERS=3",
+  "purpose": "larger S3 for the paper (r24 S3 was 64 programs)",
+  "result": "CONVERGED (verification rerun of the round-8 tree, no agent turn)",
+  "stages": {
+   "resume": "directed + S2 sample clean -> fast path",
+   "gate": "directed 1045/1045; RVV 837/837, 0 single-run failures, 12797 s",
+   "S3": "1024/1024 lockstep programs matched (stress_done 1024). By kind: 209 transposing-tile int, 205 int W=1, 93 int W=2, 50 int W=4, 18 int W=8, 63 FP W=1, fpw 187 (W=2 110, W=4 61, W=8/vf8wmmacc 16), MX 199 (W=2 47, W=4 91, W=8 61). List: out/r25_s3_programs.txt"
+  },
+  "rtl_digest": "dc4e9248d090",
+  "model_digest": "c24d535beaca"
+ }
+]

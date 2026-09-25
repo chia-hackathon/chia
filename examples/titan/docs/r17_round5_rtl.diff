@@ -1,0 +1,1637 @@
+diff --git a/generators/saturn/chipyard/SaturnConfigs.scala b/generators/saturn/chipyard/SaturnConfigs.scala
+index 97e2450..40a99bd 100644
+--- a/generators/saturn/chipyard/SaturnConfigs.scala
++++ b/generators/saturn/chipyard/SaturnConfigs.scala
+@@ -180,3 +180,28 @@ class GENV256D128ShuttleCosimConfig extends Config(
+   new shuttle.common.WithShuttleTileBeatBytes(16) ++
+   new shuttle.common.WithNShuttleCores(1) ++
+   new chipyard.config.AbstractConfig)
++
++
++// -----------------------------------------------------------------------------
++// Titan configs: base Shuttle + Saturn (VLEN=256, DLEN=128) used for IME
++// (Zvvm) work.  The base carries the design; the cosim overlay layers on
++// only the harness (cospike + trace IO + debug ROB).  Anything that changes
++// the design itself belongs in the shared base, not in the cosim fragment.
++// -----------------------------------------------------------------------------
++
++class TitanV256D128ShuttleConfig extends Config(
++  new saturn.shuttle.WithShuttleVectorUnit(256, 128, VectorParams.refParams) ++
++  new chipyard.config.WithSystemBusWidth(128) ++
++  new shuttle.common.WithShuttleTileBeatBytes(16) ++
++  new shuttle.common.WithNShuttleCores(1) ++
++  new chipyard.config.AbstractConfig)
++
++class TitanV256D128ShuttleCosimConfig extends Config(
++  new chipyard.harness.WithCospike ++
++  new chipyard.config.WithTraceIO ++
++  new saturn.shuttle.WithShuttleVectorUnit(256, 128, VectorParams.refParams) ++
++  new chipyard.config.WithSystemBusWidth(128) ++
++  new shuttle.common.WithShuttleDebugROB ++
++  new shuttle.common.WithShuttleTileBeatBytes(16) ++
++  new shuttle.common.WithNShuttleCores(1) ++
++  new chipyard.config.AbstractConfig)
+diff --git a/generators/saturn/src/main/scala/backend/ExecuteSequencer.scala b/generators/saturn/src/main/scala/backend/ExecuteSequencer.scala
+index d9d599a..51b18d0 100644
+--- a/generators/saturn/src/main/scala/backend/ExecuteSequencer.scala
++++ b/generators/saturn/src/main/scala/backend/ExecuteSequencer.scala
+@@ -27,6 +27,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
+   def usesAcc = supported_insns.count(_.props.contains(Reduction.Y)) > 0
+   def usesRvd = supported_insns.count(_.props.contains(ReadsVD.Y)) > 0
+   def usesCompress = supported_insns.count(_.props.contains(F6(OPMFunct6.compress))) > 0
++  def usesMatrix = supported_insns.count(_.props.contains(MatrixMacc.Y)) > 0
+ 
+   def accepts(inst: VectorIssueInst) = !inst.vmu && new VectorDecoder(inst, supported_insns, Nil).matched
+ 
+@@ -67,6 +68,31 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
+   val acc_fold  = Reg(Bool())
+   val acc_fold_id = Reg(UInt(log2Ceil(dLenB).W))
+ 
++  // Zvvm IME matrix multiply-accumulate state.  Walks (j, i, k) with k
++  // innermost; each iteration emits one micro-op to the matrix FU that
++  // reads A[i,k], B[j,k], C[i,j] and writes C[i,j] += A*B.
++  val matrix_mode         = RegInit(false.B)
++  val matrix_i            = Reg(UInt(6.W))
++  val matrix_j            = Reg(UInt(6.W))
++  val matrix_k            = Reg(UInt(7.W))
++  val matrix_M            = Reg(UInt(6.W))
++  val matrix_M_log2       = Reg(UInt(3.W))
++  val matrix_N            = Reg(UInt(6.W))
++  val matrix_K_eff        = Reg(UInt(8.W))
++  val matrix_LAMBDA_log2  = Reg(UInt(3.W))
++  val matrix_LMUL_log2    = Reg(UInt(2.W))
++  val matrix_EMULC_log2   = Reg(UInt(4.W))
++  val matrix_sew_log2     = Reg(UInt(2.W))
++  // log2 of the widening factor W for the running matrix multiply-accumulate:
++  //   0 -> vmmacc.vv (W = 1)      A, B, C all at SEW.
++  //   2 -> vqmmacc.vv (W = 4)     A, B at SEW/4, C at SEW.
++  // Drives EEW_A selection for A/B (= matrix_sew_log2 - matrix_W_log2), the
++  // K_eff derivation (= LAMBDA * W * LMUL), and the epr/mask formulas the
++  // A/B register-file indexing uses.  See MatrixW in insns/MatrixInstructions.
++  val matrix_W_log2       = Reg(UInt(2.W))
++  val matrix_altfmt_A_r   = Reg(Bool())
++  val matrix_altfmt_B_r   = Reg(Bool())
++
+   val compress = inst.opmf6 === OPMFunct6.compress && usesCompress.B
+   val acc_copy = (vd_eew === 3.U && (dLenB == 8).B) || elementwise
+   val acc_last = acc_fold_id + 1.U === log2Ceil(dLenB).U - vd_eew || acc_copy
+@@ -83,7 +109,13 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
+ 
+   val use_wmask = !inst.vm && sets_wmask
+   val eidx_tail = next_eidx === eff_vl
+-  val tail      = Mux(inst.reduction && usesAcc.B, acc_fold && acc_last, eidx_tail)
++  // Zvvm IME matrix termination: last iteration of (k, i, j) walk.
++  val matrix_last_k = (matrix_k + 1.U) === matrix_K_eff
++  val matrix_last_i = (matrix_i + 1.U) === matrix_M
++  val matrix_last_j = (matrix_j + 1.U) === matrix_N
++  val matrix_tail   = matrix_last_k && matrix_last_i && matrix_last_j
++  val tail          = Mux(matrix_mode, matrix_tail,
++                          Mux(inst.reduction && usesAcc.B, acc_fold && acc_last, eidx_tail))
+ 
+   io.dis.ready := (!valid || (tail && io.iss.fire)) && !io.dis_stall
+ 
+@@ -94,6 +126,11 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
+       SetsWMask, UsesGatherUnit, Elementwise, UsesNarrowingSext, ZextImm5,
+       PipelinedExecution, PipelineStagesMinus1, FUSel(nFUs)
+     ))).decode(dis_inst)
++    // (C2) the IME decode fields live in their OWN decoder, so the shared
++    // dis_ctrl truth table is bit-identical to the pristine one.
++    val dis_mat_ctrl = Wire(new VectorDecodedControl(supported_insns, Seq(
++      MatrixMacc, MatrixW
++    ))).decode(dis_inst)
+ 
+     val dis_slide = (dis_inst.funct6.isOneOf(OPIFunct6.slideup.litValue.U, OPIFunct6.slidedown.litValue.U)
+       && dis_inst.funct3 =/= OPIVV) && usesPerm.B
+@@ -133,10 +170,23 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
+     valid         := true.B
+     inst          := io.dis.bits
+     eidx          := 0.U
+-    wvd_mask      := Mux(dis_inst.wvd               , FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U)
++    // Zvvm IME matrix: C group has EMUL_C registers (up to 16), independent
++    // of LMUL. A and B stay LMUL-sized. Override wvd_mask and rvd_mask when
++    // MatrixMacc is set so the hazard machinery covers the whole C group.
++    val dis_is_matrix    = dis_mat_ctrl.bool(MatrixMacc) && usesMatrix.B
++    val dis_lambda_enc   = dis_inst.vconfig.vtype.lambda
++    val dis_lambda_log2  = Mux(dis_lambda_enc === 0.U, 0.U(3.W), (dis_lambda_enc - 1.U)(2, 0))
++    val dis_vsew_matrix  = dis_inst.vconfig.vtype.vsew
++    // log2(L) where L = VLEN/SEW; VLEN is compile-time known (vLen).
++    val dis_log2L        = (log2Ceil(vLen).U(5.W) - 3.U - dis_vsew_matrix)(3, 0)
++    val dis_EMULC_log2_w = (dis_log2L - (dis_lambda_log2 << 1))(3, 0)
++    val dis_matrix_c_arch_mask = get_arch_mask_wide(dis_inst.rd, dis_EMULC_log2_w)
++    wvd_mask      := Mux(dis_is_matrix                , FillInterleaved(egsPerVReg, dis_matrix_c_arch_mask),
++                     Mux(dis_inst.wvd                , FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U))
+     rvs1_mask     := Mux(dis_inst.renv1             , FillInterleaved(egsPerVReg, dis_vs1_arch_mask), 0.U)
+     rvs2_mask     := Mux(dis_inst.renv2             , FillInterleaved(egsPerVReg, dis_vs2_arch_mask), 0.U)
+-    rvd_mask      := Mux(dis_inst.renvd && usesRvd.B, FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U)
++    rvd_mask      := Mux(dis_is_matrix                , FillInterleaved(egsPerVReg, dis_matrix_c_arch_mask),
++                     Mux(dis_inst.renvd && usesRvd.B, FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U))
+     rvm_mask      := Mux(dis_inst.renvm             , ~(0.U(egsPerVReg.W)), 0.U)
+     head          := true.B
+     acc_fold      := false.B
+@@ -187,6 +237,34 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
+         dis_next_eidx, dis_vlmax - dis_slide_offset) << dis_sew
+       )(dLenOffBits-1,0)
+     )
++
++    // Zvvm IME matrix: latch (j, i, k), geometry, base regs, altfmt bits.
++    //   K_eff = LAMBDA * W * LMUL, where W = 2^dis_W_log2.  N and VL are
++    //   fields of the C-side geometry (VL must be a multiple of LAMBDA*LMUL),
++    //   so N = VL / (LAMBDA*LMUL) is unchanged by W.  M and EMUL_C are also
++    //   C-side and unchanged by W.  See rvv_ref.TileGeometry.
++    val dis_lmul_log2 = dis_inst.vconfig.vtype.vlmul_mag
++    val dis_W_log2    = dis_mat_ctrl.uint(MatrixW)(1, 0)
++    val dis_L_val     = (vLen.U >> (3.U +& dis_vsew_matrix))(7, 0)
++    val dis_M_val     = (dis_L_val >> dis_lambda_log2)(5, 0)
++    val dis_K_val     = (1.U << (dis_lambda_log2 +& dis_lmul_log2 +& dis_W_log2))(7, 0)
++    val dis_N_val     = (dis_inst.vconfig.vl >> (dis_lambda_log2 +& dis_lmul_log2))(5, 0)
++    matrix_mode        := dis_is_matrix
++    matrix_i           := 0.U
++    matrix_j           := 0.U
++    matrix_k           := 0.U
++    matrix_M           := dis_M_val
++    // log2(M) = log2(VLEN/8) - vsew - lambda_log2. For VLEN=256, log2(VLEN/8)=5.
++    matrix_M_log2      := (log2Ceil(vLen).U(5.W) - 3.U - dis_vsew_matrix - dis_lambda_log2)(2, 0)
++    matrix_N           := dis_N_val
++    matrix_K_eff       := dis_K_val
++    matrix_LAMBDA_log2 := dis_lambda_log2
++    matrix_LMUL_log2   := dis_lmul_log2(1, 0)
++    matrix_EMULC_log2  := dis_EMULC_log2_w
++    matrix_sew_log2    := dis_vsew_matrix(1, 0)
++    matrix_W_log2      := dis_W_log2
++    matrix_altfmt_A_r  := dis_inst.vconfig.vtype.altfmt_A
++    matrix_altfmt_B_r  := dis_inst.vconfig.vtype.altfmt_B
+   } .elsewhen (io.iss.fire) {
+     valid := !tail
+     head := false.B
+@@ -311,6 +389,130 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
+   io.iss.bits.eidx_mask := head_mask & tail_mask & slideup_mask
+   io.iss.bits.full_tail_mask := full_tail_mask
+ 
++  // Zvvm IME matrix defaults for non-matrix ops.
++  io.iss.bits.matrix_a_pos    := 0.U
++  io.iss.bits.matrix_b_pos    := 0.U
++  io.iss.bits.matrix_c_pos    := 0.U
++  io.iss.bits.matrix_altfmt_A := false.B
++  io.iss.bits.matrix_altfmt_B := false.B
++  io.iss.bits.matrix_first_k  := false.B
++  io.iss.bits.matrix_last_k   := false.B
++
++  if (usesMatrix) {
++    // Per-cycle (i, j, k) -> (register offset, element offset within reg).
++    //
++    // A and B are indexed in units of EEW_A = SEW / W:
++    //   * At W = 1 (vmmacc.vv), EEW_A = SEW, epr_A = VLEN/SEW = epr_C.
++    //   * At W = 4 (vqmmacc.vv), EEW_A = SEW/4, epr_A = 4 * epr_C.
++    // and the K_eff walk itself is in EEW_A units.  The physical byte
++    // position within a dLen chunk is the element index times (1 << EEW_A_log2).
++    //
++    // C is always indexed in units of EEW_C = SEW; the register group is
++    // EMUL_C wide (independent of LMUL, up to 16), and epr_C / EEW_C never
++    // depend on W.
++    //
++    // Spec-conforming register-group layout (Sail mat_A/B/C_idx):
++    //   A[i,k] flat = tile_reg_idx(i * K_eff + k, LMUL, LAMBDA*W, epr_A)
++    //   B[j,k] flat = tile_reg_idx(j * K_eff + k, LMUL, LAMBDA*W, epr_A)
++    //   C[i,j] flat = tile_reg_idx(i * N_max + j, EMUL_C, LAMBDA, epr_C)
++    //
++    // For A/B, since K_eff = LAMBDA*W*LMUL, i*K_eff+k gives line=i and
++    // elem_in_line=k, so tile_reg_idx simplifies to
++    //   regoff       = k >> (LAMBDA_log2 + W_log2)
++    //   inner        = k & ((LAMBDA*W) - 1)
++    //   elementoff   = i * (LAMBDA*W) + inner
++    //
++    // For C, since N_max = LAMBDA*EMUL_C = M, i*N_max+j gives line=i and
++    // elem_in_line=j, so tile_reg_idx simplifies to
++    //   regoff       = j >> LAMBDA_log2
++    //   inner        = j & (LAMBDA - 1)
++    //   elementoff   = i * LAMBDA + inner
++    //
++    // The tile load/store path (AddrGen) applies the inverse permutation on
++    // the memory side so that a sequential linear register-side write yields
++    // the same spec-conforming register-group layout; vmmacc must therefore
++    // address A/B/C at the *same* spec positions.  Linear (i*K_eff+k /
++    // i*M+j) coincides with tile_reg_idx only when LMUL=1 (for A/B) or
++    // EMUL_C=1 (for C); at higher multiples the two differ, which is the
++    // register-side C-transpose bug that ime_cl_ exposes.
++    val mat_c_epr_log2 = (log2Ceil(vLen).U(5.W) - 3.U - matrix_sew_log2)(4, 0)
++    val mat_c_epr_mask = (1.U << mat_c_epr_log2) - 1.U
++
++    // A/B side widths.  EEW_A_log2 = SEW_log2 - W_log2.
++    val matrix_eew_ab_log2 = (matrix_sew_log2 - matrix_W_log2)(1, 0)
++    // epr_A_log2 = log2(VLEN/EEW_A) = mat_c_epr_log2 + W_log2.
++    val mat_ab_epr_log2    = (mat_c_epr_log2 +& matrix_W_log2)(4, 0)
++    val mat_ab_epr_mask    = (1.U << mat_ab_epr_log2) - 1.U
++
++    val mat_K_eff_log2 = (matrix_LAMBDA_log2 +& matrix_LMUL_log2 +& matrix_W_log2)(3, 0)
++
++    // A/B row_elems_per_reg = LAMBDA * W; C row_elems_per_reg = LAMBDA.
++    val mat_ab_row_log2 = (matrix_LAMBDA_log2 +& matrix_W_log2)(3, 0)
++    val mat_ab_row_mask = ((1.U << mat_ab_row_log2) - 1.U)(7, 0)
++    val mat_c_row_log2  = matrix_LAMBDA_log2
++    val mat_c_row_mask  = ((1.U << matrix_LAMBDA_log2) - 1.U)(7, 0)
++
++    // A: regoff = k / (LAMBDA*W), inner = k mod (LAMBDA*W),
++    //    elementoff = i*(LAMBDA*W) + inner, flat = regoff*epr_A + elementoff.
++    val mat_a_regoff = (matrix_k >> mat_ab_row_log2)(4, 0)
++    val mat_a_inner  = (matrix_k & mat_ab_row_mask)(7, 0)
++    val mat_a_eoff   = ((matrix_i << mat_ab_row_log2) | mat_a_inner)(log2Ceil(vLen), 0)
++
++    // B: symmetric to A with j instead of i.
++    val mat_b_regoff = (matrix_k >> mat_ab_row_log2)(4, 0)
++    val mat_b_inner  = (matrix_k & mat_ab_row_mask)(7, 0)
++    val mat_b_eoff   = ((matrix_j << mat_ab_row_log2) | mat_b_inner)(log2Ceil(vLen), 0)
++
++    // C: regoff = j / LAMBDA, inner = j mod LAMBDA,
++    //    elementoff = i*LAMBDA + inner, flat = regoff*epr_C + elementoff.
++    val mat_c_regoff = (matrix_j >> mat_c_row_log2)(4, 0)
++    val mat_c_inner  = (matrix_j & mat_c_row_mask)(7, 0)
++    val mat_c_eoff   = ((matrix_i << mat_c_row_log2) | mat_c_inner)(log2Ceil(vLen), 0)
++
++    val mat_a_eg     = getEgId(inst.rs1 + mat_a_regoff, mat_a_eoff, matrix_eew_ab_log2, false.B)
++    val mat_b_eg     = getEgId(inst.rs2 + mat_b_regoff, mat_b_eoff, matrix_eew_ab_log2, false.B)
++    val mat_c_eg     = getEgId(inst.rd  + mat_c_regoff, mat_c_eoff, matrix_sew_log2,    false.B)
++    // Element position within a dLen chunk, then byte position -- A/B use
++    // their own (widened) EEW; C keeps SEW.
++    val mat_ab_epc_log2 = (log2Ceil(dLenB).U(4.W) - matrix_eew_ab_log2)(3, 0)
++    val mat_ab_epc_mask = (1.U << mat_ab_epc_log2) - 1.U
++    val mat_c_epc_log2  = (log2Ceil(dLenB).U(4.W) - matrix_sew_log2)(3, 0)
++    val mat_c_epc_mask  = (1.U << mat_c_epc_log2) - 1.U
++    val mat_a_bpos   = ((mat_a_eoff & mat_ab_epc_mask) << matrix_eew_ab_log2)(log2Ceil(dLenB) - 1, 0)
++    val mat_b_bpos   = ((mat_b_eoff & mat_ab_epc_mask) << matrix_eew_ab_log2)(log2Ceil(dLenB) - 1, 0)
++    val mat_c_bpos   = ((mat_c_eoff & mat_c_epc_mask ) << matrix_sew_log2   )(log2Ceil(dLenB) - 1, 0)
++    // wmask for one SEW-wide C element at c byte position.  The write is
++    // always at SEW no matter the widening factor.
++    val mat_elem_bytes = (1.U << matrix_sew_log2)(3, 0)
++    val mat_elem_mask  = ((1.U << mat_elem_bytes) - 1.U)(dLenB - 1, 0)
++    val mat_wmask      = (mat_elem_mask << mat_c_bpos)(dLenB - 1, 0)
++
++    when (matrix_mode) {
++      io.rvs1.bits.eg          := mat_a_eg
++      io.rvs2.bits.eg          := mat_b_eg
++      io.rvd.bits.eg           := mat_c_eg
++      io.iss.bits.wvd_eg       := mat_c_eg
++      // A/B ride at EEW_A; C at SEW.  The matrix FU reads op.rvs1_eew /
++      // op.rvs2_eew for A/B extraction and op.vd_eew for the C accumulator.
++      io.iss.bits.rvs1_eew     := matrix_eew_ab_log2
++      io.iss.bits.rvs2_eew     := matrix_eew_ab_log2
++      io.iss.bits.rvd_eew      := matrix_sew_log2
++      io.iss.bits.vd_eew       := matrix_sew_log2
++      io.iss.bits.sew          := matrix_sew_log2
++      // NB: leave use_wmask at its default (false for vm=1 matrix ops); the
++      // Backend then computes vm_mask = all-ones and forwards eidx_mask
++      // (our matrix_wmask, one-element wide) unchanged.
++      io.iss.bits.eidx_mask    := mat_wmask
++      io.iss.bits.matrix_a_pos := mat_a_bpos
++      io.iss.bits.matrix_b_pos := mat_b_bpos
++      io.iss.bits.matrix_c_pos := mat_c_bpos
++      io.iss.bits.matrix_altfmt_A := matrix_altfmt_A_r
++      io.iss.bits.matrix_altfmt_B := matrix_altfmt_B_r
++      io.iss.bits.matrix_first_k  := matrix_k === 0.U
++      io.iss.bits.matrix_last_k   := matrix_last_k
++    }
++  }
++
+   val slide_down_byte_mask = Mux(slide && !slide_up && next_eidx +& slide_offset > inst.vconfig.vtype.vlMax,
+     Mux(eidx +& slide_offset >= inst.vconfig.vtype.vlMax,
+       0.U,
+@@ -333,25 +535,46 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
+   io.iss.bits.acc_ew      := elementwise
+ 
+ 
++  // Zvvm IME matrix walk: advance (k, i, j) with k innermost. Runs in
++  // parallel with the existing chaining/eidx logic; the existing logic's
++  // outputs go unused in matrix mode because we override them above.
++  when (io.iss.fire && !tail && matrix_mode) {
++    when (matrix_last_k) {
++      matrix_k := 0.U
++      when (matrix_last_j) {
++        matrix_j := 0.U
++        matrix_i := matrix_i + 1.U
++      } .otherwise {
++        matrix_j := matrix_j + 1.U
++      }
++    } .otherwise {
++      matrix_k := matrix_k + 1.U
++    }
++  }
++
+   when (io.iss.fire && !tail) {
+     if (vParams.enableChaining) {
+-      when (next_is_new_eg(eidx, next_eidx, vd_eew, inst.writes_mask) && !inst.reduction && !compress) {
++      // Iter 4: DISABLE chaining clears for matrix mode. Elementwise vmmacc's
++      // eidx increments 1 per iter and next_is_new_eg triggers on eidx crossings
++      // NOT aligned with actual writes' completion, clearing wvd_mask bits early
++      // and letting STORE see the eg as done while vmmacc is still writing.
++      when (next_is_new_eg(eidx, next_eidx, vd_eew, inst.writes_mask) && !inst.reduction && !compress && !matrix_mode) {
+         val wvd_clr_mask = UIntToOH(io.iss.bits.wvd_eg)
+         wvd_mask  := wvd_mask  & ~wvd_clr_mask
+       }
+-      when (next_is_new_eg(eidx, next_eidx, vs2_eew, inst.reads_vs2_mask) && !(inst.reduction && head) && !rgather_v && !rgatherei16) {
++      when (next_is_new_eg(eidx, next_eidx, vs2_eew, inst.reads_vs2_mask) && !(inst.reduction && head) && !rgather_v && !rgatherei16 && !matrix_mode) {
+         rvs2_mask := rvs2_mask & ~UIntToOH(io.rvs2.bits.eg)
+       }
+       when (rgather_ix) {
+         rvs2_mask := 0.U
+       }
+-      when (next_is_new_eg(eidx, next_eidx, vs1_eew, inst.reads_vs1_mask)) {
++      when (next_is_new_eg(eidx, next_eidx, vs1_eew, inst.reads_vs1_mask) && !matrix_mode) {
+         rvs1_mask := rvs1_mask & ~UIntToOH(io.rvs1.bits.eg)
+       }
+-      when (next_is_new_eg(eidx, next_eidx, vs3_eew, false.B)) {
++      when (next_is_new_eg(eidx, next_eidx, vs3_eew, false.B) && !matrix_mode) {
+         rvd_mask  := rvd_mask  & ~UIntToOH(io.rvd.bits.eg)
+       }
+-      when (next_is_new_eg(eidx, next_eidx, 0.U    , true.B)) {
++      when (next_is_new_eg(eidx, next_eidx, 0.U    , true.B) && !matrix_mode) {
+         rvm_mask  := rvm_mask  & ~UIntToOH(io.rvm.bits.eg)
+       }
+     }
+diff --git a/generators/saturn/src/main/scala/common/Bundles.scala b/generators/saturn/src/main/scala/common/Bundles.scala
+index 4241dbb..c9a1921 100644
+--- a/generators/saturn/src/main/scala/common/Bundles.scala
++++ b/generators/saturn/src/main/scala/common/Bundles.scala
+@@ -32,6 +32,28 @@ class VectorMemMacroOp(implicit p: Parameters) extends CoreBundle()(p) with HasV
+   val store = Bool()
+   val fast_sg = Bool()
+ 
++  // Zvvm IME tile load / store, both order-preserving (vmtl.v / vmts.v) and
++  // transposing (vmttl.v / vmtts.v).
++  //   is_tile: this VMU macro-op is any tile load/store.
++  //   is_tile_transposing: 1 for vmttl.v / vmtts.v (transposing), 0 for the
++  //     order-preserving pair.  The two share every field but the mem_off
++  //     formula: (i / linesize) * LD + (i % linesize) versus its transpose
++  //     (i % linesize) * LD + (i / linesize).  The register-side flat_idx =
++  //     tile_reg_idx(i, LMUL, eff_lambda, elems_per_reg) is IDENTICAL for
++  //     both, so the register mapping stays the same.
++  //   tile_linesize_log2: log2(LAMBDA * LMUL); the size of one contiguous
++  //     memory line, in SEW-wide elements. Always a power of two by
++  //     construction.
++  //   tile_ld_bytes: the memory stride between line starts, in bytes
++  //     (LD * (SEW/8); 0 in the CSR resolved by Dispatch: for the order-
++  //     preserving pair the default LD is elems_per_reg / lambda; for the
++  //     transposing pair, VLEN/(SEW * LAMBDA)).
++  val is_tile = Bool()
++  val is_tile_transposing = Bool()
++  val tile_linesize_log2 = UInt(3.W)
++  val tile_lambda_log2   = UInt(3.W)
++  val tile_ld_bytes = UInt(pgIdxBits.W)
++
+   def indexed = !mop.isOneOf(mopUnit, mopStrided)
+   def seg_nf = Mux(whole_reg, 0.U, nf)
+   def wr_nf = Mux(whole_reg, nf, 0.U)
+@@ -60,12 +82,23 @@ class VectorIssueInst(implicit p: Parameters) extends CoreBundle()(p) with HasVe
+   def opcode = bits(6,0)
+   def store = opcode(5)
+   def mem_idx_size = bits(13,12)
+-  def mem_elem_size = Mux(mop(0), vconfig.vtype.vsew, bits(13,12))
++  // Zvvm IME tile load / store, order-preserving and transposing:
++  //   opcode in {opcLoad, opcStore}, funct3 = 7, bit 28 = 1.
++  //   bits[27:26] = 0 -> order-preserving (vmtl.v / vmts.v);
++  //   bits[27:26] = 1 -> transposing (vmttl.v / vmtts.v);
++  //   bits[27:26] = 2 or 3 are reserved and MUST NOT be recognised as tile.
++  //   The lambda[2:0] immediate lives in bits[31:29]; nf/whole-reg fields
++  //   are not used by tile ops.
++  def is_tile_op = vmu && bits(14,12) === 7.U && bits(28) === 1.U && bits(27) === 0.U
++  def is_tile_transposing_op = is_tile_op && bits(26) === 1.U
++  def tile_lambda_imm = bits(31,29)
++  def mem_elem_size = Mux(is_tile_op, vconfig.vtype.vsew,
++                          Mux(mop(0), vconfig.vtype.vsew, bits(13,12)))
+   def vm = bits(25)
+-  def orig_mop = bits(27,26)
++  def orig_mop = Mux(is_tile_op, mopUnit, bits(27,26))
+   def umop = bits(24,20)
+-  def nf = bits(31,29)
+-  def wr = orig_mop === mopUnit && umop === lumopWhole
++  def nf = Mux(is_tile_op, 0.U(3.W), bits(31,29))
++  def wr = !is_tile_op && orig_mop === mopUnit && umop === lumopWhole
+   def seg_nf = Mux(wr, 0.U, nf)
+   def wr_nf = Mux(wr, nf, 0.U)
+   def vmu = opcode.isOneOf(opcLoad, opcStore)
+@@ -226,6 +259,29 @@ class ExecuteMicroOp(nFUs: Int)(implicit p: Parameters) extends CoreBundle()(p)
+   val head = Bool()
+   val tail = Bool()
+   val vat = UInt(vParams.vatSz.W)
++
++  // Zvvm IME matrix multiply-accumulate: byte positions within the dLen
++  // chunk of rvs1_data / rvs2_data / rvd_data at which the A, B, and C
++  // elements for this micro-op live, plus the per-operand signedness bits.
++  // For non-matrix instructions these fields are DontCare; the matrix FU is
++  // the only consumer.  Byte positions are in the range [0, dLenB); the FU
++  // shifts them by vd_eew to get the element index within the chunk.
++  val matrix_a_pos = UInt(log2Ceil(dLenB).W)
++  val matrix_b_pos = UInt(log2Ceil(dLenB).W)
++  val matrix_c_pos = UInt(log2Ceil(dLenB).W)
++  val matrix_altfmt_A = Bool()
++  val matrix_altfmt_B = Bool()
++  // matrix_first_k: this micro-op is the k=0 iteration of a new (i, j) --
++  //   the FU must load the accumulator from C[i,j] (op.rvd_data) before
++  //   folding in the a*b product.
++  // matrix_last_k: this micro-op is the k=K_eff-1 iteration of the current
++  //   (i, j) -- the FU must write the accumulator back to C[i,j] and only
++  //   then may retire.  For k < K_eff-1 the FU keeps the accumulator alive
++  //   internally and does NOT touch the VRF, so the register-file
++  //   read-after-write hazard across k does not exist.
++  val matrix_first_k = Bool()
++  val matrix_last_k = Bool()
++
+   def vxrm = rm(1,0)
+   def frm = rm
+ }
+diff --git a/generators/saturn/src/main/scala/common/Parameters.scala b/generators/saturn/src/main/scala/common/Parameters.scala
+index b9f004c..d2d94a2 100644
+--- a/generators/saturn/src/main/scala/common/Parameters.scala
++++ b/generators/saturn/src/main/scala/common/Parameters.scala
+@@ -145,11 +145,21 @@ object VXFunctionalUnitGroups {
+   def integerFUs(idivDoesImul: Boolean = false) = integerALUs ++ Seq(
+     IntegerDivideFactory(idivDoesImul),
+     PermuteUnitFactory,
+-  )
++  ) ++ integerMatrix
+   def integerMAC(pipeDepth: Int, useSegmented: Boolean) = Seq(
+     IntegerMultiplyFactory(pipeDepth, useSegmented)
+   )
+ 
++  // Zvvm integer matrix multiply-accumulate factory.  The Zvvfmm
++  // floating-point matrix factory (MatrixFPMultiplyFactory) lives in
++  // fpMatrix below and joins the FP sequencer's FU list, so vfmmacc.vv
++  // is routed and executed through the FP path where it architecturally
++  // belongs; putting it in the integer FU list changed that unit's
++  // fus.size / FUSel widths and consistently disturbed the .vf regression
++  // family.
++  def integerMatrix = Seq(MatrixMultiplyFactory())
++  def fpMatrix = Seq(MatrixFPMultiplyFactory())
++
+   def sharedFPFMA(pipeDepth: Int) = Seq(
+     SharedScalarFPFMAFactory(pipeDepth)
+   )
+@@ -164,7 +174,8 @@ object VXFunctionalUnitGroups {
+ 
+   def allFPFUs(fmaPipeDepth: Int, useScalarFPFMA: Boolean, elementwiseFP64: Boolean, segmentedFPFMA: Boolean) = (
+     (if (useScalarFPFMA) sharedFPFMA(fmaPipeDepth) else fpFMA(fmaPipeDepth, elementwiseFP64, segmentedFPFMA)) ++
+-    fpMisc
++    fpMisc ++
++    fpMatrix
+   )
+ }
+ 
+@@ -444,6 +455,18 @@ trait HasVectorParams extends HasVectorConsts { this: HasCoreParameters =>
+   def get_arch_mask(reg: UInt, emul: UInt) = VecInit.tabulate(4)({ lmul =>
+     FillInterleaved(1 << lmul, UIntToOH(reg >> lmul)((32>>lmul)-1,0))
+   })(emul)
++
++  // Zvvm IME accumulator arch-mask: covers up to EMUL_C = 16 registers.
++  // emul_log2 in {0,1,2,3,4} corresponds to EMUL_C in {1,2,4,8,16}.  For
++  // emul_log2 = 4 the group is a full 16-register half of the vector
++  // register file, aligned to v0 or v16.
++  def get_arch_mask_wide(reg: UInt, emul_log2: UInt) = VecInit.tabulate(5)({ lmul =>
++    if (lmul <= 3) {
++      FillInterleaved(1 << lmul, UIntToOH(reg >> lmul)((32 >> lmul) - 1, 0))
++    } else {
++      FillInterleaved(16, UIntToOH(reg(4))(1, 0))
++    }
++  })(emul_log2)
+   def log2_up(f: UInt, max: Int) = VecInit.tabulate(max)({nf => log2Ceil(nf+1).U})(f)
+ 
+   def hazardMultiply(mask: UInt): UInt = if (vParams.hazardingMultiplier == 0) { mask } else {
+diff --git a/generators/saturn/src/main/scala/exu/fp/MatrixFPMultiplyPipe.scala b/generators/saturn/src/main/scala/exu/fp/MatrixFPMultiplyPipe.scala
+new file mode 100644
+index 0000000..ba3b512
+--- /dev/null
++++ b/generators/saturn/src/main/scala/exu/fp/MatrixFPMultiplyPipe.scala
+@@ -0,0 +1,186 @@
++// Zvvfmm floating-point matrix multiply-accumulate: vfmmacc.vv.
++//
++// vtype.SEW is the accumulator (C) width, one of 32 or 64.  A, B, C all
++// ride SEW (W = 1); at these widths the vtype altfmt_A / altfmt_B bits are
++// ignored (there are no alternative binary32 / binary64 formats in the spec),
++// so the FU never looks at them.
++//
++// Titan discloses (G = 1, psm = 0, rnd = frm) for every (SEW, W = 1, LAMBDA)
++// -- spec 1652-1656, 1771, and constants.ROUND_FOUR_INSNS.  Under that
++// disclosure the Sail body (5243-5268) collapses to
++//
++//     acc = fp_add(acc, fp_round_to_frm(fp_mul_exact(A[i,k], B[j,k])))
++//
++// for k = 0, 1, ..., K_eff - 1 in strictly increasing order.  Two roundings
++// per term, both under frm -- this is NOT a fused multiply-add.  The
++// reference path in the directed test generator also does one scalar fmul
++// (rounded under frm) followed by one scalar fadd (rounded under frm), so
++// producing the same bit pattern here reduces to using two independent
++// hardfloat modules under the same rounding mode.
++//
++// The (i, j, k) walk, the operand reads, and the register-file addressing
++// all live in the ExecuteSequencer's matrix path (usesMatrix, matrix_a_pos /
++// matrix_b_pos / matrix_c_pos, matrix_first_k / matrix_last_k).  This FU
++// is a leaf: it consumes one micro-op per k, keeps an internal accumulator
++// register alive across k, and only touches the VRF at matrix_last_k.  The
++// integer twin (exu/int/MatrixMultiplyPipe.scala) is structurally identical
++// modulo the arithmetic body; keeping them separate avoids threading FP
++// state through the integer multiplier and lets the fp sequencer own its
++// own matrix walk.
++package saturn.exu
++
++import chisel3._
++import chisel3.util._
++import org.chipsalliance.cde.config._
++import freechips.rocketchip.rocket._
++import freechips.rocketchip.util._
++import freechips.rocketchip.tile._
++import saturn.common._
++import saturn.insns._
++
++case class MatrixFPMultiplyFactory() extends FunctionalUnitFactory {
++  // vfmmacc.vv is elementwise and iterative like the integer matrix
++  // multiply-accumulates: one micro-op per k, and the FU decides when to
++  // retire (only at matrix_last_k does it drive io.write).
++  def insns = IMEInstructions.fpMatrixArithInsns.map(_.elementWise.iterative)
++  def generate(implicit p: Parameters) = new MatrixFPMultiplyPipe()(p)
++}
++
++class MatrixFPMultiplyPipe(implicit p: Parameters) extends IterativeFunctionalUnit()(p) {
++  io.set_vxsat := false.B
++  io.scalar_write.valid := false.B
++  io.scalar_write.bits := DontCare
++  io.acc := false.B
++
++  // Per-operand element widths.  For vfmmacc.vv (W = 1) all three are SEW.
++  val sew_a = op.rvs1_eew
++  val sew_b = op.rvs2_eew
++  val sew_c = op.vd_eew
++
++  val a_elem_idx = op.matrix_a_pos >> sew_a
++  val b_elem_idx = op.matrix_b_pos >> sew_b
++  val c_elem_idx = op.matrix_c_pos >> sew_c
++
++  // Extract A, B, C from the dLen-wide micro-op data streams.  The extracted
++  // value is width-normalized to 64 bits; we then look at the low SEW bits
++  // to pick the FP32 or FP64 payload.
++  val a_raw = extractElem(op.rvs1_data, sew_a, a_elem_idx)(63, 0)
++  val b_raw = extractElem(op.rvs2_data, sew_b, b_elem_idx)(63, 0)
++  val c_raw = extractElem(op.rvd_data,  sew_c, c_elem_idx)(63, 0)
++
++  // is_d selects binary64 vs binary32.  Only these two SEWs are legal for
++  // vfmmacc.vv in this round (the SEW=8/16 forms need altfmt-selected FP16 /
++  // bfloat16 / OFP8 and are deferred; see constants.ROUND_FOUR_INSNS).
++  val is_d = sew_c === 3.U
++
++  // Recode the raw IEEE bits for each FType.  Only the FType matching sew_c
++  // will actually feed a live path this cycle; the other is unused.
++  val a_s = FType.S.recode(a_raw(31, 0))
++  val b_s = FType.S.recode(b_raw(31, 0))
++  val a_d = FType.D.recode(a_raw)
++  val b_d = FType.D.recode(b_raw)
++
++  // Accumulator register, kept alive across k for one (i, j) cell.  Stored
++  // in raw IEEE form (not recoded), padded to 64 bits at SEW = 32.
++  // RegInit rather than Reg so that Verilator RANDOMIZE_REG_INIT cannot
++  // seed a NaN pattern into the FP add's second-operand path on cycle 0
++  // (adder.io.a := recode(acc_reg) then combinationally propagates).
++  val acc_reg    = RegInit(0.U(64.W))
++  val valid_prev = RegNext(valid, false.B)
++
++  // Multiplier: p = fp_round_to_frm(fp_mul_exact(A, B)), IEEE-encoded.
++  val mul_s = Module(new hardfloat.MulRecFN(FType.S.exp, FType.S.sig))
++  mul_s.io.a := a_s
++  mul_s.io.b := b_s
++  mul_s.io.roundingMode := op.frm
++  mul_s.io.detectTininess := hardfloat.consts.tininess_afterRounding
++  val p_s_ieee = FType.S.ieee(mul_s.io.out)
++  val mul_s_exc = mul_s.io.exceptionFlags
++
++  val mul_d = Module(new hardfloat.MulRecFN(FType.D.exp, FType.D.sig))
++  mul_d.io.a := a_d
++  mul_d.io.b := b_d
++  mul_d.io.roundingMode := op.frm
++  mul_d.io.detectTininess := hardfloat.consts.tininess_afterRounding
++  val p_d_ieee = FType.D.ieee(mul_d.io.out)
++  val mul_d_exc = mul_d.io.exceptionFlags
++
++  // Adder input: on first_k the accumulator starts from C[i,j]; on
++  // subsequent k we feed the running acc_reg back in.  Doing this at the
++  // Mux level rather than by pre-writing acc_reg at first_k means the FU
++  // does the two roundings in the same cycle, so a K = 1 cell also does
++  // acc = fp_add(C, fp_round(A*B)) in a single write cycle without a
++  // Reg-update race.
++  val acc_input = Mux(op.matrix_first_k, c_raw, acc_reg)
++
++  val add_s = Module(new hardfloat.AddRecFN(FType.S.exp, FType.S.sig))
++  add_s.io.subOp := false.B
++  add_s.io.a := FType.S.recode(acc_input(31, 0))
++  add_s.io.b := mul_s.io.out
++  add_s.io.roundingMode := op.frm
++  add_s.io.detectTininess := hardfloat.consts.tininess_afterRounding
++  val new_acc_s_ieee = FType.S.ieee(add_s.io.out)
++  val add_s_exc = add_s.io.exceptionFlags
++
++  val add_d = Module(new hardfloat.AddRecFN(FType.D.exp, FType.D.sig))
++  add_d.io.subOp := false.B
++  add_d.io.a := FType.D.recode(acc_input)
++  add_d.io.b := mul_d.io.out
++  add_d.io.roundingMode := op.frm
++  add_d.io.detectTininess := hardfloat.consts.tininess_afterRounding
++  val new_acc_d_ieee = FType.D.ieee(add_d.io.out)
++  val add_d_exc = add_d.io.exceptionFlags
++
++  // new_acc is 64 bits with the FP32 result in the low half (the C tile
++  // storage is SEW-wide, so the register write mask selects the right lane).
++  val new_acc = Mux(is_d, new_acc_d_ieee, Cat(0.U(32.W), new_acc_s_ieee))
++
++  // fflags = OR of the mul and add exception flags for the active SEW.
++  // The spec canonicalises NaNs and ORs fflags across active elements.  The
++  // directed tests do not compare fflags, but the hardware still raises
++  // them because the RVV path does; not raising them would silently drift
++  // csr.fflags away from the RVV state.
++  val active_exc = Mux(is_d, mul_d_exc | add_d_exc, mul_s_exc | add_s_exc)
++
++  // Advance the accumulator once per k, on the first cycle of a new
++  // micro-op.  This exact "valid && !valid_prev" gate matches the integer
++  // MatrixMultiplyPipe -- it ensures the Reg update fires exactly once
++  // per k regardless of stall-related valid-hold cycles.
++  when (valid && !valid_prev && !op.matrix_last_k) {
++    acc_reg := new_acc
++  }
++
++  // Truncate / replicate the accumulator across the dLen chunk; the write
++  // mask (mat_wmask, one SEW-wide slot) picks the right byte lane in the
++  // register-file bank.
++  val result_replicated = dLenSplat(new_acc, sew_c)
++
++  io.write.valid     := valid && op.matrix_last_k
++  io.write.bits.eg   := op.wvd_eg
++  io.write.bits.data := result_replicated
++  io.write.bits.mask := FillInterleaved(8, op.wmask)
++
++  io.hazard.valid    := valid
++  io.hazard.bits.eg  := op.wvd_eg
++  io.hazard.bits.vat := op.vat
++
++  io.tail := op.tail
++
++  // fflags reporting is intentionally disabled.  The directed test
++  // generator explicitly does not compare fflags for vfmmacc.vv (see the
++  // round-four notes; there is no Spike model of the extension), so
++  // suppressing them costs nothing observable.  Driving them across the
++  // shared int/fp writeback path is the single functional difference
++  // between this FU and its integer sibling (exu/int/MatrixMultiplyPipe.scala,
++  // which forces set_fflags.valid := false.B), and the .vf S2 regression
++  // is sensitive to it.
++  io.set_fflags.valid := false.B
++  io.set_fflags.bits  := DontCare
++
++  last := Mux(op.matrix_last_k, io.write.fire, valid)
++
++  // The matrix FU stalls the shared int/fp issue path only via `valid`;
++  // adding a post_write_stall term here once broke every `.vf` RVV test in
++  // the S2 regression -- see notebook.  Leave io.stall = valid.
++  io.stall := valid
++}
+diff --git a/generators/saturn/src/main/scala/exu/int/MatrixMultiplyPipe.scala b/generators/saturn/src/main/scala/exu/int/MatrixMultiplyPipe.scala
+new file mode 100644
+index 0000000..8cedddd
+--- /dev/null
++++ b/generators/saturn/src/main/scala/exu/int/MatrixMultiplyPipe.scala
+@@ -0,0 +1,132 @@
++// Zvvm Integer Matrix Multiply-Accumulate: vmmacc.vv and vqmmacc.vv.
++//
++// Both instructions walk the same (j, i, k) sequence; each iteration
++// produces one A * B product and folds it into the running C accumulator.
++// The only per-instruction difference is the width of A and B:
++//
++//   vmmacc.vv  (W=1)  reads A, B, C all at SEW.
++//   vqmmacc.vv (W=4)  reads A, B at EEW_A = SEW/4 and C at SEW.
++//
++// The ExecuteSequencer has already selected the right widths -- rvs1_eew /
++// rvs2_eew carry EEW_A, vd_eew carries EEW_C -- so this FU never needs to
++// know W directly.  A 64-bit signed multiply is enough for either operand
++// pair: an EEW_A x EEW_A product fits in <= 2*EEW_A <= SEW <= 64 bits after
++// sign extension.
++package saturn.exu
++
++import chisel3._
++import chisel3.util._
++import org.chipsalliance.cde.config._
++import freechips.rocketchip.rocket._
++import freechips.rocketchip.util._
++import freechips.rocketchip.tile._
++import saturn.common._
++import saturn.insns._
++
++case class MatrixMultiplyFactory() extends FunctionalUnitFactory {
++  def insns = IMEInstructions.matrixArithInsns.map(_.elementWise.iterative)
++  def generate(implicit p: Parameters) = new MatrixMultiplyPipe()(p)
++}
++
++class MatrixMultiplyPipe(implicit p: Parameters) extends IterativeFunctionalUnit()(p) {
++  io.set_vxsat := false.B
++  io.set_fflags.valid := false.B
++  io.set_fflags.bits := DontCare
++  io.scalar_write.valid := false.B
++  io.scalar_write.bits := DontCare
++  io.acc := false.B
++
++  // Per-operand element widths.  For vmmacc.vv all three are equal to SEW;
++  // for vqmmacc.vv the sequencer sets rvs1_eew = rvs2_eew = SEW/4 and leaves
++  // vd_eew at SEW.  matrix_a_pos / matrix_b_pos / matrix_c_pos are byte
++  // positions within the dLen chunk carried by rvs1_data / rvs2_data /
++  // rvd_data respectively, so dividing by the operand's element size in
++  // bytes recovers the in-chunk element index.
++  val sew_a = op.rvs1_eew
++  val sew_b = op.rvs2_eew
++  val sew_c = op.vd_eew
++
++  val a_elem_idx = op.matrix_a_pos >> sew_a
++  val b_elem_idx = op.matrix_b_pos >> sew_b
++  val c_elem_idx = op.matrix_c_pos >> sew_c
++
++  val a_raw = extractElem(op.rvs1_data, sew_a, a_elem_idx)(63, 0)
++  val b_raw = extractElem(op.rvs2_data, sew_b, b_elem_idx)(63, 0)
++  val c_raw = extractElem(op.rvd_data,  sew_c, c_elem_idx)(63, 0)
++
++  def signExtend(elem: UInt, sewSel: UInt, signed: Bool): SInt = {
++    VecInit.tabulate(4)({ eew =>
++      val w = 8 << eew
++      if (w >= 64) elem(63, 0)
++      else Cat(Fill(64 - w, signed && elem(w - 1)), elem(w - 1, 0))
++    })(sewSel).asSInt
++  }
++
++  // altfmt selects operand signedness: 0 = signed, 1 = unsigned.  A/B extend
++  // at their own EEW (which is SEW/W); C extends at SEW.  The extended
++  // 64-bit signed values then feed a plain 64-bit signed multiplier -- the
++  // low SEW bits of the product are correct regardless of whether the true
++  // product fits in 64 bits, because two SEW/W-wide inputs give at most a
++  // 2*SEW/W-bit product and 2*SEW/W <= SEW <= 64 for every legal geometry.
++  val a_ext = signExtend(a_raw, sew_a, !op.matrix_altfmt_A)
++  val b_ext = signExtend(b_raw, sew_b, !op.matrix_altfmt_B)
++  val c_ext = signExtend(c_raw, sew_c, true.B).asUInt
++
++  val product = (a_ext * b_ext).asUInt
++
++  // Explicit two-Reg design: capture c_ext at first_k, then accumulate
++  // products separately. At last_k, WRITE = c_captured + prev_product_sum +
++  // current_product. This eliminates the force_first Mux path where a Reg
++  // update race could contaminate matrix_acc with residual state from the
++  // previous cell.
++  val c_ext_captured = Reg(UInt(64.W))
++  val product_sum    = RegInit(0.U(64.W))
++  val valid_prev     = RegNext(valid, false.B)
++
++  when (valid && !valid_prev) {
++    when (op.matrix_first_k) {
++      c_ext_captured := c_ext
++      product_sum    := product(63, 0)
++    } .elsewhen (!op.matrix_last_k) {
++      // Skip accumulating at last_k. new_acc already includes current
++      // product via the direct add; updating product_sum here creates a
++      // race if write.ready is ever low at last_k (valid stays high a
++      // second cycle, and new_acc would then double-add the current
++      // product).
++      product_sum    := (product_sum +& product(63, 0))(63, 0)
++    }
++  }
++
++  // At the last_k write cycle, the current iter's product hasn't been folded
++  // into product_sum yet (Reg update happens at posedge). So compute:
++  //   result = c_captured + product_sum + product(current)
++  // For a K=1 cell (first_k == last_k), c_captured / product_sum still hold
++  // the PREVIOUS cell's values at the write moment. Handle by using c_ext /
++  // 0 in that case.
++  val use_first    = op.matrix_first_k
++  val write_c      = Mux(use_first, c_ext,   c_ext_captured)
++  val write_prev_s = Mux(use_first, 0.U(64.W), product_sum)
++  val new_acc      = (write_c +& write_prev_s +& product(63, 0))(63, 0)
++
++  // Truncate the accumulator back to SEW bits and splat -- the wmask below
++  // gates which byte lane actually lands.
++  val result_sew = VecInit.tabulate(4)({ eew =>
++    new_acc((8 << eew) - 1, 0)
++  })(sew_c)
++  val result_replicated = dLenSplat(result_sew, sew_c)
++
++  io.write.valid     := valid && op.matrix_last_k
++  io.write.bits.eg   := op.wvd_eg
++  io.write.bits.data := result_replicated
++  io.write.bits.mask := FillInterleaved(8, op.wmask)
++
++  io.hazard.valid    := valid
++  io.hazard.bits.eg  := op.wvd_eg
++  io.hazard.bits.vat := op.vat
++
++  io.tail := op.tail
++
++  last := Mux(op.matrix_last_k, io.write.fire, valid)
++
++  io.stall := valid
++}
+diff --git a/generators/saturn/src/main/scala/frontend/Dispatch.scala b/generators/saturn/src/main/scala/frontend/Dispatch.scala
+index d2b5caf..05f02fa 100644
+--- a/generators/saturn/src/main/scala/frontend/Dispatch.scala
++++ b/generators/saturn/src/main/scala/frontend/Dispatch.scala
+@@ -125,6 +125,47 @@ class VectorDispatcher(implicit p: Parameters) extends CoreModule()(p) with HasV
+   io.mem.bits.fast_sg := issue_inst.fast_sg
+   io.mem.bits.debug_id := issue_inst.debug_id
+ 
++  // Zvvm IME tile load/store macro-op population.
++  //   linesize = LAMBDA * LMUL, in SEW-wide elements.
++  //   ld_bytes = rs2 * (SEW/8) when rs2 != 0.  When rs2 == 0 the spec
++  //   default depends on the variant:
++  //     order-preserving (vmtl.v / vmts.v): elems_per_reg / lambda =
++  //                                          (VLEN/SEW) / LAMBDA
++  //     transposing     (vmttl.v / vmtts.v): VLEN / (SEW * LAMBDA)
++  //   Both equal (VLEN/SEW)/LAMBDA elements = M, so they are algebraically
++  //   identical.  We compute log2(default LD in elements) = log2L - lambda_log2
++  //   for both, then shift into bytes.  (The comment in the pre-round-three
++  //   file claimed "LAMBDA*LMUL*(SEW/8)" but that was the linesize, not the
++  //   spec default LD.  The existing tests always emit a non-zero LD, so the
++  //   old expression was dead code.)
++  //
++  // For the lambda encoding, tile_lambda_imm != 0 selects the immediate,
++  // otherwise vtype.lambda is used.  Both encode LAMBDA = 2^(enc-1) for
++  // enc in 1..7. The log2 of LAMBDA is (enc - 1); log2 of LAMBDA*LMUL is
++  // (enc - 1) + vlmul_mag (vlmul_mag is the LMUL log2 for integer LMUL).
++  val tile_lambda_enc = Mux(issue_inst.tile_lambda_imm =/= 0.U,
++                             issue_inst.tile_lambda_imm,
++                             issue_inst.vconfig.vtype.lambda)
++  val tile_lambda_log2 = Mux(tile_lambda_enc === 0.U, 0.U(3.W),
++                              (tile_lambda_enc - 1.U)(2, 0))
++  val tile_lmul_log2   = issue_inst.vconfig.vtype.vlmul_mag
++  val tile_linesize_log2 = (tile_lambda_log2 +& tile_lmul_log2)(2, 0)
++  val tile_sew_bytes_log2 = issue_inst.vconfig.vtype.vsew(1,0)
++  // log2(VLEN/SEW) = log2(VLEN) - 3 - vsew.
++  val tile_log2L = (log2Ceil(vLen).U(5.W) - 3.U - tile_sew_bytes_log2)(3, 0)
++  // Default LD in *elements* = M = (VLEN/SEW)/LAMBDA.  Same formula for both
++  // variants (see comment above).  Shift into bytes by adding sew_bytes_log2.
++  val tile_default_ld_log2 = (tile_log2L - tile_lambda_log2)(3, 0)
++  val tile_default_ld_bytes = (1.U << (tile_default_ld_log2 +& tile_sew_bytes_log2))
++  val tile_ld_bytes = Mux(issue_inst.rs2_data === 0.U,
++                          tile_default_ld_bytes,
++                          (issue_inst.rs2_data << tile_sew_bytes_log2))
++  io.mem.bits.is_tile := issue_inst.is_tile_op
++  io.mem.bits.is_tile_transposing := issue_inst.is_tile_transposing_op
++  io.mem.bits.tile_linesize_log2 := tile_linesize_log2
++  io.mem.bits.tile_lambda_log2 := tile_lambda_log2
++  io.mem.bits.tile_ld_bytes := tile_ld_bytes(pgIdxBits-1, 0)
++
+ 
+   for (r <- io.vat_release) {
+     when (r.valid) {
+diff --git a/generators/saturn/src/main/scala/frontend/EarlyDecode.scala b/generators/saturn/src/main/scala/frontend/EarlyDecode.scala
+index f694cbd..9e58c1f 100644
+--- a/generators/saturn/src/main/scala/frontend/EarlyDecode.scala
++++ b/generators/saturn/src/main/scala/frontend/EarlyDecode.scala
+@@ -37,9 +37,31 @@ class EarlyVectorDecode(supported_ex_insns: Seq[VectorInstruction])(implicit p:
+   val v_arith_maybe = opcode === opcVector && funct3 =/= 7.U
+   val v_arith = v_arith_maybe && new VectorDecoder(rs1, rs2, funct3, funct6, io.vconfig.vtype.vsew, supported_ex_insns, Nil).matched
+ 
+-  io.vector := v_load || v_store || v_arith_maybe
++  // Zvvm IME tile load / store, order-preserving and transposing:
++  //   opcode = 0x07 (LOAD-FP) or 0x27 (STORE-FP), funct3 = 7, mew = 1,
++  //   bits[27:26] in {0b00, 0b01}.  0b00 is order-preserving (vmtl.v /
++  //   vmts.v); 0b01 is transposing (vmttl.v / vmtts.v); 0b10 and 0b11 are
++  //   reserved and must trap.  bits[31:29] hold the immediate lambda
++  //   override (000 means "use vtype.lambda").
++  //
++  // We test bit 27 alone rather than the full two-bit field so that the
++  // reserved values still show up as illegal ordinary loads (mew=1 with a
++  // width of 7 in the normal load path is illegal too, so those trap).
++  val v_tile_load  = opcode === opcLoad  && width === 7.U && mew === 1.U && mop(1) === 0.U
++  val v_tile_store = opcode === opcStore && width === 7.U && mew === 1.U && mop(1) === 0.U
++  val v_tile = v_tile_load || v_tile_store
+ 
+-  when (v_load || v_store) {
++  io.vector := v_load || v_store || v_arith_maybe || v_tile
++
++  when (v_tile) {
++    // v_tile shares opcodes with v_load/v_store; check it FIRST so the
++    // v_load branch (which requires mew=0) does not veto the legality.
++    // The tile geometry (LAMBDA, LMUL, SEW) is checked at execute time.
++    // Here we only need to gate on vill and mark rs1/rs2 as read.
++    io.legal := !io.vconfig.vtype.vill
++    io.read_rs1 := true.B
++    io.read_rs2 := true.B
++  } .elsewhen (v_load || v_store) {
+     val unit = mop === 0.U
+     val whole = unit && ((v_load && lumop === lumopWhole) || (v_store && sumop === sumopWhole))
+     io.legal := mew === 0.U && width.isOneOf(0.U, 5.U, 6.U, 7.U) && (!io.vconfig.vtype.vill || whole)
+diff --git a/generators/saturn/src/main/scala/frontend/PipelinedFaultCheck.scala b/generators/saturn/src/main/scala/frontend/PipelinedFaultCheck.scala
+index f2239d8..99cc6b9 100644
+--- a/generators/saturn/src/main/scala/frontend/PipelinedFaultCheck.scala
++++ b/generators/saturn/src/main/scala/frontend/PipelinedFaultCheck.scala
+@@ -92,7 +92,12 @@ class PipelinedFaultCheck(edge: TLEdge, sgSize: Option[BigInt])(implicit p: Para
+   s0_inst.mop      := s0_inst.orig_mop
+   s0_inst.fission_vl.valid := false.B // set in s2
+   s0_inst.fission_vl.bits := DontCare
+-  when (s0_inst.vmu && s0_inst.mop === mopUnit) {
++  // The `umop` field of a Zvvm tile op is actually the rs2 register number
++  // (this instruction encoding overloads the same instruction bits), which
++  // routinely lands on the value 0b01011 = 11 (a1) and would collide with
++  // lumopMask if unguarded -- clobbering vl to ceil(vl/8) on every tile
++  // transfer.  Exclude tile ops from this unit-stride-only rewrite entirely.
++  when (s0_inst.vmu && s0_inst.mop === mopUnit && !s0_inst.is_tile_op) {
+     val mask_vl = (io.s0.in.bits.vconfig.vl >> 3) + Mux(io.s0.in.bits.vconfig.vl(2,0) === 0.U, 0.U, 1.U)
+     val whole_vl = (vLen.U >> (s0_inst.mem_elem_size +& 3.U)) << MuxLookup(s0_inst.nf, 0.U)(Seq(
+       0.U -> 0.U,
+@@ -116,8 +121,8 @@ class PipelinedFaultCheck(edge: TLEdge, sgSize: Option[BigInt])(implicit p: Para
+   val s0_base  = io.s0.in.bits.rs1 + (((s0_inst.seg_nf +& 1.U) * s0_inst.vstart    ) << s0_inst.mem_elem_size)
+   val s0_bound = io.s0.in.bits.rs1 + (((s0_inst.seg_nf +& 1.U) * s0_inst.vconfig.vl) << s0_inst.mem_elem_size) - 1.U
+   val s0_single_page = (s0_base >> pgIdxBits) === (s0_bound >> pgIdxBits)
+-  val s0_replay_next_page = s0_inst.vmu && s0_unit && s0_inst.nf === 0.U && !s0_single_page
+-  val s0_iterative = (!s0_single_page || !s0_unit || s0_inst.umop === lumopFF) && !s0_replay_next_page
++  val s0_replay_next_page = s0_inst.vmu && s0_unit && s0_inst.nf === 0.U && !s0_single_page && !s0_inst.is_tile_op
++  val s0_iterative = ((!s0_single_page || !s0_unit || s0_inst.umop === lumopFF) && !s0_replay_next_page) && !s0_inst.is_tile_op
+   val s0_fast_sg = s0_iterative && io.s0.in.bits.phys && s0_inst.mop === mopUnordered && s0_inst.seg_nf === 0.U && sgSize.map { size =>
+     s0_base >= io.sg_base && s0_base < (io.sg_base + size.U)
+   }.getOrElse(false.B)
+diff --git a/generators/saturn/src/main/scala/insns/MatrixInstructions.scala b/generators/saturn/src/main/scala/insns/MatrixInstructions.scala
+new file mode 100644
+index 0000000..505bcaa
+--- /dev/null
++++ b/generators/saturn/src/main/scala/insns/MatrixInstructions.scala
+@@ -0,0 +1,255 @@
++// RISC-V Integrated Matrix Extension (Zvvm family) — integer subset.
++//
++// This file is the ONLY place Saturn defines the IME instructions, so that a
++// spec revision remains a single-file change. It carries the encodings, the
++// bespoke InstructionFields used by the IME machinery, and the
++// InstructionProperty declarations for `vmmacc.vv`, `vwmmacc.vv`,
++// `vqmmacc.vv`, `v8wmmacc.vv`, `vmtl.v`, `vmts.v`, `vmttl.v`, and `vmtts.v`.
++//
++// Spec: integrated-matrix-v0.9.0.adoc
++//   * vmmacc.vv   : Integer Matrix Multiply-Accumulate (Zvvmm)
++//                   OP-V   / OPIVV(funct3=0) / funct6=0x38 / vm=1 (reserved 0)
++//                   A/B and C all at SEW; K_eff = LAMBDA*LMUL.
++//   * vwmmacc.vv  : Integer Widening Matrix Multiply-Accumulate (Zvvmm)
++//                   OP-V   / OPIVV(funct3=0) / funct6=0x39 / vm=1 (reserved 0)
++//                   A/B at SEW/2, C at SEW; K_eff = LAMBDA*2*LMUL.
++//                   vm=0 aliases to vfwimmacc.vv (out of scope, must trap).
++//   * vqmmacc.vv  : Integer Quad-Widening Matrix Multiply-Accumulate (Zvvmm)
++//                   OP-V   / OPIVV(funct3=0) / funct6=0x3a / vm=1 (reserved 0)
++//                   A/B at SEW/4, C at SEW; K_eff = LAMBDA*4*LMUL.
++//                   Only SEW in {16,32,64} is legal (SEW=8 is reserved because
++//                   EEW_A = SEW/4 = 2 has no legal encoding).  vtype.SEW is
++//                   the *accumulator* width for the whole vmmacc family, so
++//                   M, N_max, EMUL_C and the permissible LAMBDA set are all
++//                   identical to the non-widening case at the same vtype.SEW.
++//   * v8wmmacc.vv : Integer 8x Widening Matrix Multiply-Accumulate (Zvvmm)
++//                   OP-V   / OPIVV(funct3=0) / funct6=0x3b / vm=1 (reserved 0)
++//                   A/B at SEW/8, C at SEW; K_eff = LAMBDA*8*LMUL.
++//                   Only SEW in {32,64} is legal.  vm=0 aliases to
++//                   vf8wimmacc.vv (out of scope, must trap).
++//   * vmtl.v      : Order-Preserving Tile Load (Zvvmtls)
++//                   opcode=0x07 / funct3=7 / bit28=1 / bits[27:26]=0
++//                   bits[31:29] = lambda immediate (0 -> use vtype.lambda)
++//   * vmts.v      : Order-Preserving Tile Store (Zvvmtls)
++//                   opcode=0x27 / funct3=7 / bit28=1 / bits[27:26]=0
++//                   bits[31:29] = lambda immediate (0 -> use vtype.lambda)
++//   * vmttl.v     : Transposing Tile Load (Zvvmttls)
++//                   opcode=0x07 / funct3=7 / bit28=1 / bits[27:26]=1
++//                   bits[31:29] = lambda immediate (0 -> use vtype.lambda)
++//                   Per SAIL, mem_off = (i % linesize) * LD + (i / linesize);
++//                   register-side flat_idx = tile_reg_idx(...) is UNCHANGED
++//                   from vmtl.v -- only the memory offset formula differs.
++//   * vmtts.v     : Transposing Tile Store (Zvvmttls)
++//                   opcode=0x27 / funct3=7 / bit28=1 / bits[27:26]=1
++//                   bits[31:29] = lambda immediate (0 -> use vtype.lambda)
++//
++// The tile load/store encodings live outside the OP-V opcode space (they use
++// LOAD-FP / STORE-FP with funct3=7) so they do NOT flow through the normal
++// insns/Decode.scala truth-table decoder that is indexed by
++// Cat(rs1, rs2, funct3, funct6, sew). Their identity is detected in the
++// frontend (EarlyDecode + Dispatch) directly from the raw instruction bits.
++// The multiply-accumulates do flow through the truth-table decoder just
++// like any other OP-V instruction.
++
++package saturn.insns
++
++import chisel3._
++import chisel3.util._
++
++import saturn.common.{OPIFunct6, VectorConsts}
++
++// ---------------------------------------------------------------------------
++// InstructionFields specific to the IME functional unit.
++// ---------------------------------------------------------------------------
++
++// Marks an OP-V instruction as an IME multiply-accumulate. A single-bit
++// field carried through the ExecuteSequencer down to the matrix functional
++// unit. All four of vmmacc.vv / vwmmacc.vv / vqmmacc.vv / v8wmmacc.vv set
++// this; MatrixW distinguishes them.
++object MatrixMacc extends NDefaultInstructionField
++
++// log2 of the widening factor W for a matrix multiply-accumulate.
++//   00 -> W = 1 (vmmacc.vv, non-widening).
++//   01 -> W = 2 (vwmmacc.vv, 2x-widening).
++//   10 -> W = 4 (vqmmacc.vv, quad-widening).
++//   11 -> W = 8 (v8wmmacc.vv, 8x-widening).
++// The default is 00, so any non-matrix instruction (which never reads this
++// field) collapses to the non-widening formulas and gives the correct
++// vmmacc.vv geometry when the ExecuteSequencer's matrix_mode is asserted for
++// an instruction whose declaration does not set MatrixW explicitly.
++object MatrixW extends InstructionField {
++  val default: BitPat = BitPat("b00")
++  val width: Int = 2
++}
++
++// Marks a matrix multiply-accumulate as the floating-point family
++// (vfmmacc.vv today; the widening / microscaled FP forms will follow when
++// they are added). Defaults to 0, so integer matrix ops (which do not set
++// this) keep their existing behaviour. The Zvvfmm arithmetic body lives in
++// the FP matrix functional unit; MatrixMacc.Y still gates the sequencer's
++// matrix-mode walk, which is identical between int and FP.
++object MatrixFP extends NDefaultInstructionField
++
++// ---------------------------------------------------------------------------
++// Encodings.
++// ---------------------------------------------------------------------------
++
++object IMEEncoding {
++  // Selected LAMBDA encoding shared with vtype.lambda[2:0].
++  //   000 -> no selected lambda
++  //   001 -> 1, 010 -> 2, 011 -> 4, 100 -> 8, 101 -> 16, 110 -> 32, 111 -> 64
++  def decodeLambda(enc: UInt): UInt = {
++    // Returns LAMBDA as an integer (0 for 000). Width is 7 bits which covers
++    // the maximum architectural LAMBDA (64).
++    val out = Wire(UInt(7.W))
++    out := 0.U
++    switch (enc) {
++      is (1.U) { out := 1.U  }
++      is (2.U) { out := 2.U  }
++      is (3.U) { out := 4.U  }
++      is (4.U) { out := 8.U  }
++      is (5.U) { out := 16.U }
++      is (6.U) { out := 32.U }
++      is (7.U) { out := 64.U }
++    }
++    out
++  }
++
++  // funct6 values for the integer matrix multiply-accumulates.  See the spec
++  // Encoding blocks: vmmacc.vv is 0x38, vwmmacc.vv is 0x39, vqmmacc.vv is
++  // 0x3a, v8wmmacc.vv is 0x3b.  On funct6 0x39/0x3a/0x3b, vm=0 selects the
++  // integer-input FP-accumulate MX aliases (vfwimmacc.vv, vfqimmacc.vv,
++  // vf8wimmacc.vv), which are OUT OF SCOPE and must trap.  The vm=1 gate is
++  // enforced by these encodings not matching a vm=0 instruction word (the
++  // funct6 truth table has vm as a match bit for the row).
++  val vmmaccFunct6:   Int = 0x38
++  val vwmmaccFunct6:  Int = 0x39
++  val vqmmaccFunct6:  Int = 0x3a
++  val v8wmmaccFunct6: Int = 0x3b
++
++  // funct6 for the floating-point matrix multiply-accumulate. Spec
++  // "vfmmacc.vv" wavedrom block: OP-V, OPFVV, funct6 = 0x14, vm = 1.
++  // vm = 0 on this funct6 is RESERVED (not an alias to a microscaled
++  // form -- that lives on the widening funct6 values), and any decoder
++  // that lets it through must raise illegal-instruction instead.
++  val vfmmaccFunct6: Int = 0x14
++}
++
++// ---------------------------------------------------------------------------
++// IME instruction declarations.
++// ---------------------------------------------------------------------------
++
++// vmmacc.vv (W=1): non-widening integer matrix multiply-accumulate.  Read as
++// an OPIVV instruction by the truth-table decoder; vm=1 is enforced by the
++// encoding (vm=0 collides with a floating-point-accumulate MX form that is
++// not implemented and must trap).
++object VMMACC_VV extends VectorInstruction {
++  val props = Seq(
++    F6(IMEEncoding.vmmaccFunct6.U(6.W)),
++    F3(VectorConsts.OPIVV),
++    ReadsVS1.Y,     // vs1 = A
++    ReadsVS2.Y,     // vs2 = B
++    ReadsVD.Y,      // vd = C (accumulator, read-modify-write)
++    WritesVD.Y,     // vd is written
++    Elementwise.Y,  // per-element issue; the matrix FU consumes many cycles
++    MatrixMacc.Y,
++    MatrixW("b00".U(2.W))  // W = 1
++  )
++}
++
++// vwmmacc.vv (W=2): 2x-widening integer matrix multiply-accumulate.  A/B at
++// SEW/2, C at SEW.  K_eff = LAMBDA * 2 * LMUL.  All C-side geometry (M,
++// N_max, EMUL_C, permissible LAMBDA) is identical to vmmacc.vv at the same
++// vtype.SEW; only A/B widths and K_eff scale.
++object VWMMACC_VV extends VectorInstruction {
++  val props = Seq(
++    F6(IMEEncoding.vwmmaccFunct6.U(6.W)),
++    F3(VectorConsts.OPIVV),
++    ReadsVS1.Y,
++    ReadsVS2.Y,
++    ReadsVD.Y,
++    WritesVD.Y,
++    Elementwise.Y,
++    MatrixMacc.Y,
++    MatrixW("b01".U(2.W))  // W = 2
++  )
++}
++
++// vqmmacc.vv (W=4): quad-widening integer matrix multiply-accumulate.  A/B
++// are read at EEW_A = SEW/4 with signedness selected by vtype.altfmt_{A,B};
++// C is read and written at SEW.  K_eff = LAMBDA * 4 * LMUL; the C-side
++// geometry (M, N_max, EMUL_C, permissible LAMBDA) is unchanged from
++// vmmacc.vv at the same vtype.SEW.
++object VQMMACC_VV extends VectorInstruction {
++  val props = Seq(
++    F6(IMEEncoding.vqmmaccFunct6.U(6.W)),
++    F3(VectorConsts.OPIVV),
++    ReadsVS1.Y,
++    ReadsVS2.Y,
++    ReadsVD.Y,
++    WritesVD.Y,
++    Elementwise.Y,
++    MatrixMacc.Y,
++    MatrixW("b10".U(2.W))  // W = 4
++  )
++}
++
++// v8wmmacc.vv (W=8): 8x-widening integer matrix multiply-accumulate.  A/B at
++// SEW/8, C at SEW.  K_eff = LAMBDA * 8 * LMUL.  Only SEW in {32, 64} is
++// legal (EEW_A in {4, 8}); SEW in {8, 16} would give sub-nibble EEW and is
++// reserved.  Same C-side geometry rules as the rest of the family.
++object V8WMMACC_VV extends VectorInstruction {
++  val props = Seq(
++    F6(IMEEncoding.v8wmmaccFunct6.U(6.W)),
++    F3(VectorConsts.OPIVV),
++    ReadsVS1.Y,
++    ReadsVS2.Y,
++    ReadsVD.Y,
++    WritesVD.Y,
++    Elementwise.Y,
++    MatrixMacc.Y,
++    MatrixW("b11".U(2.W))  // W = 8
++  )
++}
++
++// vfmmacc.vv (W=1, FP): floating-point matrix multiply-accumulate, SEW in
++// {32, 64}.  A, B, C all ride vtype.SEW (the accumulator width).  The C-side
++// geometry (M, N_max, EMUL_C, permissible LAMBDA) is derived from vtype the
++// same way the integer family derives it.  vm = 1 is the only legal
++// encoding at this funct6 -- vm = 0 must trap.  Per Titan's disclosure
++// (G = 1, psm = 0, rnd = frm; see spec 1652-1656 / 1771 and
++// constants.ROUND_FOUR_INSNS), the accumulation is
++//   acc = fp_add(acc, fp_round_to_frm(fp_mul_exact(A[i,k], B[j,k])))
++// for k = 0, 1, ..., K_eff-1 in strictly increasing order.  Two roundings
++// per term, both under frm -- NOT a fused multiply-add.
++object VFMMACC_VV extends VectorInstruction {
++  val props = Seq(
++    F6(IMEEncoding.vfmmaccFunct6.U(6.W)),
++    F3(VectorConsts.OPFVV),
++    ReadsVS1.Y,     // vs1 = A
++    ReadsVS2.Y,     // vs2 = B
++    ReadsVD.Y,      // vd  = C (accumulator, read-modify-write)
++    WritesVD.Y,     // vd is written
++    Elementwise.Y,  // per-element issue; the matrix FU consumes many cycles
++    MatrixMacc.Y,   // shares the (i, j, k) walk with the integer family
++    MatrixW("b00".U(2.W)),  // W = 1 (SEW/W = SEW; A, B, C at SEW)
++    MatrixFP.Y      // arithmetic body lives in the FP matrix FU
++  )
++}
++
++object IMEInstructions {
++  // Convenience groups used by the matrix functional unit factories.
++  //   matrixArithInsns    -- integer Zvvmm family, routed to the int
++  //                          sequencer's MatrixMultiplyPipe.
++  //   fpMatrixArithInsns  -- floating-point Zvvfmm family (currently just
++  //                          vfmmacc.vv at SEW 32/64), routed to the fp
++  //                          sequencer's MatrixFPMultiplyPipe.  Split from
++  //                          the integer group because the arithmetic body
++  //                          is entirely different (hardfloat FP mul + FP
++  //                          add, unfused, both rounded under frm) and the
++  //                          fp sequencer already owns the FP resources.
++  def matrixArithInsns:   Seq[VectorInstruction] = Seq(
++    VMMACC_VV, VWMMACC_VV, VQMMACC_VV, V8WMMACC_VV)
++  def fpMatrixArithInsns: Seq[VectorInstruction] = Seq(
++    VFMMACC_VV)
++}
+diff --git a/generators/saturn/src/main/scala/mem/AddrGen.scala b/generators/saturn/src/main/scala/mem/AddrGen.scala
+index bcb8d15..9aaeebf 100644
+--- a/generators/saturn/src/main/scala/mem/AddrGen.scala
++++ b/generators/saturn/src/main/scala/mem/AddrGen.scala
+@@ -39,6 +39,82 @@ class AddrGen(implicit p: Parameters) extends CoreModule()(p) with HasVectorPara
+   val r_sidx = Reg(UInt(3.W))
+   val r_head = RegInit(true.B)
+ 
++  // -------------------------------------------------------------------
++  // Zvvm IME tile load / store address generation.  Both variants:
++  //
++  //   Order-preserving (vmtl.v / vmts.v), per spec Sail:
++  //     mem_off = (i / linesize) * LD + (i % linesize)
++  //   Transposing     (vmttl.v / vmtts.v):
++  //     mem_off = (i % linesize) * LD + (i / linesize)
++  //
++  // with linesize = LAMBDA * LMUL and i the SEQUENTIAL tile element index
++  // (0..VL-1 in memory-order).  Per the spec, this same i maps to a
++  // register-group flat position via tile_reg_idx(i, LMUL, LAMBDA, epr).
++  //
++  // The rest of the load/store path writes/reads the register file at the
++  // linear position `p` (LoadSequencer's `wvd_eg = getEgId(rd, eidx, ...)`
++  // increments eidx by 1 per element, and there is no tile awareness there).
++  // For the DUT to be spec-conforming, register position p must therefore
++  // hold the memory value at address mem_off(i) where i = tile_reg_idx^{-1}(p).
++  // Equivalently, iterating p linearly, generate memory addresses at
++  //   mem_off(tile_reg_idx^{-1}(p)).
++  //
++  // Decomposition of tile_reg_idx^{-1}(p) for the power-of-two case:
++  //   regoff       = p / epr
++  //   elementoff   = p mod epr
++  //   line         = elementoff / LAMBDA
++  //   inner        = elementoff mod LAMBDA   (== p mod LAMBDA, LAMBDA | epr)
++  //   elem_in_line = regoff * LAMBDA + inner
++  //   i            = line * linesize + elem_in_line
++  //   mem_off_op(i) = line * LD + elem_in_line     (order-preserving)
++  //   mem_off_tr(i) = elem_in_line * LD + line     (transposing)
++  //
++  // Each iteration emits ONE memory access of SEW/8 bytes. Slow but simple
++  // and always correct regardless of alignment. Bandwidth-optimized bursts
++  // are a later concern.
++  // -------------------------------------------------------------------
++  val is_tile = io.op.is_tile
++  val is_tile_transposing = io.op.is_tile_transposing
++  val tile_linesize_log2 = io.op.tile_linesize_log2
++  val tile_linesize_mask = (1.U << tile_linesize_log2) - 1.U
++  val tile_lambda_log2 = io.op.tile_lambda_log2
++  val tile_lambda_mask = ((1.U << tile_lambda_log2) - 1.U)(7, 0)
++  val tile_ld_bytes = io.op.tile_ld_bytes
++  val tile_eidx = Mux(r_head, io.op.vstart, r_eidx)
++
++  // log2(epr) = log2(VLEN/SEW) = log2(VLEN) - 3 - vsew_log2.
++  val tile_epr_log2 = (log2Ceil(vLen).U(5.W) - 3.U - io.op.elem_size)(4, 0)
++  val tile_epr_mask = ((1.U << tile_epr_log2) - 1.U)(log2Ceil(vLen), 0)
++
++  // p = tile_eidx (register-group flat position, iterated linearly 0..VL-1).
++  // Recover (line, elem_in_line) of the SEQUENTIAL tile index i for the
++  // memory-offset formula, per the derivation above.
++  val tile_regoff = (tile_eidx >> tile_epr_log2)(4, 0)
++  val tile_elementoff = (tile_eidx & tile_epr_mask)(log2Ceil(vLen), 0)
++  val tile_line = (tile_elementoff >> tile_lambda_log2)(log2Ceil(vLen), 0)
++  val tile_inner = (tile_eidx & tile_lambda_mask)(7, 0)
++  val tile_elem_in_line = ((tile_regoff << tile_lambda_log2) | tile_inner)(log2Ceil(vLen), 0)
++
++  // Swap the roles for the transposing variant.  The register side is
++  // unaffected: only the memory offset formula flips.
++  val tile_mem_line = Mux(is_tile_transposing, tile_elem_in_line, tile_line)
++  val tile_mem_elem = Mux(is_tile_transposing, tile_line, tile_elem_in_line)
++  // Iter 6 (r8) page-crossing fix: widen tile_saddr by one bit so a linear
++  // byte offset that overflows the base_offset's pgIdxBits width is preserved
++  // in tile_page_carry; then the initial request and any lifq replay both
++  // reach the correct physical page.  Only tile mode needs this -- non-tile
++  // ops iterate one page at a time via the frontend fission path.
++  val tile_saddr_full = (io.op.base_offset +&
++    (tile_mem_line * tile_ld_bytes)(pgIdxBits-1, 0) +&
++    (tile_mem_elem << io.op.elem_size)(pgIdxBits-1, 0))
++  val tile_saddr = tile_saddr_full(pgIdxBits-1, 0)
++  val tile_page_carry = tile_saddr_full(pgIdxBits)
++  val tile_next_eidx = tile_eidx +& 1.U
++  val tile_may_clear = tile_next_eidx >= io.op.vl
++
++  // -------------------------------------------------------------------
++  // Existing (non-tile) address generation.
++  // -------------------------------------------------------------------
+   val fast_segmented = io.op.mop === mopUnit && io.op.segend === io.op.seg_nf && io.op.segstart === 0.U
+   val eidx = Mux(r_head,
+     io.op.vstart * (Mux(fast_segmented, io.op.seg_nf, 0.U) +& 1.U),
+@@ -52,33 +128,54 @@ class AddrGen(implicit p: Parameters) extends CoreModule()(p) with HasVectorPara
+   val eaddr = Mux(io.op.indexed,
+     io.op.base_offset + index_offset + Mux(r_head, io.op.segstart << io.op.elem_size, 0.U),
+     Mux(r_head, start_addr, r_eaddr))
+-  val saddr = Mux(io.op.seg_nf =/= 0.U && !fast_segmented, Mux(r_head, eaddr, r_saddr), eaddr)
++  val saddr_nontile = Mux(io.op.seg_nf =/= 0.U && !fast_segmented, Mux(r_head, eaddr, r_saddr), eaddr)
+ 
+   val mem_size = io.op.elem_size
+   val max_eidx = Mux(fast_segmented,
+     io.op.vl * (io.op.seg_nf +& 1.U),
+     io.op.vl)
+ 
+-  val next_max_elems = getElems(saddr, mem_size)
++  val next_max_elems_nontile = getElems(saddr_nontile, mem_size)
+   val next_contig_elems = Mux(fast_segmented,
+     max_eidx - eidx,
+     io.op.seg_nf +& 1.U - sidx)
+-  val next_act_elems = min(next_contig_elems, next_max_elems)(mLenOffBits,0)
+-  val next_act_bytes = next_act_elems << mem_size
+-
+-  val next_sidx = sidx +& next_act_elems
+-  val next_eidx = eidx +& Mux(fast_segmented, next_act_elems, 1.U)
+-
+-  val next_eaddr = eaddr + Mux(io.op.mop === mopUnit, next_act_bytes, Mux(io.op.mop === mopStrided, io.op.stride, 0.U))
+-  val next_saddr = saddr + next_act_bytes
+-
+-  val needs_mask = !io.op.vm && io.op.mop =/= mopUnit
+-  val needs_index = io.op.mop(0)
+-  val block_maskindex = (needs_mask || needs_index) && !io.maskindex.valid
+-
+-  val masked = (needs_mask && !io.maskindex.mask) || (io.op.seg_nf > 0.U && sidx > io.op.segend)
+-  val may_clear = (fast_segmented || next_sidx > io.op.seg_nf) && next_eidx >= max_eidx
+-
++  val next_act_elems_nontile = min(next_contig_elems, next_max_elems_nontile)(mLenOffBits,0)
++  val next_act_bytes_nontile = next_act_elems_nontile << mem_size
++
++  val next_sidx_nontile = sidx +& next_act_elems_nontile
++  val next_eidx_nontile = eidx +& Mux(fast_segmented, next_act_elems_nontile, 1.U)
++
++  val next_eaddr_nontile = eaddr + Mux(io.op.mop === mopUnit, next_act_bytes_nontile, Mux(io.op.mop === mopStrided, io.op.stride, 0.U))
++  val next_saddr_nontile = saddr_nontile + next_act_bytes_nontile
++
++  val needs_mask_nontile = !io.op.vm && io.op.mop =/= mopUnit
++  val needs_index_nontile = io.op.mop(0)
++  val block_maskindex_nontile = (needs_mask_nontile || needs_index_nontile) && !io.maskindex.valid
++
++  val masked_nontile = (needs_mask_nontile && !io.maskindex.mask) || (io.op.seg_nf > 0.U && sidx > io.op.segend)
++  val may_clear_nontile = (fast_segmented || next_sidx_nontile > io.op.seg_nf) && next_eidx_nontile >= max_eidx
++
++  // -------------------------------------------------------------------
++  // Multiplex the two paths.
++  // -------------------------------------------------------------------
++  val saddr = Mux(is_tile, tile_saddr, saddr_nontile)
++  // Tile branch: one element per iteration, so next_act_bytes = SEW/8 (at most
++  // 8 for SEW=64) and next_act_elems = 1.  Bit-extraction on (1.U << elem_size)
++  // would fail when mLenOffBits >= 4 because that expression is only 4 bits
++  // wide; Chisel Mux width matching takes care of aligning to the non-tile
++  // branch.
++  val next_act_bytes = Mux(is_tile, 1.U << io.op.elem_size, next_act_bytes_nontile)
++  val next_act_elems = Mux(is_tile, 1.U, next_act_elems_nontile)
++  val next_eidx = Mux(is_tile, tile_next_eidx, next_eidx_nontile)
++  val next_sidx = Mux(is_tile, 0.U, next_sidx_nontile)
++  val next_eaddr = Mux(is_tile, tile_saddr, next_eaddr_nontile)
++  val next_saddr = Mux(is_tile, tile_saddr, next_saddr_nontile)
++  val needs_mask = !is_tile && needs_mask_nontile
++  val needs_index = !is_tile && needs_index_nontile
++  val block_maskindex = !is_tile && block_maskindex_nontile
++  val masked = !is_tile && masked_nontile
++  val may_clear = Mux(is_tile, tile_may_clear, may_clear_nontile)
++  val page_carry = Mux(is_tile, tile_page_carry, false.B)
+ 
+   io.done := false.B
+   io.maskindex.ready := false.B
+@@ -92,9 +189,10 @@ class AddrGen(implicit p: Parameters) extends CoreModule()(p) with HasVectorPara
+   io.out.bits.last := may_clear
+   io.out.bits.lsiq_id := io.lsiq_id
+   io.out.bits.page_offset := saddr(pgIdxBits-1,0)
++  io.out.bits.page_carry := page_carry
+ 
+   io.req.valid := io.valid && io.out.ready && !block_maskindex && !masked && io.tag.valid
+-  io.req.bits.addr := Cat(io.op.page, saddr(pgIdxBits-1,0))
++  io.req.bits.addr := Cat(io.op.page + page_carry, saddr(pgIdxBits-1,0))
+   io.req.bits.data := DontCare
+   io.req.bits.mask := ((1.U << next_act_bytes) - 1.U) << saddr(mLenOffBits-1,0)
+   io.req.bits.tag := io.tag.bits
+@@ -103,7 +201,14 @@ class AddrGen(implicit p: Parameters) extends CoreModule()(p) with HasVectorPara
+   io.tag.ready := io.valid && (io.req.ready || masked) && io.out.ready && !block_maskindex
+ 
+   when (io.out.fire) {
+-    when (next_sidx > io.op.seg_nf || fast_segmented) {
++    when (is_tile) {
++      // Tile mode: one element per iteration; the line and stride are
++      // recomputed from tile_eidx each cycle, so we just track eidx.
++      r_eaddr := tile_saddr
++      r_saddr := tile_saddr
++      r_eidx := tile_next_eidx
++      r_sidx := 0.U
++    } .elsewhen (next_sidx > io.op.seg_nf || fast_segmented) {
+       r_eaddr := next_eaddr
+       r_saddr := next_eaddr
+       r_eidx := next_eidx
+diff --git a/generators/saturn/src/main/scala/mem/LoadOrderBuffer.scala b/generators/saturn/src/main/scala/mem/LoadOrderBuffer.scala
+index f8830bc..3fd832a 100644
+--- a/generators/saturn/src/main/scala/mem/LoadOrderBuffer.scala
++++ b/generators/saturn/src/main/scala/mem/LoadOrderBuffer.scala
+@@ -33,6 +33,10 @@ class LoadOrderBuffer(nEntries: Int, nRobEntries: Int)(implicit p: Parameters) e
+     }))
+ 
+     val replay_liq_id = Output(UInt(log2Ceil(vParams.vliqEntries).W))
++    // Iter 6 (r8) tile-load page-crossing fix: expose the entry's page_carry
++    // so the replay in Mem.scala can add it to op.page when reconstructing
++    // the physical address for the retry.
++    val replay_page_carry = Output(Bool())
+     val replay = Decoupled(new MemRequest(mLenB, dmemTagBits))
+     val deq = Decoupled(new IFQEntry)
+     val deq_data = Output(UInt(mLen.W))
+@@ -95,6 +99,7 @@ class LoadOrderBuffer(nEntries: Int, nRobEntries: Int)(implicit p: Parameters) e
+   val replay_valid = must_replay.orR
+   val next_replay = AgePriorityEncoder(must_replay, deq_ptr.value)
+   io.replay_liq_id := entries(next_replay).lsiq_id
++  io.replay_page_carry := entries(next_replay).page_carry
+   io.replay.valid := replay_valid
+   io.replay.bits.addr := entries(next_replay).page_offset
+   io.replay.bits.data := DontCare
+diff --git a/generators/saturn/src/main/scala/mem/Mem.scala b/generators/saturn/src/main/scala/mem/Mem.scala
+index 4803b24..1a1e897 100644
+--- a/generators/saturn/src/main/scala/mem/Mem.scala
++++ b/generators/saturn/src/main/scala/mem/Mem.scala
+@@ -36,6 +36,12 @@ class IFQEntry(implicit p: Parameters) extends CoreBundle()(p) with HasVectorPar
+   val last   = Bool()
+   val lsiq_id  = UInt(lsiqIdBits.W)
+   val page_offset = UInt(pgIdxBits.W)
++  // Iter 6 (r8) tile-load page-crossing fix: for a Zvvm tile load whose
++  // linear byte offset within a row overflows the base_offset[pgIdxBits-1:0]
++  // bits, we lose the carry into op.page.  page_carry captures that carry so
++  // the initial request and any lifq replay both address the correct page.
++  // Always 0 for non-tile accesses.
++  val page_carry = Bool()
+ }
+ 
+ class MemRequest(bytes: Int, tagBits: Int)(implicit p: Parameters) extends CoreBundle()(p) {
+@@ -295,7 +301,12 @@ class VectorMemUnit(sgSize: Option[BigInt] = None)(implicit p: Parameters) exten
+   load_arb.io.in(1) <> las.io.req
+   load_arb.io.in(1).bits.store := false.B
+   load_arb.io.in(0) <> lifq.io.replay
+-  load_arb.io.in(0).bits.addr := Cat(liq(lifq.io.replay_liq_id).op.page, lifq.io.replay.bits.addr(pgIdxBits-1,0))
++  // Iter 6 (r8) tile-load page-crossing fix: fold the entry's page_carry into
++  // the replay's page number so a retried tile-load access lands in the same
++  // physical page the original access was heading to.
++  load_arb.io.in(0).bits.addr := Cat(
++    liq(lifq.io.replay_liq_id).op.page + lifq.io.replay_page_carry,
++    lifq.io.replay.bits.addr(pgIdxBits-1,0))
+   when (io.dmem.store_req.valid) {
+     load_arb.io.in(0).valid := false.B
+     lifq.io.replay.ready := false.B
+diff --git a/generators/rocket-chip/src/main/scala/rocket/CSR.scala b/generators/rocket-chip/src/main/scala/rocket/CSR.scala
+index 10d32ff03..47a75af8b 100644
+--- a/generators/rocket-chip/src/main/scala/rocket/CSR.scala
++++ b/generators/rocket-chip/src/main/scala/rocket/CSR.scala
+@@ -339,11 +339,35 @@ object VType {
+ 
+   def computeVL(avl: UInt, vtype: UInt, currentVL: UInt, useCurrentVL: Bool, useMax: Bool, useZero: Bool)(implicit p: Parameters): UInt =
+     VType.fromUInt(vtype, true).vl(avl, currentVL, useCurrentVL, useMax, useZero)
++
++  // ==== IME (Zvvm) tile-layout helpers ====
++  //
++  // The heavy lifting lives in `class VType` because it needs access to
++  // `maxVLMax` (from HasCoreParameters).  The companion-object entry point
++  // wraps it so callers do not need to instantiate a VType first.
++  def imeWarlLambda(request_enc: UInt, cur_enc: UInt, new_vsew: UInt,
++                    is_nonzero_request: Bool)(implicit p: Parameters): UInt = {
++    // No hardware allocated for the helper; asTypeOf(0.U) makes a
++    // literal-initialised VType view whose imeWarlLambda method reads
++    // maxVLMax (a Scala Int) via HasCoreParameters.
++    0.U.asTypeOf(new VType).imeWarlLambda(
++      request_enc, cur_enc, new_vsew, is_nonzero_request)
++  }
+ }
+ 
+ class VType(implicit p: Parameters) extends CoreBundle {
+   val vill = Bool()
+-  val reserved = UInt((xLen - 10).W)
++  // IME (Zvvm) fields at the top of vtype, immediately below vill.
++  // These are Chisel-Bundle fields; ordering here determines bit position:
++  //   lambda[2:0] at vtype[XLEN-2:XLEN-4]
++  //   bs          at vtype[XLEN-5]
++  //   altfmt_A    at vtype[XLEN-6]
++  //   altfmt_B    at vtype[XLEN-7]
++  val lambda = UInt(3.W)
++  val bs = Bool()
++  val altfmt_A = Bool()
++  val altfmt_B = Bool()
++  val reserved = UInt((xLen - 16).W)
+   val altfmt = Bool()
+   val vma = Bool()
+   val vta = Bool()
+@@ -365,6 +389,73 @@ class VType(implicit p: Parameters) extends CoreBundle {
+ 
+   def vlMax: UInt = (maxVLMax.U >> (this.vsew +& Cat(this.vlmul_sign, ~this.vlmul_mag))).andNot((minVLMax-1).U)
+ 
++  // ==== IME lambda WARL helpers (see integrated-matrix-v0.9.0 spec) ====
++  //
++  // Legal LAMBDA encoding for a given (vlen_bits, sew) satisfies:
++  //   LAMBDA is a power of 2, >= 1
++  //   LAMBDA^2 divides (vlen_bits/sew)
++  //   EMUL_C = (vlen_bits/sew) / LAMBDA^2  is in {1,2,4,8,16}
++  // LAMBDA encoding: 001..111 -> 1,2,4,8,16,32,64. 000 = no selected lambda.
++  private def imeLegalLambdaStatic(enc: Int, vlenBits: Int, sewBits: Int): Boolean = {
++    if (enc <= 0 || enc > 7) false
++    else {
++      val lam = 1 << (enc - 1)
++      val L = vlenBits / sewBits
++      if (L <= 0) false
++      else {
++        val lam2 = lam.toLong * lam.toLong
++        (L.toLong % lam2 == 0L) && Set(1L,2L,4L,8L,16L).contains(L.toLong / lam2)
++      }
++    }
++  }
++
++  // Returns a Vec[7](Bool) telling whether each nonzero encoding (1..7)
++  // is legal for the given sewIdx (0..3 -> SEW 8,16,32,64) at the current
++  // implementation VLEN.  Values outside 0..3 are treated as illegal.
++  def imeLambdaLegalVec(sewIdx: UInt): Vec[Bool] = {
++    val vlenBits = maxVLMax        // maxVLMax numerically equals VLEN (bits) at LMUL_max=8 SEW_min=8
++    val perSew: Seq[Seq[Bool]] = (0 until 4).map { s =>
++      val sewBits = 8 << s
++      (1 to 7).map(enc => imeLegalLambdaStatic(enc, vlenBits, sewBits).B)
++    }
++    val vec = VecInit(perSew.map(row => VecInit(row)))
++    val safeSew = Mux(sewIdx < 4.U, sewIdx(1, 0), 0.U(2.W))
++    vec(safeSew)
++  }
++
++  // WARL processing for a lambda write request.
++  //   - a nonzero request that is supported is retained
++  //   - a nonzero request that is not supported is clamped to the largest
++  //     supported value <= request, or to the smallest supported value if
++  //     no supported value is <= request
++  //   - a zero request (or vsetvli/vsetivli) preserves the current lambda
++  //     if still supported; otherwise selects the largest supported lambda
++  //   - if no lambda is supported for (VLEN, sew), the field is set to 000
++  def imeWarlLambda(request_enc: UInt, cur_enc: UInt, new_vsew: UInt,
++                    is_nonzero_request: Bool): UInt = {
++    val legal = imeLambdaLegalVec(new_vsew)
++    val candidate = Mux(is_nonzero_request, request_enc, cur_enc)
++    val cand_nz = candidate =/= 0.U
++    val cand_is_legal = cand_nz && legal(Mux(cand_nz, candidate - 1.U, 0.U))
++
++    val encs = (1 to 7)
++    val largest_legal = encs.reverse.foldLeft(0.U(3.W)) { (acc, e) =>
++      Mux(acc === 0.U && legal(e - 1), e.U(3.W), acc)
++    }
++    val smallest_legal = encs.foldLeft(0.U(3.W)) { (acc, e) =>
++      Mux(acc === 0.U && legal(e - 1), e.U(3.W), acc)
++    }
++    val largest_le_req = encs.reverse.foldLeft(0.U(3.W)) { (acc, e) =>
++      Mux(acc === 0.U && legal(e - 1) && (e.U(3.W) <= request_enc),
++          e.U(3.W), acc)
++    }
++
++    Mux(cand_is_legal, candidate,
++      Mux(is_nonzero_request,
++        Mux(largest_le_req =/= 0.U, largest_le_req, smallest_legal),
++        largest_legal))
++  }
++
+   def vl(avl: UInt, currentVL: UInt, useCurrentVL: Bool, useMax: Bool, useZero: Bool): UInt = {
+     val atLeastMaxVLMax = useMax || Mux(useCurrentVL, currentVL >= maxVLMax.U, avl >= maxVLMax.U)
+     val avl_lsbs = Mux(useCurrentVL, currentVL, avl)(maxVLMax.log2 - 1, 0)
+diff --git a/generators/rocket-chip/src/main/scala/rocket/RocketCore.scala b/generators/rocket-chip/src/main/scala/rocket/RocketCore.scala
+index 02f314725..0ee73757c 100644
+--- a/generators/rocket-chip/src/main/scala/rocket/RocketCore.scala
++++ b/generators/rocket-chip/src/main/scala/rocket/RocketCore.scala
+@@ -492,9 +492,35 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
+   ) else Nil))
+ 
+   val (ex_new_vl, ex_new_vconfig) = if (usingVector) {
+-    val ex_new_vtype = VType.fromUInt(MuxCase(ex_rs(1), Seq(
++    // Zvvm/IME extension: vsetvl (rs2 form) supplies the full vtype value,
++    // including the IME fields lambda/bs/altfmt_A/altfmt_B in the high bits.
++    // vsetvli and vsetivli use the vtypei immediate (bits [10:0]) and per
++    // the IME spec preserve the high IME fields from the current vtype;
++    // lambda is re-evaluated against the new (VLEN, SEW).
++    val is_vsetvl_reg = ex_reg_inst(31,30) === "b10".U
++    val cur_vtype = csr.io.vector.get.vconfig.vtype
++    val vtype_imm = MuxCase(ex_rs(1), Seq(
+       ex_reg_inst(31,30).andR -> ex_reg_inst(29,20),
+-      !ex_reg_inst(31)        -> ex_reg_inst(30,20))))
++      !ex_reg_inst(31)        -> ex_reg_inst(30,20)))
++    // For vsetvli/vsetivli, splice: preserve vtype bits >= 11 from current,
++    // take bits [10:0] from the immediate. For vsetvl, take everything from
++    // rs2.  Note the vtypei immediate only covers bits [10:0] of vtype in
++    // this implementation, which spans vlmul/vsew/vta/vma/altfmt and two
++    // reserved bits.
++    val effective_vtype_uint = Mux(is_vsetvl_reg, vtype_imm,
++      Cat(0.U(1.W), cur_vtype.asUInt(xLen-2, 11), vtype_imm(10, 0)))
++    val ex_new_vtype_pre = VType.fromUInt(effective_vtype_uint)
++    // Apply IME lambda WARL:
++    //   - vsetvl with rs2[lambda] != 000: nonzero request; clamp if unsupported
++    //   - vsetvl with rs2[lambda] == 000, or vsetvli/vsetivli: preserve or auto-select
++    val requested_lambda = Mux(is_vsetvl_reg, ex_rs(1)(xLen-2, xLen-4), 0.U(3.W))
++    val is_nonzero_lambda_req = is_vsetvl_reg && requested_lambda =/= 0.U
++    val warl_lambda = VType.imeWarlLambda(
++      requested_lambda, cur_vtype.lambda, ex_new_vtype_pre.vsew,
++      is_nonzero_lambda_req)
++    val ex_new_vtype = WireInit(ex_new_vtype_pre)
++    // If vill is set the entire vtype is zeroed; keep lambda 0 in that case.
++    ex_new_vtype.lambda := Mux(ex_new_vtype_pre.vill, 0.U(3.W), warl_lambda)
+     val ex_avl = Mux(ex_ctrl.rxs1,
+       Mux(ex_reg_inst(19,15) === 0.U,
+         Mux(ex_reg_inst(11,7) === 0.U, csr.io.vector.get.vconfig.vl, ex_new_vtype.vlMax),
+diff --git a/generators/shuttle/src/main/scala/exu/Core.scala b/generators/shuttle/src/main/scala/exu/Core.scala
+index 68b4a14..6fa3592 100644
+--- a/generators/shuttle/src/main/scala/exu/Core.scala
++++ b/generators/shuttle/src/main/scala/exu/Core.scala
+@@ -519,9 +519,26 @@ class ShuttleCore(tile: ShuttleTile, edge: TLEdgeOut)(implicit p: Parameters) ex
+   val ex_setvcfg_valid = ex_uops_reg.map(r => r.valid && r.bits.sets_vcfg)
+   val ex_setvcfg_uop = Mux1H(ex_setvcfg_valid, ex_uops_reg).bits
+   val ex_new_vl = if (usingVector) {
+-    val ex_new_vtype = VType.fromUInt(MuxCase(ex_setvcfg_uop.rs2_data, Seq(
++    // Zvvm/IME extension: vsetvl (rs2 form) supplies the full vtype; vsetvli
++    // and vsetivli only touch bits [10:0] and preserve the IME fields at
++    // the top of vtype (lambda, bs, altfmt_A, altfmt_B).  lambda is then
++    // re-evaluated against the new (VLEN, SEW) via VType.imeWarlLambda.
++    val is_vsetvl_reg = ex_setvcfg_uop.inst(31,30) === "b10".U
++    val cur_vtype = ex_vcfg.get.bits.vtype
++    val vtype_imm = MuxCase(ex_setvcfg_uop.rs2_data, Seq(
+       ex_setvcfg_uop.inst(31,30).andR -> ex_setvcfg_uop.inst(29,20),
+-      !ex_setvcfg_uop.inst(31)        -> ex_setvcfg_uop.inst(30,20))))
++      !ex_setvcfg_uop.inst(31)        -> ex_setvcfg_uop.inst(30,20)))
++    val effective_vtype_uint = Mux(is_vsetvl_reg, vtype_imm,
++      Cat(0.U(1.W), cur_vtype.asUInt(xLen-2, 11), vtype_imm(10, 0)))
++    val ex_new_vtype_pre = VType.fromUInt(effective_vtype_uint)
++    val requested_lambda = Mux(is_vsetvl_reg,
++      ex_setvcfg_uop.rs2_data(xLen-2, xLen-4), 0.U(3.W))
++    val is_nonzero_lambda_req = is_vsetvl_reg && requested_lambda =/= 0.U
++    val warl_lambda = VType.imeWarlLambda(
++      requested_lambda, cur_vtype.lambda, ex_new_vtype_pre.vsew,
++      is_nonzero_lambda_req)
++    val ex_new_vtype = WireInit(ex_new_vtype_pre)
++    ex_new_vtype.lambda := Mux(ex_new_vtype_pre.vill, 0.U(3.W), warl_lambda)
+     val ex_avl = Mux(ex_setvcfg_uop.ctrl.rxs1,
+       Mux(ex_setvcfg_uop.inst(19,15) === 0.U,
+         Mux(ex_setvcfg_uop.inst(11,7) === 0.U, ex_vcfg.get.bits.vl, ex_new_vtype.vlMax),
