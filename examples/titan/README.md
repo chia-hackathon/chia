@@ -47,11 +47,11 @@ psm=0 要求 `W` 個子乘積先精確加總、只捨入一次，rv64imafd 的�
 
 | 階段 | 內容 | judge | r15 結果 | 出處 |
 |---|---|---|---|---|
-| M | Zvvm 進 Spike，依規格的 SAIL | S1 的成對程式 | 模型種子 80/80 | `docs/ledger.md`（r15 列） |
+| 0 model | Zvvm 進 Spike，依規格的 SAIL | S1 的成對程式 | 模型種子 80/80 | `docs/ledger.md`（r15 列） |
 | S1 directed | 成對的 IME / RVV-1.0 程式，每輪 80 支 | `rvv_ref.py` | **directed 80/80** | `docs/r15_full_verify.json` → `directed.n_tests=80`, `counts.pass=80` |
 | S1 gate | 收斂時的完整 directed 閘門，548 個 geometry | `rvv_ref.py` | **548/548** | `docs/ledger.md`（r15 列）；`docs/round3_design.md` §6「S1 gate: 244 → **548**」 |
 | S2 regression | Saturn 自帶的 riscv-vector-tests 全套 | 測試自帶 + stock Spike | **837 ran / 0 failing** | `docs/r15_full_verify.json` → `s2_full.n_ran=837`, `n_failing=0`, `failing=[]` |
-| S3 stress | 隨機 tile geometry，與 IME Spike 模型 lockstep | stage M 的模型 | **64/64** | `docs/ledger.md`（r15 列） |
+| S3 stress | 隨機 tile geometry，與 IME Spike 模型 lockstep | stage 0 的模型 | **64/64** | `docs/ledger.md`（r15 列） |
 
 S2 的 837 是全套 841 扣掉 **4 支有文件記錄的排除**（`docs/r15_full_verify.json` 的
 `baseline.subtracted`，逐支理由見 `rvv_baseline_failures.README.md`）：
@@ -143,7 +143,7 @@ agent 生出成本與編輯都不在帳上的 sub-agent。見本分支的第一�
 
 | 檔案 | 是什麼 |
 |---|---|
-| `r6_stageM_spike_model_sail.diff` | Stage M 的 Spike IME 模型（依 SAIL 重寫後的版本） |
+| `r6_stageM_spike_model_sail.diff` | Stage 0 的 Spike IME 模型（依 SAIL 重寫後的版本） |
 | `r12_rtl_a3.diff` | **第一輪設計，4 條指令**（A3 修正後的 RTL + 模型） |
 | `r13_round2.diff` | **第二輪**，加入 `vqmmacc.vv` |
 | `r15_round3.diff` | **第三輪，最終 8 條指令設計** |

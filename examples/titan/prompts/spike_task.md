@@ -143,7 +143,7 @@ Do not use them. Specifically:
   kept independent of it. You are not the junior party to it; you are a
   second opinion whose whole value is that it was formed separately. So when
   your SAIL transcription and our expected value disagree, report the
-  disagreement and stop. Do not resolve it by moving toward us. A Stage M
+  disagreement and stop. Do not resolve it by moving toward us. A Stage 0
   model that quietly converges on our expectations tells us nothing we did
   not already believe, and it destroys the only check we have on the
   reference model itself.

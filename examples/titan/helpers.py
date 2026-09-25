@@ -771,7 +771,7 @@ def format_model_seed_message(source: str,
                               done: Sequence[str],
                               new: Sequence[str],
                               log_path: Optional[str] = None) -> str:
-    """Stage M's first turn when the tree was seeded with a working model.
+    """Stage 0's first turn when the tree was seeded with a working model.
 
     Pure: everything it needs is an argument, so it can be tested without a
     cluster (and is).  The failure half is ``format_directed_failure``

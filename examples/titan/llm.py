@@ -8,7 +8,7 @@ the loop pays for orientation explicitly -- iteration number, diffstat, the
 agent's own notes, the result, and a path to the logs -- which costs a few
 kilobytes and, unlike a transcript, is something the agent can go and re-read.
 
-The Stage M model agent keeps its session: it is short, cheap, and gets no
+The Stage 0 model agent keeps its session: it is short, cheap, and gets no
 orientation block.
 """
 from __future__ import annotations
@@ -153,7 +153,7 @@ def make_llm(logging_name: str = "titan_generator",
 def make_model_llm(logging_name: str = "titan_spike_model"):
     """The Spike-model agent: a different system prompt and a fresh session.
 
-    Keeps ``resume_session=True`` explicitly.  Stage M is not what made r5
+    Keeps ``resume_session=True`` explicitly.  Stage 0 is not what made r5
     expensive -- it is short, its feedback is small, and it is *not* given the
     per-iteration orientation block that lets the RTL agent start cold, so
     dropping its session would take away continuity and put nothing back.
@@ -162,7 +162,7 @@ def make_model_llm(logging_name: str = "titan_spike_model"):
 
 
 def implement_model(llm, tools: Sequence[object], note: str = ""):
-    """First turn of Stage M.
+    """First turn of Stage 0.
 
     *note* is appended when the run started from a seeded model tree
     (``--model-seed``): the standing task is still "implement Zvvm in Spike",

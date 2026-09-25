@@ -49,7 +49,7 @@ SATURN_SRC_REL = "generators/saturn/src/main/scala"
 #: Diff capture.  Every repo a loop agent may edit has to be snapshotted each
 #: iteration or a failing run cannot be reproduced.  rocket-chip is on this
 #: list because the vtype CSR is defined there rather than in Saturn, and
-#: riscv-isa-sim because the Stage M agent edits Spike.
+#: riscv-isa-sim because the Stage 0 agent edits Spike.
 CHIPYARD_DIFF_SUBMODULES = [
     SATURN_REPO_REL,
     "generators/rocket-chip",
@@ -711,7 +711,7 @@ RVV_REGRESSION_DIR = os.environ.get(
 TITAN_LOG_ROOT = os.environ.get(
     "TITAN_LOG_ROOT", str(OUT_DIR / "logs"))
 MAX_ITERS = int(os.environ.get("TITAN_MAX_ITERS", "60"))
-#: Stage M is a transcription task against a formal semantics, not a
+#: Stage 0 is a transcription task against a formal semantics, not a
 #: microarchitecture search, so it should converge in far fewer turns
 #: than the RTL stage -- and if it does not, that is a signal about the
 #: spec or the prompt rather than a reason to keep paying.

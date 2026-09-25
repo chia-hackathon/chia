@@ -110,7 +110,7 @@ def apply_diff(diff: str, chipyard_path: str = CHIPYARD_PATH,
     the chipyard root; the diff's a/<submodule>/ prefixes are made for
     this).
 
-    Used by ``--model-diff`` to reuse a converged Stage M Spike model from an
+    Used by ``--model-diff`` to reuse a converged Stage 0 Spike model from an
     earlier run instead of paying for the model agent again.  Returns "" on
     success, else git's stderr."""
     if extension: get_profiler().add_info({"extension": extension})

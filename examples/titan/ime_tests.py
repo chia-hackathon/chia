@@ -2673,7 +2673,7 @@ def emit_mxl_test(vlen: int, mnemonic: str, name: str = "ime_mxl") -> str:
         # DUT's lambda into a1 and jumps to .Lskip, whose format string
         # names only the program's nominal geometry -- so a skip from case 3
         # and a skip from case 0 print the same line.  In r19 that cost the
-        # Stage M agent an iteration: the verdict said "lambda=0 (requested
+        # Stage 0 agent an iteration: the verdict said "lambda=0 (requested
         # 1)" against case 0's header while the real culprit was a reserved
         # -altfmt case further down the list.  a2 carries the index so the
         # two are distinguishable.

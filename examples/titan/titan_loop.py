@@ -4,10 +4,12 @@
 Four stages, and the ordering principle behind them is the only design
 decision here that matters:
 
-    M   model        Zvvm in Spike, from the spec's SAIL   judge: the S1 programs
+    0   model        Zvvm in Spike, from the spec's SAIL   judge: the S1 programs
     S1  directed     paired IME / RVV-1.0 programs         judge: rvv_ref.py
     S2  regression   Saturn's own riscv-vector-tests       judge: ships with Saturn
-    S3  stress       randomised tile geometries            judge: the M model
+    S3  stress       randomised tile geometries            judge: the stage 0 model
+
+(Stage 0 was called stage M before 2026-09-25; older logs use that name.)
 
 **Every judge predates the defendant it judges.** rvv_ref.py is written outside
 the loop (Claude Code sessions directed by the authors) before any RTL exists; riscv-vector-tests shipped with Saturn and passed
@@ -17,7 +19,7 @@ property of the ordering, not of a rule in a prompt that an agent might work
 around.  None of the three judges is the implementer's own work, which is the
 whole reason a pass from them means anything.
 
-Note what stage M is judged by: the same paired programs stage 1 uses.  Spike's
+Note what stage 0 is judged by: the same paired programs stage 1 uses.  Spike's
 RVV 1.0 support is upstream and mature, so in a program running on Spike the
 reference path is trustworthy and the IME path is the new thing -- a
 disagreement convicts the model.  The same programs therefore judge two
@@ -219,13 +221,13 @@ _AGENT_ARTIFACTS: Dict[str, object] = {}
 _AGENT_COSIM_ARTIFACTS: Dict[str, object] = {}
 
 #: The STOCK ``libriscv``, built once at the top of ``run()`` from the
-#: pristine riscv-isa-sim checkout -- before Stage M patches it -- and passed
+#: pristine riscv-isa-sim checkout -- before Stage 0 patches it -- and passed
 #: as ``build_saturn``'s ``golden_model`` for every S2 cosim build.
 #:
 #: Why it has to exist.  ``nodes.build_spike`` installs what it builds into
 #: ``$RISCV/lib/libriscv.so``, and nothing ever puts the stock library back:
 #: ``reset_chipyard`` resets git-tracked *sources*, and an installed library
-#: is a build artifact, not a tracked file.  So from Stage M onwards the
+#: is a build artifact, not a tracked file.  So from Stage 0 onwards the
 #: cosim simulator S2 elaborates links the agent's *IME model* -- whose
 #: ``vectorUnit_t`` carries four extra ``reg_t`` members and a rewritten
 #: ``set_vl`` -- while the cospike bridge next to it is compiled against the
@@ -639,7 +641,7 @@ def _run_regression(artifact, select: Optional[Sequence[str]] = None,
     the opposite: the golden model does NOT come from the verilator_run
     image.  ``ChiselBuildNode`` bundles the chipyard container's own
     ``$RISCV/lib/libriscv.so`` into the artifact's ``runtime_libs``, and the
-    run worker puts that on ``LD_LIBRARY_PATH`` -- so whatever Stage M last
+    run worker puts that on ``LD_LIBRARY_PATH`` -- so whatever Stage 0 last
     installed is exactly what this gate would cosimulate against.  See
     ``_STOCK_SPIKE``.
 
@@ -1124,7 +1126,7 @@ def _run_s2(dump: helpers.Dumper, label: str, attempt: int, pg_opts,
     _write_s2_cosim_config(pg_opts)
     try:
         # _STOCK_SPIKE, not None: None means "link whatever libriscv is
-        # installed", which from Stage M onwards is the agent's IME model.
+        # installed", which from Stage 0 onwards is the agent's IME model.
         cosim_artifact = get(nodes.build_saturn.options(**pg_opts)
                              .chia_remote(COSIM_CONFIG, _STOCK_SPIKE,
                                           extension=EXTENSION))
@@ -1220,7 +1222,7 @@ def _orient(attempt: int, max_iters: int, run_id: str, label: str,
                    .chia_remote(CHIPYARD_PATH, extension=EXTENSION))
     except Exception:                                       # noqa: BLE001
         diff = ""
-    # RTL half only.  The tree also holds the Stage M Spike model, and the
+    # RTL half only.  The tree also holds the Stage 0 Spike model, and the
     # whole reason that model can judge this agent's RTL in Stage 3 is that
     # its author never saw the RTL -- pasting the model's diffstat into the
     # RTL agent's prompt would not break that direction, but it hands one
@@ -1638,7 +1640,7 @@ def _gate(artifact, dump: helpers.Dumper, status_path: str, vlen: int,
 
 
 # ---------------------------------------------------------------------------
-# stage M: the Spike model
+# stage 0: the Spike model
 # ---------------------------------------------------------------------------
 
 def _run_on_spike(tests: Sequence[Tuple[str, bytes]], vlen: int, pg_opts
@@ -1668,7 +1670,7 @@ def _run_on_spike(tests: Sequence[Tuple[str, bytes]], vlen: int, pg_opts
 def _model_stage(dump: helpers.Dumper, status_path: str, tool_list,
                  finish_tool, vlen: int, max_iters: int, pg_opts,
                  first_note: Optional[str] = None):
-    """Stage M: an agent implements Zvvm in Spike, judged by the S1 programs.
+    """Stage 0: an agent implements Zvvm in Spike, judged by the S1 programs.
 
     Runs before any RTL exists.  That is not a scheduling convenience -- it is
     what makes the model an independent judge in Stage 3.  An agent cannot
@@ -1970,7 +1972,7 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
 
 def _reseed_model(dump: helpers.Dumper, status_path: str, vlen: int,
                   diff_path: str, pg_opts):
-    """Stage M without the agent: reapply a converged model from an earlier
+    """Stage 0 without the agent: reapply a converged model from an earlier
     run (the riscv-isa-sim part of that run's collect_diff output), rebuild
     Spike, and re-judge it with the same directed programs the model stage
     uses.  It must pass outright -- a reseeded model that fails is a
@@ -2014,7 +2016,7 @@ def _reseed_model(dump: helpers.Dumper, status_path: str, vlen: int,
 
 def _seed_model(dump: helpers.Dumper, status_path: str, vlen: int,
                 diff_path: str, pg_opts) -> str:
-    """Seed Stage M from a converged model and then *run the stage anyway*.
+    """Seed Stage 0 from a converged model and then *run the stage anyway*.
 
     The difference from ``_reseed_model`` is the whole point of the flag.
     ``--model-diff`` says "this model is finished, reuse it and skip the
@@ -2155,7 +2157,7 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
             .chia_remote(CHIPYARD_PATH, extension=EXTENSION))
 
         # The stock golden model for S2, built HERE -- after the reset, before
-        # Stage M writes a line of Zvvm -- because this is the only moment in
+        # Stage 0 writes a line of Zvvm -- because this is the only moment in
         # a run when the riscv-isa-sim checkout is guaranteed pristine.  See
         # _STOCK_SPIKE for what goes wrong without it.  One spike build
         # (~1 min) per run; S2 itself pays nothing, the relink was already
@@ -2181,7 +2183,7 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
             "rtl", with_run_directed=True, stock_spike=_STOCK_SPIKE)
         all_tools = model_tools + rtl_tools
 
-        # Stage M, first, so that "the model's author never saw the RTL" is
+        # Stage 0, first, so that "the model's author never saw the RTL" is
         # true by construction rather than by instruction.
         spike_artifact = None
         model_note = None
@@ -2452,14 +2454,14 @@ def main() -> int:
     parser.add_argument("--vlen", type=int, default=VLEN)
     parser.add_argument("--no-stress", action="store_true")
     parser.add_argument("--no-model", action="store_true",
-                        help="skip stage M (then stage 3 cannot run)")
+                        help="skip stage 0 (then stage 3 cannot run)")
     parser.add_argument("--model-diff", metavar="DIFF",
-                        help="reuse a converged Stage M model: the "
+                        help="reuse a converged Stage 0 model: the "
                              "riscv-isa-sim hunks of an earlier run's "
                              "*_impl_diff_attemptN.diff. Skips the model "
                              "agent; the model is rebuilt and re-judged.")
     parser.add_argument("--model-seed", metavar="DIFF",
-                        help="seed stage M from an earlier run's converged "
+                        help="seed stage 0 from an earlier run's converged "
                              "model (the riscv-isa-sim hunks of that run's "
                              "diff) and then RUN the model agent on top of "
                              "it: applied, rebuilt and judged before the "

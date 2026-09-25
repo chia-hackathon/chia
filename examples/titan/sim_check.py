@@ -1541,7 +1541,7 @@ def check_mxl_tier(vlen: int = 256) -> None:
     This tier is not geometry-driven -- ``emit_mxl_test`` takes a mnemonic,
     not a ``TileGeometry`` -- so it is invisible to the sweep in
     :func:`main`, and for a while it shipped with no meta-judge at all.
-    That mattered: when r19's Stage M reported two ``ime_mxl_`` failures
+    That mattered: when r19's Stage 0 reported two ``ime_mxl_`` failures
     there was no way to tell a model defect from a judge bug without reading
     the assembly by hand.  Running them here answers that question in one
     command, and is why the model needs CSR and trap support at all.

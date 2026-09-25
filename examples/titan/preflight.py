@@ -430,7 +430,7 @@ def main() -> int:
     print(f"\n{passed}/{len(results)} 通過"
           f"（共 {len(CHECKS)} 項，跑了 {len(results)} 項）")
     if passed == len(CHECKS):
-        print("\n全部通過。可以跑 titan_loop.py 了 —— 第一個上場的是 Stage M，"
+        print("\n全部通過。可以跑 titan_loop.py 了 —— 第一個上場的是 Stage 0，"
               "寫 Spike 模型的那個 agent。")
     return 0 if passed == len(results) else 1
 

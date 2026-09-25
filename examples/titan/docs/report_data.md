@@ -13,7 +13,7 @@ Assembled 2026-09-17 (snapshot as of 04:28) by re-reading the artifacts. A machi
 | run artifacts, ledger, one-off experiments | `/share1/saves/max410011/hackathon/titan_runs/` |
 | the loop itself | `/share1/saves/max410011/hackathon/chia/examples/titan/` |
 | converged design diffs | `titan_runs/{r12_rtl_a3.diff, r13_round2.diff}` |
-| Stage M model diffs | `titan_runs/{r3_stageM_spike_model.diff, r6_stageM_spike_model_sail.diff}` |
+| Stage 0 model diffs | `titan_runs/{r3_stageM_spike_model.diff, r6_stageM_spike_model_sail.diff}` |
 
 ## Headline numbers
 
@@ -101,7 +101,7 @@ Stage code: `_model_stage` (`titan_loop.py:1037-1135`), directed suite (`ime_tes
 
 | stage | judges what against what | round 1 (r12_0914_0341) | round 2 (r13_0915_2118) | evidence |
 |---|---|---|---|---|
-| **Stage M** | agent's Spike model vs `rvv_ref.py`, cheap tier (`full_vl_only=True`) — no RTL exists yet | **27/27** on reseed | **34/34**, converged in 1 iteration | `r12_.../20260914_034746_model_reseed.json` = `{"total":27,"counts":{"pass":27},"failing":[]}`; `r13_.../20260915_213549_model_attempt1.json` = `{"total":34,"counts":{"pass":34}}`; trace `model_iter {'attempt':1,'pass':34}` |
+| **Stage 0** | agent's Spike model vs `rvv_ref.py`, cheap tier (`full_vl_only=True`) — no RTL exists yet | **27/27** on reseed | **34/34**, converged in 1 iteration | `r12_.../20260914_034746_model_reseed.json` = `{"total":27,"counts":{"pass":27},"failing":[]}`; `r13_.../20260915_213549_model_attempt1.json` = `{"total":34,"counts":{"pass":34}}`; trace `model_iter {'attempt':1,'pass':34}` |
 | **S1 directed** | RTL vs `rvv_ref.py`, cheap tier, on `DIRECTED_CONFIG` (dual-issue) | **27/27** | **34/34**, converged in 1 iteration | `r12_.../20260914_041813_impl_directed_attempt1.json`; also `..._035022_impl_resume_directed_attempt0.json` 27/27; `r13_.../20260915_220429_impl_directed_attempt1.json` = `{"total":34,"counts":{"pass":34}}` |
 | **S2 cosim regression** | RTL vs **stock** Spike, lockstep cosim on riscv-vector-tests, **stride-sampled to 150** | **0 failing / 150** | **0 failing / 150** | sample size: `titan_runs/tools/next_run.sh:16` sets `TITAN_REGRESSION_SAMPLE=${SAMPLE:-150}` (constants' own default is 0 = all, `constants.py:342`). r12 trace event `rtl_resume_regression {'attempt':0,'cosim_build_ok':True,'failing':0}`; **no `regression_failure` event in either r12 or r13's trace**, which is how a zero is recorded. r13's S2 occupies 22:06:44→22:24:07 between `..._impl_cosim_build_attempt1.stdout.txt` and the gate. |
 | **Gate** (full S1 sweep incl. partial-VL) | every legal (SEW, λ, LMUL, VL) combination, `full_vl_only=False` | **200/200** | **244/244** | `r12_.../20260914_044010_gate.json` = `{"total":200,"counts":{"pass":200},"failing":[]}`; `r13_.../20260915_222621_gate.json` = `{"total":244,"counts":{"pass":244},"failing":[]}` |
@@ -151,7 +151,7 @@ Four stages, stated in the module docstring `titan_loop.py:6-24`:
 | **S1** — directed | agent implements Zvvm RTL in Saturn; paired IME/RVV-1.0 self-checking programs | `rvv_ref.py`, embedded in the test programs | `_iterate`, `titan_loop.py:800` |
 | **S2** — regression | Saturn's own `riscv-vector-tests`, lockstep cosim vs **stock** Spike | ships with Saturn; passed before anyone touched it | `_run_s2`, `titan_loop.py:694`, called inside `_iterate` |
 | **Gate** | full directed sweep including partial-N geometries | same self-checking programs, exhaustive | `_gate`, `titan_loop.py:996` |
-| **S3** — stress | randomised tile geometries, lockstep RTL vs the Stage-M Spike model | the Stage-M model | `_stress`, `titan_loop.py:1140` |
+| **S3** — stress | randomised tile geometries, lockstep RTL vs the Stage 0 Spike model | the Stage 0 model | `_stress`, `titan_loop.py:1140` |
 
 **S1 and S2 are one loop, not two stages.** `_iterate` docstring, `titan_loop.py:800-810`:
 > "S2 is inside this loop rather than after it: a directed pass that broke plain RVV is not a pass."
@@ -163,18 +163,18 @@ Budgets (`constants.py`):
 | constant | value | meaning | line |
 |---|---|---|---|
 | `MAX_ITERS` | 60 | S1/S2 combined loop per run | `constants.py:310` |
-| `MODEL_MAX_ITERS` | 25 | Stage M | `constants.py:315` |
+| `MODEL_MAX_ITERS` | 25 | Stage 0 | `constants.py:315` |
 | `DEBUG_MAX_ITERS` | 5 | re-entry loop if the Gate fails after S1/S2 passed | `constants.py:316` |
 | `LLM_MAX_CONSECUTIVE_FAILURES` | 2 | consecutive *infra* LLM failures before abort | `titan_loop.py:115` |
 | `AGENT_RUNS_PER_ITER` | 6 | self-serve `run_directed_start`/`run_rvv_start` calls per turn, one shared pool | `constants.py:437` |
-| `MODEL_MAX_SKIP_FRACTION` | 0.5 | Stage M fails if >50% of programs report SKIP (a model that declines everything must not "pass") | `constants.py:297` |
+| `MODEL_MAX_SKIP_FRACTION` | 0.5 | Stage 0 fails if >50% of programs report SKIP (a model that declines everything must not "pass") | `constants.py:297` |
 | `REGRESSION_ALERT_DELTA` | 3 | drop vs the run's own best that triggers a REGRESSION block in the prompt | `constants.py:469` |
 | `STRESS_TEST_HOURS` / `STRESS_TEST_CASES_PER_GEOM` | 24 / 64 | S3 deadline and pool fill | `constants.py:280-282` |
 | `REGRESSION_SAMPLE` | 0 (=all) in code, **150** in practice | S2 stride sample | `constants.py:342`; overridden by `TITAN_REGRESSION_SAMPLE=${SAMPLE:-150}` in `/share1/saves/max410011/hackathon/titan_runs/tools/next_run.sh:16` |
 
 Note the practical consequence: **the runs as actually launched never used the code default.** Every number in §3 comes from a 150-test S2 sample, not an 841-test one.
 
-**Convergence.** `run()` (`titan_loop.py:1439`) is strictly sequential and short-circuits: Stage M ok → `_iterate` ok (S1+S2) → if `_gate` fails, one `_iterate` re-entry with `label="gate"` and `DEBUG_MAX_ITERS` → if `stress=True`, `_stress` runs to deadline with no divergence. `result["converged"]=True` only after all of it (`titan_loop.py:1651`).
+**Convergence.** `run()` (`titan_loop.py:1439`) is strictly sequential and short-circuits: Stage 0 ok → `_iterate` ok (S1+S2) → if `_gate` fails, one `_iterate` re-entry with `label="gate"` and `DEBUG_MAX_ITERS` → if `stress=True`, `_stress` runs to deadline with no divergence. `result["converged"]=True` only after all of it (`titan_loop.py:1651`).
 
 **Seeding / resuming.** Four composable CLI flags (`main()`, `titan_loop.py:1724-1753`), all splitting a `collect_diff` output along `_MODEL_PATH_PREFIX` = `SPIKE_SRC_REL` (`_split_diff`, `titan_loop.py:1218-1225`):
 
@@ -197,14 +197,14 @@ And, on harness ownership, verified verbatim at `constants.py:108-109`:
 
 That sits in the comment block above `S2_COSIM_SCALA` (`constants.py:64-116`). `constants.py:70`: "r9: the loop now OWNS this config instead of asking the agent for it." The motivating incident is r8's DebugROB race (§5.5), found precisely because the harness had been hand-written and was second-guessable.
 
-Restated for the Stage-M agent, `prompts/spike_system.md:65-66`:
+Restated for the Stage 0 agent, `prompts/spike_system.md:65-66`:
 > "Your model will later be used to judge that implementation. A judge that was derived from the defendant judges nothing."
 
 The judge's own soundness was audited before it was allowed to convict: `rvv_baseline_failures.json` + `.README.md` record an exclusion list of tests that fail against a **pristine** Saturn / stock Spike for reasons unrelated to Zvvm (see §7.4).
 
 ### 2.3 Two-agent separation
 
-| | Stage M (model) agent | S1/S2 (RTL) agent |
+| | Stage 0 (model) agent | S1/S2 (RTL) agent |
 |---|---|---|
 | system prompt | `prompts/spike_system.md` | `prompts/system.md` |
 | task prompt | `prompts/spike_task.md` | `prompts/implement.md` |
@@ -228,7 +228,7 @@ Both agents' `BashTool` has `work_dir=CHIPYARD_PATH` (`titan_loop.py:1472-1473`)
 * On mismatch, `format_directed_failure` (`helpers.py:491-570`): one line per failing test; WARL classification (`skip` vs `bad_geometry`) with an explanation of which is a real failure; the LAMBDA the DUT actually supports; and **numeric evidence** — up to `MAX_EVIDENCE_TESTS` = 6 (`constants.py:504`) failures with actual mismatching values and `TITAN CDUMP` vs `TITAN CREF` tile dumps, bounded by `MAX_EVIDENCE_CHARS` = 4000 (`constants.py:401`), plus a path to full per-test simulator logs under `${AGENT_LOG_DIR}/<run>/iter<N>/`.
 * Iteration orientation (`_orient`, `titan_loop.py:761-794`): iteration number/budget, `git diff --stat` of the current tree **RTL half only** (split via `_split_diff` so the RTL agent never sees the model's diffstat, `titan_loop.py:783-789`), its notes, the result, and a REGRESSION block if the run just got worse than its own best.
 
-**Hidden**: the reference model's *source* (`rvv_ref.py`), the test generators (`ime_tests.py`, `ime_stress.py`, `sim_check.py`), the encoding/spec derivation (`ime_encodings.py`), and — for Stage M — the RTL. Feedback is limited to what the self-checking programs print at runtime; never the golden model's code.
+**Hidden**: the reference model's *source* (`rvv_ref.py`), the test generators (`ime_tests.py`, `ime_stress.py`, `sim_check.py`), the encoding/spec derivation (`ime_encodings.py`), and — for Stage 0 — the RTL. Feedback is limited to what the self-checking programs print at runtime; never the golden model's code.
 
 **Feedback size history** (`helpers.py:495-503`): pre-r5 the message pasted whole build logs and simulator tails, and with `resume_session=True` that was replayed every turn — *"145M cached tokens over five calls"* (also `llm.py:3-9,44-52`). r5 cut this to bounded per-test evidence plus a log path.
 
@@ -256,7 +256,7 @@ Both agents' `BashTool` has `work_dir=CHIPYARD_PATH` (`titan_loop.py:1472-1473`)
 | **Backgrounded MCP call graded an instrumented tree** — a `run_directed` call over 120 s was silently backgrounded by the `claude` CLI; in `-p` mode the model then ended its turn with an unfinished job and the loop graded whatever was in the tree | three parts: (1) non-blocking `run_directed_start`/`_wait` so no single tool call approaches 120 s (`tools.py:211-253`); (2) prompt rule against ending a turn with instrumentation in the tree or a job unfinished (`debug.md:20-24`, `system.md:274-281`); (3) `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` raised to 1,800,000 ms in the CLI subprocess env (`constants.py:477`, `llm.py:33-45`) | `tools.py:211-253` names the incident: "exactly what happened in r8 iteration 3: the agent installed a printf instrumented `MatrixMultiplyPipe`… The loop then graded the instrumented tree: 26/27 passing became 27 mismatch." Prompt line appears at `debug.md.bak-r9b` → **fixed at r9** |
 | **`resume_session` replay cost** — full transcript replay every turn, ~$23/iteration, no new information in the replay | sessions fresh by default; continuity moved to small explicit artifacts (knowledge notes, tree diffstat, log path) | `llm.py:1-9,44-52` → **fixed at r5** |
 | **Agent-authored S2 cosim harness** could drift from or weaken the design under test | loop generates and owns `TitanS2CosimConfig`, extending the agent's own `SYNTH_CONFIG` | `constants.py:64-116`, "r9: the loop now OWNS this config" → **fixed at r9** |
-| **Sail-vs-test authority** (Stage M) — agent tempted to bend the Spike model until a wrong test passes | RULE: "The executable SAIL appendix is normative… If a test fails and the only way you can see to make it pass is to write something the SAIL does not say… **stop**. Do not write it," with an `append_knowledge`/`finish` reporting protocol | `spike_system.md:32-59`. Present in `.bak-r13`, **absent from `.bak-r6`** → introduced between r6 and r13; exact run **uncertain** (no intermediate snapshot). Circumstantially r7, which is when the judge moved to Sail (§5.4) |
+| **Sail-vs-test authority** (Stage 0) — agent tempted to bend the Spike model until a wrong test passes | RULE: "The executable SAIL appendix is normative… If a test fails and the only way you can see to make it pass is to write something the SAIL does not say… **stop**. Do not write it," with an `append_knowledge`/`finish` reporting protocol | `spike_system.md:32-59`. Present in `.bak-r13`, **absent from `.bak-r6`** → introduced between r6 and r13; exact run **uncertain** (no intermediate snapshot). Circumstantially r7, which is when the judge moved to Sail (§5.4) |
 
 Two of these land together in the snapshot trail (the async tool split and the "no instrumentation left in the tree" line, both between r8 and r9b) and the loop's own comments trace both to the same r8-iteration-3 incident — internally consistent.
 ## 3. Results table
@@ -274,9 +274,9 @@ Runs are listed in chronological order (the ledger file sorts lexically, which i
 
 | # | run dir | wall | LLM calls | cost | out tokens | converged | note (translated from `ledger_notes.json`) |
 |---|---|---|---|---|---|---|---|
-| 1 | `r1_0907_1231` | 0:28:41 | 1 | $11.66 | 78,093 | no | (no note) — Stage M first attempt |
+| 1 | `r1_0907_1231` | 0:28:41 | 1 | $11.66 | 78,093 | no | (no note) — Stage 0 first attempt |
 | 2 | `r2_0907_1327` | 4:14:18 | 1 | $11.44 | 82,810 | no | (no note) — 4h14m wall for a single 23-min LLM call: Ray placement-group deadlock |
-| 3 | `r3_0907_1742` | 3:14:47 | 5 | $110.81 | 772,218 | no | Stage M converged in 3 iterations 27/27; S1 both iterations all-trap (cosim config bug) |
+| 3 | `r3_0907_1742` | 3:14:47 | 5 | $110.81 | 772,218 | no | Stage 0 converged in 3 iterations 27/27; S1 both iterations all-trap (cosim config bug) |
 | 4 | `r4_0907_2120` | 1:55:08 | 5 | $50.56 | 475,806 | no | Model reused; S1 5 iterations stuck at 12 mismatch / 15 skip; 6th hit the rate-limit quota |
 | 5 | `r5_0908_1057` | 3:03:34 | 5 | $113.84 | 690,497 | no | Continues r4; 5 iterations, 12/15 unmoved; diagnosed: feedback carried no numbers, `rvv_ref` layout wrong |
 | 6 | `r6_0909_0440` | 8:06:38 | 5 | $126.81 | 1,374,000 | no | S1 rebuilt (numeric feedback, `run_directed`, fresh session); 8/27 pass; includes 81 min rate-limit wait |
@@ -289,7 +289,7 @@ Runs are listed in chronological order (the ledger file sorts lexically, which i
 | 13 | `r11_0912_0535` | 2:21:03 | 2 | $43.00 | 332,560 | no (manual stop) | Stock-Spike judge, `vsetvl-0` excluded; S2 sample 24→23; agent self-tested 2 iterations, `.vf` still failing; stopped to run RTL bisect |
 | 14 | `r12_0914_0341` | 1:05:23 | 1 | $0.65 | 3,745 | **yes** | Start point = the A3-corrected diff; **whole loop converged**: directed 27/27, S2 sample 0 failing, Gate 200/200, S3 lockstep 64/64 |
 | 15 | `r13_0915_2100` | 0:05:33 | 0 | $0.00 | 0 | no | Round-2 first submit; Ray session log file vanished → `apply_diff` crashed; cluster restarted |
-| 16 | `r13_0915_2118` | 1:14:47 | 2 | $16.96 | 122,309 | **yes** | **Round 2 `vqmmacc.vv` converged first try**: Stage M 1 iteration 34/34, S1 1 iteration 34/34, S2 sample 0 failing, Gate 244/244, S3 64/64 |
+| 16 | `r13_0915_2118` | 1:14:47 | 2 | $16.96 | 122,309 | **yes** | **Round 2 `vqmmacc.vv` converged first try**: Stage 0 1 iteration 34/34, S1 1 iteration 34/34, S2 sample 0 failing, Gate 244/244, S3 64/64 |
 
 **Totals** (`ledger.md` footer, reproduced by my re-parse): **41 h 07 m wall, $751.13, 43 LLM calls**
 (sum of out tokens = 6,636,804; note `r10_0912_0254`'s trace is a 0-byte/0-event file so it contributes nothing).
@@ -310,7 +310,7 @@ first build/directed baseline; no LLM runs there by construction.
 
 | bucket | wall | cost | share of cost |
 |---|---|---|---|
-| Stage M (`model` sections) | 7:15:29 | $105.50 | 14.0% |
+| Stage 0 (`model` sections) | 7:15:29 | $105.50 | 14.0% |
 | S1 + S2 (`impl:iterN` sections) | 31:38:45 | $645.61 | 86.0% |
 | Gate + S3 (`gate` section) | 0:17:57 | $0.00 | 0% |
 | prologue (reset/seed/resume/baseline build) | 1:54:57 | $0.00 | 0% |
@@ -327,7 +327,7 @@ Two structural facts fall out of this:
 
 Per-run stage split (only runs that contain more than one bucket):
 
-| run | Stage M wall / cost | impl wall / cost | gate wall / cost |
+| run | Stage 0 wall / cost | impl wall / cost | gate wall / cost |
 |---|---|---|---|
 | `r1_0907_1231` | 0:28:40 / $11.66 | — | — |
 | `r2_0907_1327` | 4:14:17 / $11.44 | — | — |
@@ -335,7 +335,7 @@ Per-run stage split (only runs that contain more than one bucket):
 | `r12_0914_0341` | — (reseeded) | 0:26:03 / $0.65 | 0:08:34 / $0.00 |
 | `r13_0915_2118` | 0:14:08 / $4.56 | 0:45:33 / $12.41 | 0:09:22 / $0.00 |
 
-`r4`–`r11` are impl-only runs (the Stage M model was reseeded from a stored diff, which is why they have no
+`r4`–`r11` are impl-only runs (the Stage 0 model was reseeded from a stored diff, which is why they have no
 `model` section): their whole cost is S1/S2.
 
 ### 3.3 Per-iteration LLM cost
@@ -629,18 +629,18 @@ Nine defects in the order they were hit, plus five smaller ones (§5.10). Costs 
 
 | | |
 |---|---|
-| **symptom** | Stage M converged cleanly (3 rounds, 27/27). S1 then returned 27/27 `trap` in attempt 1 and a byte-identical 27/27 `trap` in attempt 2, **across two different RTL diffs**. |
+| **symptom** | Stage 0 converged cleanly (3 rounds, 27/27). S1 then returned 27/27 `trap` in attempt 1 and a byte-identical 27/27 `trap` in attempt 2, **across two different RTL diffs**. |
 | **evidence** | `r3_0907_1742/20260907_202624_impl_directed_attempt1.json` and `..._205218_impl_directed_attempt2.json` are each exactly `{"total": 27, "counts": {"trap": 27}}`. `r3_0907_1742/work/status_rtl.md:4-30` shows `trap=27` with no LAMBDA/SEW/LMUL breakdown — a uniform-failure signature, i.e. harness, not design. |
 | **mis-localisation** | `r3_0907_1742/work/knowledge_rtl.md:88-102` — the agent hypothesised a WARL-clamp bug in its own `vtype.lambda` decode and spent attempt 2 on a "LAMBDA always 2" experiment. Both iterations were unwinnable regardless of what it wrote. |
 | **root cause** | `titan_loop.py.bak-r3:227-228` — S1's directed image was built with `COSIM_CONFIG`: <br>`artifact = get(nodes.build_saturn.options(**pg_opts).chia_remote(COSIM_CONFIG, extension=EXTENSION))` <br>The cosim config links the container image's **stock** `libriscv`, which has never heard of Zvvm. The directed programs are self-checking and need no golden model, but cospike aborts on the first `vtype` write carrying a lambda field — before any program can print its verdict. The original assumption is still recorded at `nodes.py:200-202`: *"the cosim config is the LLM's to write."* |
 | **fix — shipped in r4** | `titan_loop.py.bak-r4:59` imports `SYNTH_CONFIG as DIRECTED_CONFIG`; `:250-251` builds S1 with `DIRECTED_CONFIG`; S2 gets its own `COSIM_CONFIG` build only after directed passes (`:261-272`). Comment at `titan_loop.py.bak-r4:243-249`: <br>&gt; *"Directed tests run on the design WITHOUT the cosim harness. The cosim config links the image's stock libriscv, which has never heard of Zvvm: the first vtype write with a lambda field diverges from that Spike, cospike aborts, and every program classifies as 'trap' before it can print a verdict (r3_0907_1742 burned two S1 iterations, 27/27 trap each, exactly this way)."* <br>The same diff adds `_dump_sim_logs` (`:145-158`) because r3 left no way to see *why* 27/27 trapped. |
-| **cost** | r3's S1 half: 0:56:23, 2 LLM iterations, **$32.96**. Stage M in the same run was real work (27/27 in 3 iterations, $77.84), so the run is not a total loss. |
+| **cost** | r3's S1 half: 0:56:23, 2 LLM iterations, **$32.96**. Stage 0 in the same run was real work (27/27 in 3 iterations, $77.84), so the run is not a total loss. |
 
 ### 5.2 r2 — `spike_run` dispatched outside the placement group (3h50m deadlock)
 
 | | |
 |---|---|
-| **symptom** | 4:14:18 wall, 1 LLM call, $11.44, `converged: false`. The Stage-M LLM turn finished normally (`r2_0907_1327/20260907_134953_model_llm_attempt1.md`, `Cost: $11.4399 \| Duration: 1399.8s`). Everything after it hung. |
+| **symptom** | 4:14:18 wall, 1 LLM call, $11.44, `converged: false`. The Stage 0 LLM turn finished normally (`r2_0907_1327/20260907_134953_model_llm_attempt1.md`, `Cost: $11.4399 \| Duration: 1399.8s`). Everything after it hung. |
 | **localisation** | `r2_0907_1327/trace/ChiaProfileCollector.log`, 127 events: `complete build_spike` 13:50:34 → `run_end` 17:40:45. **One gap, 13,811 s = 230.2 min, zero events in between.** Then at 17:40:47 all 27 `spike_run` pairs fire and finish in 6–9 ms each. |
 | **careful reading of the trace** | Every function in the run is balanced (`spike_run dispatch=27 complete=27`) — there are **no unmatched dispatches**. But the file is **non-monotonic in `ts`**: those 27 pairs sit *after* `run_end` in file order, with `ts` 17:40:47 > run_end 17:40:45. Because both event types are emitted worker-side at execution time, a task Ray never schedules logs nothing — which is precisely why the 230-minute window is empty. The tasks were submitted by the driver at ~13:50:34, sat unschedulable for 3h50m, and were logged only once teardown released the placement group. The correct statement is **"never *scheduled*, hence never logged until the end"**, not "never dispatched". |
 | **root cause — verbatim in the code, twice** | `titan_loop.py:1015-1021` (`_run_on_spike` docstring): <br>&gt; *"Dispatched **inside** the chipyard placement group: the group reserves the build node's whole `chipyard` resource, so a `spike_run` scheduled outside it can never be placed (**r2_0907_1327 sat on 27 pending tasks for four hours**). The bundle carries 4 CPUs, so two runs overlap (chipyard 0.4 each)."* <br>`titan_loop.py:304-313`: <br>&gt; *"`build_saturn` needs `chipyard` and there is exactly one; the loop's placement group has reserved it for the whole run… `pg_opts` is a scheduling strategy and nothing else -- so the actor is placed in the bundle but reserves none of its `chipyard`. **Dispatching *outside* the group is the deadlock** (see `_run_on_spike`: r2 sat on 27 pending tasks for four hours that way)."* <br>Mechanically: r2's `_run_on_spike` omitted `pg_opts`, so its 27 `spike_run` tasks (`@ChiaFunction(resources={"chipyard": 0.4}, num_cpus=1)`, `nodes.py:250`) asked for `chipyard` from the node's default pool, which the `STRICT_PACK` PG `[{"CPU": 4, "chipyard": 1}]` had emptied. They sat `PENDING_NODE_ASSIGNMENT`; **Ray never errors on this**. The "27" in the comment matches the trace exactly. |
@@ -661,7 +661,7 @@ Two defects that compounded: the loop told the agent the wrong **score**, and ga
 | **root cause** | `helpers.py.bak-r5:80-85` — `classify_run`'s `_SKIP_RE` branch turned **every** `TITAN SKIP` into `Outcome("skip", …)` unconditionally; `helpers.py.bak-r5:59-60` excludes `"skip"` from `Outcome.failed`. The feedback then told the agent in writing they were "not counted against you". |
 | **spec basis** | IME v0.9.0 *"Writing vtype.lambda"*, quoted at `helpers.py:27-30`: *"the implementation shall select the largest supported nonzero lambda value that is less than or equal to the requested value; if no supported value is less than or equal to the request, it shall select the smallest supported nonzero lambda value."* Rounding **up** is legal in exactly one case, and that is a property of the run as a whole, not of one program. |
 | **self-narration** | `helpers.py:21-24`: *"The mistake that actually happened is the mirror image, and cost five iterations: **every** geometry disagreement was called a skip, so a DUT that answered LAMBDA=4 to a request for LAMBDA=2 was granted amnesty fifteen times per run and told in writing that it was 'not counted against you'."* The "fifteen times per run" is literally the `"skip": 15` frozen in all nine JSONs. |
-| **why nothing caught it** | `MODEL_MAX_SKIP_FRACTION` (`constants.py:297`, default 0.5) — *"A model that clamps LAMBDA everywhere passes every test by declining every one of them"* — guards **Stage M only**. A 15/27 ≈ 0.56 skip rate in S1 tripped nothing. |
+| **why nothing caught it** | `MODEL_MAX_SKIP_FRACTION` (`constants.py:297`, default 0.5) — *"A model that clamps LAMBDA everywhere passes every test by declining every one of them"* — guards **Stage 0 only**. A 15/27 ≈ 0.56 skip rate in S1 tripped nothing. |
 | **fix** | Authored as `titan_runs/patch-r5/fixes.diff` (2026-09-08 13:00, during r5's tail), first live in **r6**. New failing outcome kind `bad_geometry` split out from `skip` (`helpers.py:142-178`); `reconcile_geometry()` (`:210-258`) downgrades round-ups that whole-run evidence excuses — *"Deliberately conservative in the direction that costs iterations rather than the direction that hides bugs"* (`:221-223`); `geometry_support()` (`:261-297`) surfaces per-(VLEN,SEW) supported lambdas — *"they say '12 mismatch, 15 skip' as though the same amount of work had been done"* (`:266-267`). Agent-facing legend at `helpers.py:517-529`. 0 occurrences of `bad_geometry` in `helpers.py.bak-r5`, 13 in `.bak-r6`. |
 | **post-fix form** | `r9_0912_0137/work/status_rtl.md` carries the `skip` vs `bad_geometry` legend, the per-(VLEN,SEW) support table, and the line *"Every declined lambda is a tile geometry this run did not test. Legal, but untested is not tested."* |
 
@@ -683,9 +683,9 @@ The most consequential defect in the corpus, because it was in **the judge**.
 
 | | |
 |---|---|
-| **symptom** | r4, r5 and r6 all reused the same Stage-M Spike diff (`summary.json.model_source` = `titan_runs/r3_stageM_spike_model.diff`, digest `5037a57e7bc3`) while S1 refused to converge. The agent "fixed" its addressing every round to no effect — it was chasing a judge that was itself wrong. |
+| **symptom** | r4, r5 and r6 all reused the same Stage 0 Spike diff (`summary.json.model_source` = `titan_runs/r3_stageM_spike_model.diff`, digest `5037a57e7bc3`) while S1 refused to converge. The agent "fixed" its addressing every round to no effect — it was chasing a judge that was itself wrong. |
 | **localisation, step 1 — the agent saw it** | `r5_0908_1057/work/knowledge_rtl.md:19-22`: *"Reference (rvv_ref.py) says register position of C[i,j] = i\*N_max + j (plain flat row-major over EMUL_C registers)… SPEC's SAIL uses mat_C_idx(i,j) = tile_reg_idx(i\*N_max+j, EMUL_C, LAMBDA, epr), which for EMUL_C > 1 SHUFFLES the position… **The test is judged by rvv_ref's model, NOT the SPEC's — so RTL must use reference-style flat i\*N_max+j for C.**"* The agent identified the divergence correctly and then, reasonably and disastrously, wrote to the judge rather than to the spec. |
-| **localisation, step 2 — the decisive experiment** | `tools/verify_model_diff.py` → `titan_runs/verify_r6_model/verify.json`, a zero-LLM A/B of both Stage-M diffs against the **corrected** tests. Its stated contract: *"NEW diff + NEW tests → must be 27/27; OLD diff + NEW tests → must fail exactly the geometries the change moved."* <br><br>| model diff | verdict vs corrected tests | seconds | <br>|---|---|---| <br>| `r6_stageM_spike_model_sail.diff` | `{"total":27,"counts":{"pass":27}}`, `ok: true` | 48.8 | <br>| `r3_stageM_spike_model.diff` | `ok: false` — `RuntimeError: … reseeded model does not pass the directed programs: {'mismatch': 19, 'pass': 8}` | 47.0 | <br><br>**The r3 model scored 27/27 against the old tests and 8/27 against the corrected ones.** |
+| **localisation, step 2 — the decisive experiment** | `tools/verify_model_diff.py` → `titan_runs/verify_r6_model/verify.json`, a zero-LLM A/B of both Stage 0 diffs against the **corrected** tests. Its stated contract: *"NEW diff + NEW tests → must be 27/27; OLD diff + NEW tests → must fail exactly the geometries the change moved."* <br><br>| model diff | verdict vs corrected tests | seconds | <br>|---|---|---| <br>| `r6_stageM_spike_model_sail.diff` | `{"total":27,"counts":{"pass":27}}`, `ok: true` | 48.8 | <br>| `r3_stageM_spike_model.diff` | `ok: false` — `RuntimeError: … reseeded model does not pass the directed programs: {'mismatch': 19, 'pass': 8}` | 47.0 | <br><br>**The r3 model scored 27/27 against the old tests and 8/27 against the corrected ones.** |
 | **the exact discriminator** | The `By LMUL` breakdown in `verify.json`'s `old_r3_prose.status` is `LMUL=1: pass=8` / `LMUL=2: mismatch=8` / `LMUL=4: mismatch=7` / `LMUL=8: mismatch=4` — a clean 8 + 19 split on **LMUL ≥ 2**. It is *not* `EMUL_C > 1`: `By EMUL_C` reads `EMUL_C=1: mismatch=3, pass=2`, and three named failures are EMUL_C=1 (`ime_sew16_lam4_lmul2_n4`, `ime_sew16_lam4_lmul4_n4`, `ime_sew64_lam2_lmul2_n2`). Every one of the 19 fails at `C[0,0]`. |
 | **root cause A — the reference** | `rvv_ref.py.bak-r6:234-244`: `def c_element_index(i, j, geom): return i * geom.n_max + j`. The A and B tiles were already correctly permuted; only the C accessor was flat. |
 | **root cause B — the model was fitted to the tests, knowingly** | `r3_stageM_spike_model.diff` → `riscv/insns/vmmacc_vv.h:110` `const reg_t c_flat = i * n_max + j;`, with the comment above it: *"…The tests supply mat_a_tile / mat_b_tile in a layout-A-serialized… format that only yields correct results with the prose interpretation (contiguous load), so we follow the prose here."* Same in `insns/vmtl_v.h:95` and `insns/vmts_v.h:82` (`const reg_t flat_idx = i;`), **each acknowledging "The SAIL literally passes i through tile_reg_idx(…)" and choosing the tests anyway.** Two mutually consistent wrong artefacts are undetectable from inside the loop. |
@@ -879,7 +879,7 @@ Attribution de-duplicated by run (each run's cost assigned once, to the defect t
 
 | run(s) | dominant defect | cost | share of $751.13 |
 |---|---|---|---|
-| r1, r2, r3 | Stage M bring-up; §5.2 deadlock; §5.1 cosim config | $133.91 | 17.8% |
+| r1, r2, r3 | Stage 0 bring-up; §5.2 deadlock; §5.1 cosim config | $133.91 | 17.8% |
 | r4, r5, r6 | §5.3 amnesty + evidence-free feedback, then §5.4 judge defect invalidating all three | **$291.21** | **38.8%** |
 | r7 (both), r8 | genuine RTL convergence on a corrected judge, ending in §5.5 | $228.12 | 30.4% |
 | r9, r10 (both), r11 | §5.7b silent no-ops, then the §5.6 `.vf` hunt | $80.28 | 10.7% |
