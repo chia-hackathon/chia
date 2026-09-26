@@ -62,7 +62,8 @@ dimension; one that appears everywhere points at something structural.
   normative reference to OCP Microscaling Formats (MX) v1.0 -- so E4M3
   having no infinities, E5M2 being IEEE-shaped and E2M1 having neither NaN
   nor infinity all have to come from OCP (OFP8 v1.0 text:
-  `specs/ime/ocp-ofp8-v1.0.txt`; OCP MX / E2M1 is not available). A wrong
+  `specs/ime/ocp-ofp8-v1.0.txt`; OCP MX v1.0 -- E2M1, E8M0, MX blocks:
+  `specs/ime/ocp-mx-v1.0.txt`). A wrong
   special-value rule produces exactly this symptom. (E8M0 *is* restated in full at spec
   1990-1993, and note it has no zero, infinity or subnormal encoding: byte
   0x00 is the ordinary finite value 2^-127, and only 0xFF is NaN.)
@@ -78,6 +79,23 @@ dimension; one that appears everywhere points at something structural.
   half is a 32-bit accumulator. A narrow `vfmmacc.vv` (`ime_fpn_*`) that is
   off by an ulp in most elements is rounding in binary32 and narrowing once,
   instead of rounding every term in the C format.
+
+- **Round ten: `ime_fp4_*` / `ime_mxf_*`.** An E2M1 result off by a factor
+  of two everywhere is the bias (it is 1); results missing every +-0.5
+  contribution are a subnormal flush; NaN/Inf where the reference is finite
+  is an IEEE-shaped E2M1 decode (E=3 is 4.0 / 6.0, never special); a K
+  permutation is the nibble order; values like -1 where the reference has
+  -6 are the nibble read as Int4. For `ime_mxf_*` (`vm=0`): a factor of
+  2^(+-1) or 2^(+-2) per element is the E8M0 bias; the right numbers in
+  the wrong rows/columns or blocks are the v0 pair index (`m*R+s`, low byte
+  = scale_A of row m, high byte = scale_B of column m) or the block
+  boundary (32 elements at `bs`=0, 16 at `bs`=1); a finite value where the
+  reference has the default NaN is a 0xFF scale not forcing NaN; a
+  mismatch only at extreme scales (0x00 = 2^-127, 0xFE = 2^127) means the
+  scales were not converted to / multiplied in the C format under frm; an
+  ulp-level mismatch in bfloat16 / OFP8 C means the group sum S was not
+  rounded to the C format before the scale multiply (rnd=frm), or each
+  product was rounded separately.
 
 ## Reading a directed failure
 

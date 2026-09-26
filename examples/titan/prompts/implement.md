@@ -132,6 +132,46 @@ have are the work (spec 810-844 tbl-extensions; tbl-int-encoding-map
   E5M2 -> Inf), default NaN E4M3 0x7F / E5M2 0x7E, RNE only. These programs
   embed expected bytes (`ime_fpn_golden_`, `ime_fpn_special_`).
 
+## Round ten: the OFP4 (E2M1) cells and microscaled FP (MXFP)
+
+Round ten adds no mnemonic. `vfwmmacc.vv`, `vfqmmacc.vv` and `vf8wmmacc.vv`
+(rounds seven / eight) are the regression surface; their E2M1 cells and their
+`vm=0` (`v0.scale`) form are the work. OCP MX v1.0 is now available:
+`specs/ime/ocp-mx-v1.0.txt` (listed by the spec tool) -- read sec 5.3.3 /
+Table 5 for E2M1 and sec 5.4.1 for E8M0; OFP8 stays
+`specs/ime/ocp-ofp8-v1.0.txt`.
+
+- **E2M1 (OFP4) inputs, `vm=1`** (spec 826-829, 7319-7364): `vfwmmacc.vv`
+  at SEW=8 -> E4M3 (`altfmt`=0) / E5M2 (`altfmt`=1) C (Zvvofp4ofp8mm),
+  `vfqmmacc.vv` at SEW=16 -> binary16 / bfloat16 (Zvvofp4fp16mm /
+  Zvvofp4bf16mm), `vf8wmmacc.vv` at SEW=32 -> binary32 (Zvvofp4fp32mm).
+  E2M1: sign, 2 exponent bits, 1 mantissa bit, bias 1, **no Inf, no NaN**;
+  codes 0..7 are 0, 0.5 (the one subnormal), 1, 1.5, 2, 3, 4, 6 and bit 3
+  is the sign (0x8 = -0, 0xF = -6.0 -- not a two's-complement Int4).
+  Two per byte, element 2n in the LOW nibble (spec 1206-1219).
+  `altfmt_A`/`altfmt_B` = 1 is **reserved** at 4-bit inputs (1442-1443).
+  Same (G, psm, rnd) = (1, 0, frm) as round seven: W exact products summed
+  (the sum starts from +0, so an all-(-0) group gives +0), rounded once to
+  the C format, then C = round(C + S). The OFP8 C of Zvvofp4ofp8mm follows
+  the round-nine disclosure: non-saturating (E4M3 -> NaN 0x7F, E5M2 -> Inf),
+  default NaN 0x7F / 0x7E, RNE only. Names `ime_fp4_{golden,exact,special}_`.
+- **MXFP, `vm=0`** on the same three opcodes (spec 1345-1356, 1906-2140,
+  Sail `fp_scaled_gemm` 5277-5370): the sixteen Zvvx*/Zvvxn* extensions --
+  every OFP4 and OFP8 input row of `vfwmmacc` (SEW 8, 16), `vfqmmacc` (SEW
+  16, 32) and `vf8wmmacc` (SEW 32, 64), including OFP8 -> FP16/BF16 at
+  (W=2, SEW=16). `v0` holds the paired E8M0 scales exactly as round six's
+  MXINT (16-bit pairs, low byte scale_A of row m, high byte scale_B of
+  column m, pair `m*R+s`, `R = LAMBDA*SEW/16`; `bs`=0 -> 32-element blocks,
+  1 -> 16; `bs`=1 needs W*LMUL <= SEW). Per block: both scales are
+  **converted to the C format under frm and multiplied in the C format**
+  (so they can overflow, underflow, or -- E4M3 C above 2^8 -- become NaN;
+  +0 x Inf is NaN); a NaN block scale forces that C element to the default
+  NaN. Then per sub-dot-product: exact sum of W products, rounded to the C
+  format, **multiplied by the block scale in the C format (a rounding
+  point)**, then C = round(C + that). Not OCP's exact X(A)X(B)
+  (rvv_ref.MXF_DISCLOSURE). Names `ime_mxf_{golden,exact,special}_`, with
+  `_bs0_` / `_bs1_` in the name.
+
 ## Suggested order
 
 1. **Read first, edit second.** `${SATURN_SRC_PATH}` — in particular
@@ -195,8 +235,8 @@ have are the work (spec 810-844 tbl-extensions; tbl-int-encoding-map
   E2M1 has neither NaN nor infinity. If you need any of those rules, get
   them from OCP -- a guess here produces wrong numbers that look exactly
   like an RTL bug and will cost you iterations. The OCP OFP8 v1.0 text is at
-  `specs/ime/ocp-ofp8-v1.0.txt` (E4M3/E5M2); OCP MX v1.0 (E2M1) is not
-  available, and the E2M1 extensions are declared unsupported. (Round six itself does not
+  `specs/ime/ocp-ofp8-v1.0.txt` (E4M3/E5M2) and, from round ten, the OCP MX
+  v1.0 text (E2M1, E8M0, MX blocks) at `specs/ime/ocp-mx-v1.0.txt`. (Round six itself does not
   need them: its data inputs are MXINT4/MXINT8, plain signed two's
   complement with no special values, and E8M0 *is* restated in full at spec
   1990-1993. This matters for the floating-point rounds.)

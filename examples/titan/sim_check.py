@@ -846,6 +846,11 @@ _MX_BLOCK_DOT = _mx_block_dot
 #: the round-nine FP controls can substitute a wrong accumulator.
 _FPN_GEMM = rvv_ref.fpn_reference_gemm
 
+#: Round ten: the E2M1 cells (vm=1) and every MXFP (vm=0) program are judged
+#: by rvv_ref.mxf_reference_gemm; rebindable so the round-ten meta-judge can
+#: substitute a sabotaged reference (rvv_ref.R10_CONTROLS).
+_MXF_GEMM = rvv_ref.mxf_reference_gemm
+
 
 def _linear_c_index(i: int, j: int, geom: TileGeometry) -> int:
     """C indexed as a plain ``i*N_max + j``, the way Titan's RTL does it.
@@ -991,6 +996,57 @@ def _ime(machine: Machine, word: int) -> None:
                 machine.vset(vd, c_flat, sew, acc)
         return
 
+    if name in _FPW_MACC_W and fields.get("vm", 1) == 0:
+        # Round ten: MXFP -- Sail fp_scaled_gemm (5277-5370) at the Titan
+        # disclosure, arithmetic delegated to rvv_ref.mxf_reference_gemm
+        # (_MXF_GEMM).  This block owns the architectural legality (each
+        # rejection is a place the Sail / Exceptions list trap) and the
+        # register addressing: A / B through _AB_INDEX, C through _C_INDEX,
+        # the paired E8M0 scales out of v0 through _MX_PAIR_INDEX -- round
+        # six's layout, the same rebindable global its controls sabotage.
+        w = _FPW_MACC_W[name]
+        try:
+            geom = _geometry(machine, w, kind="mxf")
+            geom.validate()
+            rvv_ref.mx_check_legality(w, geom.lmul, sew, geom.lam,
+                                      machine.bs)
+            altfmt_a, altfmt_b = machine.altfmt_ab
+            name_a, name_b, name_c, mx_ok = rvv_ref.fpw_legal_row(
+                geom.w, geom.sew, machine.altfmt, altfmt_a, altfmt_b)
+        except ValueError:
+            raise IllegalInstruction from None
+        if not mx_ok:
+            raise IllegalInstruction
+        vd, vs1, vs2 = fields["vd"], fields["vs1"], fields["vs2"]
+        if any(r <= 0 < r + n for r, n in ((vd, geom.emul_c),
+                                           (vs1, geom.lmul),
+                                           (vs2, geom.lmul))):
+            raise IllegalInstruction      # Exceptions: overlaps v0
+        fmt_a, fmt_b, fmt_c = (rvv_ref.fp_format(name_a),
+                               rvv_ref.fp_format(name_b),
+                               rvv_ref.fp_format(name_c))
+        bs = machine.bs
+        blocks = rvv_ref.mx_block_count(geom.k_eff,
+                                        rvv_ref.mx_block_size(bs))
+        stride = rvv_ref.mx_scale_stride(sew, geom.lam)
+        pairs = [[machine.vget(0, _MX_PAIR_INDEX(m, s_idx, stride),
+                               rvv_ref.MX_PAIR_WIDTH)
+                  for s_idx in range(blocks)] for m in range(geom.m)]
+        sa = [[p & 0xFF for p in row] for row in pairs]
+        sb = [[(p >> 8) & 0xFF for p in row] for row in pairs]
+        eew_ab = geom.eew_ab
+        a = [[machine.vget(vs1, _AB_INDEX(i, k, geom), eew_ab)
+              for k in range(geom.k_eff)] for i in range(geom.m)]
+        b = [[machine.vget(vs2, _AB_INDEX(j, k, geom), eew_ab)
+              for k in range(geom.k_eff)] for j in range(geom.n)]
+        c = [[machine.vget(vd, _C_INDEX(i, j, geom), sew)
+              for j in range(geom.n_max)] for i in range(geom.m)]
+        out = _MXF_GEMM(geom, a, b, c, fmt_a, fmt_b, fmt_c, sa, sb, bs)
+        for i in range(geom.m):
+            for j in range(geom.n):
+                machine.vset(vd, _C_INDEX(i, j, geom), sew, out[i][j])
+        return
+
     if name in _FPW_MACC_W or name in _FP_MACC_W:
         # (Round nine: vfmmacc.vv at SEW 8 / 16 -- the W=1 narrow cells in
         # rvv_ref.FPN_CELLS -- arrives here too, as kind='fpw' with W=1, and
@@ -1038,6 +1094,7 @@ def _ime(machine: Machine, word: int) -> None:
         c = [[machine.vget(vd, _C_INDEX(i, j, geom), sew)
               for j in range(geom.n_max)] for i in range(geom.m)]
         gemm = (_FPN_GEMM if cell in rvv_ref.FPN_CELLS
+                else _MXF_GEMM if cell in rvv_ref.FPW_ROUND_TEN_CELLS
                 else rvv_ref.fpw_reference_gemm)
         out = gemm(geom, a, b, c, fmt_a, fmt_b, fmt_c)
         # ... but only the active columns are written back, because the
@@ -1224,7 +1281,8 @@ def _fpw_sweep_tier(geom: TileGeometry, seed: int) -> str:
         # Round nine: no exact tier exists; alternate golden / special.
         return ("golden", "special")[seed % 2] if geom.k_eff >= 2 \
             else "golden"
-    if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_EIGHT_CELLS:
+    if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_EIGHT_CELLS + \
+            rvv_ref.FPW_ROUND_TEN_CELLS:
         tier = ("golden", "exact", "special")[seed % 3]
     if tier == "exact" and not ime_tests.fpw_exact_emittable(geom):
         tier = "golden"
@@ -1253,15 +1311,31 @@ def simulate(geom: TileGeometry, seed: int = 0) -> Tuple[int, str]:
         key = sorted(rows, key=str)[seed % len(rows)]
         tier = _fpw_sweep_tier(geom, seed)
         fpn = (geom.w, geom.sew) in rvv_ref.FPN_CELLS
+        r10 = (geom.w, geom.sew) in rvv_ref.FPW_ROUND_TEN_CELLS
         case = (rvv_ref.fpw_exact_case(geom, rows[key], rng)
                 if tier == "exact"
                 else rvv_ref.fpn_special_case(geom, rows[key], rng)
                 if tier == "special" and fpn
+                else rvv_ref.ofp4_special_case(geom, rows[key], rng)
+                if tier == "special" and r10
                 else rvv_ref.fpw_special_case(geom, rows[key], rng)
                 if tier == "special"
                 else rvv_ref.fpw_case(geom, rows[key], rng))
         plan = ime_tests.FpwPlan(geom, key, tier, *case, tag="sweep")
         program = assemble(ime_tests.emit_fpw_test(plan))
+    elif geom.kind == "mxf":
+        # Round ten: MXFP.  Seeds cycle golden / special / exact (exact only
+        # at binary32 / binary64 C), rows and bs rotate with the seed.
+        rng = random.Random(seed)
+        tier = ("golden", "special", "exact")[seed % 3]
+        if tier == "exact" and not ime_tests.fpw_exact_emittable(geom):
+            tier = "golden"
+        rows = sorted(rvv_ref.fpw_rows(geom.w, geom.sew), key=str)
+        legal_bs = rvv_ref.mxf_legal_bs(geom)
+        plan = ime_tests.mxf_random_plan(
+            geom, rng, tier=tier, key=rows[seed % len(rows)],
+            bs=legal_bs[seed % len(legal_bs)])
+        program = assemble(ime_tests.emit_mxf_test(plan))
     elif geom.kind == "mx":
         # Round six.  Its operands are not a plain random_case: the tier
         # rests on the result being exactly representable, so the plan has
@@ -1590,6 +1664,19 @@ def main() -> int:
                                                           full_vl_only=True)
                      if (g.w, g.sew) == cell and g.emul_c != 16
                      and _allocatable(g) and g.m > 1][:1]
+    # ... and one per round-ten cell: the E2M1 cells at vm=1 and every MX
+    # cell at vm=0 -- a golden image the harness wrote must be shown to be
+    # able to disagree with the DUT.
+    for cell in rvv_ref.FPW_ROUND_TEN_CELLS:
+        controls += [g for g in rvv_ref.fpw_legal_configs(args.vlen,
+                                                          full_vl_only=True)
+                     if (g.w, g.sew) == cell and g.emul_c != 16
+                     and _allocatable(g) and g.m > 1][:1]
+    for cell in rvv_ref.MXF_CELLS:
+        controls += [g for g in rvv_ref.mxf_legal_configs(args.vlen,
+                                                          full_vl_only=True)
+                     if (g.w, g.sew) == cell and g.emul_c != 16
+                     and _allocatable(g) and g.m > 1][:1]
     for control in controls:
         check_negative_control(control)
         print(f"  ok  check_negative_control  {control.describe()}")
@@ -1621,6 +1708,11 @@ def main() -> int:
     print("  ok  check_round_nine_fpn_controls  " + ", ".join(
         f"{bad} rows {c}/{n} ({f} programs failed)"
         for bad, (c, n, f) in tally.items()))
+    check_round_ten_sweep_is_live(args.vlen)
+    print("  ok  check_round_ten_sweep_is_live")
+    tally = check_round_ten_controls(args.vlen)
+    print("  ok  check_round_ten_controls  " + ", ".join(
+        f"{bad} {c}/{n}" for bad, (c, n, _f) in tally.items()))
 
     tally = {}
     for g in geometries:
@@ -1903,7 +1995,8 @@ def _every_geometry(vlen: int):
     # filtered against rvv_ref.fpw_resolved_cells rather than being
     # silently absent, so that 'declared unsupported' and 'forgotten' are
     # different and distinguishable states.
-    _resolved = set(rvv_ref.fpw_resolved_cells())
+    _resolved = set(rvv_ref.fpw_resolved_cells()) \
+        - set(rvv_ref.FPW_ROUND_TEN_CELLS)
     yield from (g for g in rvv_ref.fpw_legal_configs(vlen)
                 if (g.w, g.sew) in _resolved)
     # Round nine's integer tiers, appended last for the same reason: the new
@@ -1913,6 +2006,11 @@ def _every_geometry(vlen: int):
         vlen, ime_tests.INT9_TOKENS, full_vl_only=False))
     # ... and the W=1 narrow floating-point cells, every N.
     yield from rvv_ref.fpn_legal_configs(vlen)
+    # Round ten, appended last: the E2M1 cells (vm=1, kind='fpw') and every
+    # MXFP geometry (vm=0, kind='mxf'), every N.
+    yield from (g for g in rvv_ref.fpw_legal_configs(vlen)
+                if (g.w, g.sew) in rvv_ref.FPW_ROUND_TEN_CELLS)
+    yield from rvv_ref.mxf_legal_configs(vlen)
 
 
 def check_round_seven_sub_byte_path(vlen: int = 256) -> None:
@@ -2005,20 +2103,11 @@ def check_round_seven_sweep_is_live(vlen: int = 256) -> None:
     resolved = set(rvv_ref.fpw_resolved_cells())
     assert resolved, "no resolved cell -- this check would be vacuous"
     assert swept == resolved, (sorted(swept), sorted(resolved))
-    unresolved = set(rvv_ref.FP_CELLS) - resolved
-    assert unresolved, "no unresolved cell -- the OFP exclusion is untested"
-    assert not (swept & unresolved), sorted(swept & unresolved)
-    # And an OFP cell must still refuse to resolve, so that a future edit
-    # which populates FP_FORMAT_TABLE by guesswork fails here rather than
-    # quietly widening the sweep.
-    for (w, sew) in sorted(unresolved):
-        try:
-            rvv_ref.fpw_rows(w, sew)
-        except rvv_ref.OCPSpecUnavailable:
-            continue
-        raise AssertionError(
-            f"W={w} SEW={sew} resolved its formats without the OCP "
-            f"documents -- FP_FORMAT_TABLE has been populated by guesswork")
+    # Round ten: OCP MX v1.0 resolved E2M1, so no widening cell is left
+    # unresolved and every one is swept.  The refusal path for a format
+    # named-but-undefined is still checked, in rvv_ref's
+    # check_round_seven_ocp_gate, on a synthetic descriptor.
+    assert resolved == set(rvv_ref.FP_CELLS), sorted(resolved)
 
 def check_round_nine_sweep_is_live(vlen: int = 256) -> None:
     """Round nine's cells and signedness rows are all in the sweep."""
@@ -2042,7 +2131,7 @@ def check_round_eight_sweep_is_live(vlen: int = 256) -> None:
     for cell in rvv_ref.FPW_ROUND_EIGHT_CELLS:
         assert cell in swept, cell
     for cell in ((2, 8), (4, 16), (8, 32)):
-        assert cell not in swept, cell
+        assert cell in swept, cell      # swept since round ten (E2M1)
     mnems = {g.mnemonic for g in _every_geometry(vlen) if g.kind == "fpw"}
     assert "vf8wmmacc.vv" in mnems, sorted(mnems)
     # The three tiers are each reachable from the sweep's seed mapping.
@@ -2288,6 +2377,150 @@ def check_round_nine_fpn_controls(vlen: int = 256):
     return tally
 
 
+# ---------------------------------------------------------------------------
+# round ten: E2M1 cells and MXFP -- the meta-judge
+# ---------------------------------------------------------------------------
+
+def check_round_ten_sweep_is_live(vlen: int = 256) -> None:
+    """Every E2M1 cell and every MX cell is swept, both bs values reachable,
+    and each sweep program passes on the correct model for all tiers."""
+    geoms = [g for g in _every_geometry(vlen)
+             if g.emul_c != 16 and _allocatable(g)]
+    fp4 = {(g.w, g.sew) for g in geoms if g.kind == "fpw"
+           and (g.w, g.sew) in rvv_ref.FPW_ROUND_TEN_CELLS}
+    assert fp4 == set(rvv_ref.FPW_ROUND_TEN_CELLS), sorted(fp4)
+    mxf = [g for g in geoms if g.kind == "mxf"]
+    assert {(g.w, g.sew) for g in mxf} == set(rvv_ref.MXF_CELLS)
+    for cell in rvv_ref.MXF_CELLS:
+        bss = {bs for g in mxf if (g.w, g.sew) == cell
+               for bs in rvv_ref.mxf_legal_bs(g)}
+        assert bss == {0, 1}, (cell, bss)
+    g = next(g for g in mxf if (g.w, g.sew) == (4, 32))
+    for seed in range(3):
+        code, out = simulate(g, seed)
+        assert code == ime_tests.EXIT_PASS and "TITAN PASS" in out, \
+            (seed, out[-300:])
+
+
+def _r10_programs(vlen: int):
+    """(cell, bs, row, program) for the meta-judge: per MX cell x bs x row
+    (up to four rows) a golden and a special program on a geometry with >= 2
+    scale blocks where one exists; per E2M1 cell x row a golden and a
+    special unscaled program.  bs None = unscaled."""
+    progs = []
+    for cell in rvv_ref.MXF_CELLS:
+        for bs in (None, 0, 1):
+            if bs is None and cell not in rvv_ref.FPW_ROUND_TEN_CELLS:
+                continue
+            kind = "fpw" if bs is None else "mxf"
+            g = (rvv_ref._r10_geom(cell, kind, bs=bs or 0, need_blocks=2,
+                                   vlen=vlen)
+                 or rvv_ref._r10_geom(cell, kind, bs=bs or 0, vlen=vlen))
+            if g is None or not _allocatable(g):
+                continue
+            for idx, (key, row) in enumerate(rvv_ref._r10_rows(cell)):
+                for tier in ("golden", "special"):
+                    rng = random.Random(1000 + 10 * idx + (tier == "golden"))
+                    if bs is None:
+                        make = (rvv_ref.ofp4_special_case if tier == "special"
+                                else rvv_ref.fpw_case)
+                        plan = ime_tests.FpwPlan(g, key, tier,
+                                                 *make(g, row, rng),
+                                                 tag="ctl")
+                        asm = ime_tests.emit_fpw_test(plan)
+                    else:
+                        plan = ime_tests.mxf_random_plan(g, rng, tier=tier,
+                                                         key=key, bs=bs)
+                        asm = ime_tests.emit_mxf_test(plan)
+                    progs.append((cell, bs, row, assemble(asm)))
+                # ... and the rounding-point witness where fmt_C has one.
+                case = rvv_ref.r10_rounding_case(g, row, bs)
+                if case is None:
+                    continue
+                if bs is None:
+                    asm = ime_tests.emit_fpw_test(ime_tests.FpwPlan(
+                        g, key, "special", *case[:3], tag="ctl"))
+                else:
+                    asm = ime_tests.emit_mxf_test(ime_tests.MxfPlan(
+                        g, key, bs, "special", *case, tag="ctl"))
+                progs.append((cell, bs, row, assemble(asm)))
+    return progs
+
+
+def _pair_index_transposed(m, s, r):
+    return rvv_ref.mx_pair_index(s, m, r)
+
+
+def check_round_ten_controls(vlen: int = 256):
+    """The round-ten mistakes, each run against emitted programs.
+
+    Every program passes on the correct model first.  Then for each control
+    -- rvv_ref.R10_CONTROLS through a sabotaged _MXF_GEMM, plus the v0 pair
+    index transposed (_MX_PAIR_INDEX, round six's layout control on the MXFP
+    path) -- every (cell, bs) where it applies and is not listed in
+    rvv_ref.r10_required holds must have at least one FAILing program.  Returns
+    {control: ((cell, bs) caught, (cell, bs) required, programs failed)}.
+    """
+    global _MXF_GEMM, _MX_PAIR_INDEX
+    progs = _r10_programs(vlen)
+    for cell, bs, row, prog in progs:
+        machine = Machine(vlen=vlen)
+        code = run(prog, machine)
+        out = "".join(machine.stdout)
+        assert code == ime_tests.EXIT_PASS and "TITAN PASS" in out, \
+            (cell, bs, [f.name for f in row], out[-300:])
+    tally = {}
+    for bad in rvv_ref.R10_CONTROLS + ("pair_index",):
+        hit, need, failed = set(), set(), 0
+        if bad == "pair_index":
+            _MX_PAIR_INDEX = _pair_index_transposed
+        else:
+            _MXF_GEMM = (lambda bad_: lambda *a:
+                         rvv_ref.mxf_reference_gemm(*a, bad={bad_}))(bad)
+        try:
+            for cell, bs, row, prog in progs:
+                if bad == "pair_index":
+                    applies = bs is not None
+                else:
+                    applies = rvv_ref.r10_control_applies(bad, row, bs)
+                if not applies:
+                    continue
+                if bad == "pair_index" or rvv_ref.r10_required(
+                        bad, _r10_geom_for((cell, bs), vlen), row, bs):
+                    need.add((cell, bs))
+                machine = Machine(vlen=vlen)
+                try:
+                    code = run(prog, machine)
+                except SimError:
+                    code = -1          # read off the end of v0: detected
+                if code != ime_tests.EXIT_PASS:
+                    hit.add((cell, bs))
+                    failed += 1
+        finally:
+            _MXF_GEMM = rvv_ref.mxf_reference_gemm
+            _MX_PAIR_INDEX = rvv_ref.mx_pair_index
+        if bad == "pair_index":
+            # m*R+s and s*R+m coincide when R == 1 (and M == 1): blind.
+            need = {x for x in need if not _r10_stride_one(x, vlen)}
+        assert need and need <= hit, (bad, sorted(need - hit, key=str))
+        tally[bad] = (len(hit), len(need), failed)
+    return tally
+
+
+def _r10_geom_for(x, vlen):
+    """The geometry _r10_programs used for (cell, bs); bs None = fpw."""
+    cell, bs = x
+    kind = "fpw" if bs is None else "mxf"
+    return (rvv_ref._r10_geom(cell, kind, bs=bs or 0, need_blocks=2,
+                              vlen=vlen)
+            or rvv_ref._r10_geom(cell, kind, bs=bs or 0, vlen=vlen))
+
+
+def _r10_stride_one(x, vlen) -> bool:
+    g = _r10_geom_for(x, vlen)
+    return rvv_ref.mx_scale_stride(g.sew, g.lam) == 1
+
+
 def _clayout_geometries(vlen: int):
     """rvv_ref's clayout tier, minus anything this harness cannot allocate."""
     return [g for g in rvv_ref.clayout_geometries(vlen) if _allocatable(g)]
@@ -2296,7 +2529,7 @@ def _clayout_geometries(vlen: int):
 def _allocatable(geom: TileGeometry) -> bool:
     try:
         ime_tests.VectorAlloc.allocate(geom,
-                                       reserve_v0=geom.kind == "mx")
+                                       reserve_v0=geom.kind in ("mx", "mxf"))
     except ValueError:
         return False
     return True

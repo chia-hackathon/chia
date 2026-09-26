@@ -95,6 +95,46 @@ have are the work (spec 810-844 tbl-extensions; tbl-int-encoding-map
   E5M2 -> Inf), default NaN E4M3 0x7F / E5M2 0x7E, RNE only. These programs
   embed expected bytes (`ime_fpn_golden_`, `ime_fpn_special_`).
 
+## Round ten: the OFP4 (E2M1) cells and microscaled FP (MXFP)
+
+Round ten adds no mnemonic. `vfwmmacc.vv`, `vfqmmacc.vv` and `vf8wmmacc.vv`
+(rounds seven / eight) are the regression surface; their E2M1 cells and their
+`vm=0` (`v0.scale`) form are the work. OCP MX v1.0 is now available:
+`specs/ime/ocp-mx-v1.0.txt` (listed by the spec tool) -- read sec 5.3.3 /
+Table 5 for E2M1 and sec 5.4.1 for E8M0; OFP8 stays
+`specs/ime/ocp-ofp8-v1.0.txt`.
+
+- **E2M1 (OFP4) inputs, `vm=1`** (spec 826-829, 7319-7364): `vfwmmacc.vv`
+  at SEW=8 -> E4M3 (`altfmt`=0) / E5M2 (`altfmt`=1) C (Zvvofp4ofp8mm),
+  `vfqmmacc.vv` at SEW=16 -> binary16 / bfloat16 (Zvvofp4fp16mm /
+  Zvvofp4bf16mm), `vf8wmmacc.vv` at SEW=32 -> binary32 (Zvvofp4fp32mm).
+  E2M1: sign, 2 exponent bits, 1 mantissa bit, bias 1, **no Inf, no NaN**;
+  codes 0..7 are 0, 0.5 (the one subnormal), 1, 1.5, 2, 3, 4, 6 and bit 3
+  is the sign (0x8 = -0, 0xF = -6.0 -- not a two's-complement Int4).
+  Two per byte, element 2n in the LOW nibble (spec 1206-1219).
+  `altfmt_A`/`altfmt_B` = 1 is **reserved** at 4-bit inputs (1442-1443).
+  Same (G, psm, rnd) = (1, 0, frm) as round seven: W exact products summed
+  (the sum starts from +0, so an all-(-0) group gives +0), rounded once to
+  the C format, then C = round(C + S). The OFP8 C of Zvvofp4ofp8mm follows
+  the round-nine disclosure: non-saturating (E4M3 -> NaN 0x7F, E5M2 -> Inf),
+  default NaN 0x7F / 0x7E, RNE only. Names `ime_fp4_{golden,exact,special}_`.
+- **MXFP, `vm=0`** on the same three opcodes (spec 1345-1356, 1906-2140,
+  Sail `fp_scaled_gemm` 5277-5370): the sixteen Zvvx*/Zvvxn* extensions --
+  every OFP4 and OFP8 input row of `vfwmmacc` (SEW 8, 16), `vfqmmacc` (SEW
+  16, 32) and `vf8wmmacc` (SEW 32, 64), including OFP8 -> FP16/BF16 at
+  (W=2, SEW=16). `v0` holds the paired E8M0 scales exactly as round six's
+  MXINT (16-bit pairs, low byte scale_A of row m, high byte scale_B of
+  column m, pair `m*R+s`, `R = LAMBDA*SEW/16`; `bs`=0 -> 32-element blocks,
+  1 -> 16; `bs`=1 needs W*LMUL <= SEW). Per block: both scales are
+  **converted to the C format under frm and multiplied in the C format**
+  (so they can overflow, underflow, or -- E4M3 C above 2^8 -- become NaN;
+  +0 x Inf is NaN); a NaN block scale forces that C element to the default
+  NaN. Then per sub-dot-product: exact sum of W products, rounded to the C
+  format, **multiplied by the block scale in the C format (a rounding
+  point)**, then C = round(C + that). Not OCP's exact X(A)X(B)
+  (rvv_ref.MXF_DISCLOSURE). Names `ime_mxf_{golden,exact,special}_`, with
+  `_bs0_` / `_bs1_` in the name.
+
 ## Suggested order
 
 1. **`vtype` first.** Add `lambda[2:0]`, `bs`, `altfmt_A` and `altfmt_B` at
@@ -156,7 +196,8 @@ independence is what makes an agreement between the three worth anything.
 
 From round seven onwards the directed programs for the widening
 floating-point instructions (`vfwmmacc.vv`, `vfqmmacc.vv`, `vf8wmmacc.vv`)
--- and from round nine the narrow `vfmmacc.vv` cells (`ime_fpn_*`) --
+-- from round nine the narrow `vfmmacc.vv` cells (`ime_fpn_*`), and from
+round ten the E2M1 and MXFP programs (`ime_fp4_*`, `ime_mxf_*`) --
 carry *embedded expected bytes*: the result of each multiply-accumulate,
 precomputed by the Titan reference model and compared with `memcmp`, because
 a narrow accumulator (OFP8, binary16, bfloat16) cannot be recomputed on the
@@ -189,8 +230,12 @@ Do not use them. Specifically:
   by the IME adoc itself and not by analogy with IEEE 754. The OCP OFP8 v1.0
   specification is available next to the adoc as
   `specs/ime/ocp-ofp8-v1.0.txt` (listed by the spec tool): read it for E4M3 /
-  E5M2. OCP MX v1.0 (E2M1 / OFP4) is NOT available; if you need a rule it
-  states, stop and say so in `finish`. Do not infer one. E4M3 in particular
+  E5M2, and the OCP MX v1.0 specification as `specs/ime/ocp-mx-v1.0.txt`
+  for E2M1 (OFP4, sec 5.3.3 / Table 5), E8M0 (sec 5.4.1) and the MX block
+  semantics (sec 5.1, 6.1) -- where the IME adoc pins what OCP leaves
+  implementation-defined (scale conversion to the C format under frm, the
+  per-group rounding points of `fp_scaled_gemm`), the adoc governs. If a
+  rule is in neither, stop and say so in `finish`. Do not infer one. E4M3 in particular
   has no infinity encoding and only one NaN pattern (S.1111.111), so an
   IEEE-shaped decode or overflow path is wrong there in a way that looks
   right.

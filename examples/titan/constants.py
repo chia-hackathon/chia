@@ -645,9 +645,56 @@ ROUND_NINE_SUPPORTED = (
 
 ROUND_NINE_TIERS = ROUND_NINE_INT_TIERS + ROUND_NINE_FP_TIERS
 
+#: Round ten (2026-09-26): OCP Microscaling Formats (MX) v1.0 is on disk
+#: (titan/ocp-spec/*.pdf; text for the agents at specs/ime/ocp-mx-v1.0.txt,
+#: gitignored like ocp-ofp8-v1.0.txt), so E2M1 is defined (MX sec 5.3.3,
+#: Table 5: bias 1, no Inf / NaN, max 6.0, subnormal 0.5) and every cell of
+#: the Zvvm tables now has a judge.  Like round nine it adds no mnemonic --
+#: vfwmmacc.vv / vfqmmacc.vv / vf8wmmacc.vv already exist -- so it is named
+#: by tier tokens and kept out of ALL_INSNS:
+#:
+#:   ``ofp4``  the four E2M1 cells at vm=1 (spec 826-829, 7319-7364):
+#:             Zvvofp4ofp8mm  vfwmmacc  W=2 SEW=8   E2M1 -> E4M3 / E5M2
+#:             Zvvofp4fp16mm, Zvvofp4bf16mm
+#:                            vfqmmacc  W=4 SEW=16  E2M1 -> binary16 / bf16
+#:             Zvvofp4fp32mm  vf8wmmacc W=8 SEW=32  E2M1 -> binary32
+#:             altfmt_A = altfmt_B = 0 only (1 is reserved, spec 1442-1443);
+#:             two per byte, element 2n in the low nibble (1206-1219).  The
+#:             OFP8 destination follows rvv_ref.OFP8_DISCLOSURE (nonsat, RNE,
+#:             default NaN 0x7F / 0x7E), as round nine's Zvvofp8mm.
+#:   ``mxfp``  the sixteen FP microscaling extensions (spec 7149-7201):
+#:             Zvvx{ofp4ofp8,ofp4fp16,ofp4bf16,ofp4fp32,ofp8fp16,ofp8bf16,
+#:             ofp8fp32,ofp8fp64}mm (BS=32, bs=0) and their Zvvxn* BS=16
+#:             twins (bs=1): vm=0 on the three widening FP forms, paired
+#:             E8M0 scales in v0 exactly as round six's MXINT.
+#:
+#: Semantics (rvv_ref.MXF_DISCLOSURE, citations there): Sail fp_scaled_gemm
+#: at the same G=1 / psm=0 / rnd=frm tuple as rounds seven / eight -- the
+#: E8M0 scales are converted to fmt_C under frm and multiplied in fmt_C
+#: (IME, not OCP 6.1's exact X(A)X(B)); a NaN combined scale forces the
+#: element to the default NaN; each sub-dot-product is rounded to fmt_C,
+#: scaled in fmt_C (rounded), then accumulated.  Judge fix: round seven's
+#: FP_CELLS had (W=2, SEW=16) OFP8 -> FP16/BF16 as not MX-capable; spec
+#: 7322-7329 names Zvvxofp8fp16mm / Zvvxofp8bf16mm there (no program read the
+#: flag, so nothing emitted moves).
+ROUND_TEN_TIERS = ("ofp4", "mxfp")
+
+#: The mnemonics round ten's tiers exercise.  All are already in ALL_INSNS.
+ROUND_TEN_INSNS = ("vfwmmacc.vv", "vfqmmacc.vv", "vf8wmmacc.vv")
+
+ROUND_TEN_SUPPORTED = (
+    "Zvvofp4ofp8mm", "Zvvofp4fp16mm", "Zvvofp4bf16mm", "Zvvofp4fp32mm",
+    "Zvvxofp4ofp8mm", "Zvvxofp4fp16mm", "Zvvxofp4bf16mm", "Zvvxofp8fp16mm",
+    "Zvvxofp8bf16mm", "Zvvxofp8fp32mm", "Zvvxofp4fp32mm", "Zvvxofp8fp64mm",
+    "Zvvxnofp4ofp8mm", "Zvvxnofp4fp16mm", "Zvvxnofp4bf16mm",
+    "Zvvxnofp8fp16mm", "Zvvxnofp8bf16mm", "Zvvxnofp8fp32mm",
+    "Zvvxnofp4fp32mm", "Zvvxnofp8fp64mm",
+)
+
 #: The full selectable scope: every instruction, plus every check tier.
 #: ``TITAN_INSNS`` validates against this, not against ALL_INSNS.
-ALL_SCOPE = ALL_INSNS + ROUND_FIVE_TIERS + ROUND_NINE_TIERS
+ALL_SCOPE = (ALL_INSNS + ROUND_FIVE_TIERS + ROUND_NINE_TIERS
+             + ROUND_TEN_TIERS)
 
 #: What a seeded tree already implements, and what this round adds.
 #: ``helpers.instruction_scope`` reads these two names first and only falls
@@ -655,9 +702,10 @@ ALL_SCOPE = ALL_INSNS + ROUND_FIVE_TIERS + ROUND_NINE_TIERS
 #: hook it left open so that a new round needs no edit in helpers.py.  Set
 #: them and every prompt names the right halves: rounds one and two are the
 #: regression surface, round three is the work.
-IMPLEMENTED_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
-                     + ROUND_FOUR_INSNS + ROUND_SIX_INSNS + ROUND_SEVEN_INSNS
-                     + ROUND_EIGHT_INSNS)
+IMPLEMENTED_INSNS = tuple(dict.fromkeys(
+    ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS + ROUND_FOUR_INSNS
+    + ROUND_SIX_INSNS + ROUND_SEVEN_INSNS + ROUND_EIGHT_INSNS
+    + ROUND_NINE_INSNS))       # rounds 1-9; round nine adds no new name
 # Round 8 (2026-09-24) adds OFP8 (E4M3/E5M2) input *cells*: the new mnemonic
 # vf8wmmacc plus new cells of vfwmmacc/vfqmmacc, whose IEEE cells are round 7
 # and must keep passing.  Hence the overlap with IMPLEMENTED_INSNS.
@@ -666,7 +714,10 @@ IMPLEMENTED_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
 # of instructions rounds 1-4 implement for their signed / wide cells, which
 # must keep passing.  So NEW_INSNS is entirely an overlap with
 # IMPLEMENTED_INSNS, by design.
-NEW_INSNS = ROUND_NINE_INSNS
+# Round 10 (2026-09-26) adds no mnemonic either: the E2M1 cells (vm=1) and
+# the MXFP vm=0 forms of vfwmmacc / vfqmmacc / vf8wmmacc, whose IEEE and
+# OFP8 cells (rounds 7-8) must keep passing -- the same overlap, by design.
+NEW_INSNS = ROUND_TEN_INSNS
 
 
 def _scope_insns() -> tuple:
@@ -706,6 +757,7 @@ def _scope_insns() -> tuple:
              "seven": ROUND_SEVEN_INSNS, "7": ROUND_SEVEN_INSNS,
              "eight": ROUND_EIGHT_INSNS, "8": ROUND_EIGHT_INSNS,
              "nine": ROUND_NINE_TIERS, "9": ROUND_NINE_TIERS,
+             "ten": ROUND_TEN_TIERS, "10": ROUND_TEN_TIERS,
              "all": ALL_SCOPE, "": ALL_SCOPE}
     if raw.lower() in named:
         return named[raw.lower()]
@@ -714,7 +766,7 @@ def _scope_insns() -> tuple:
     if unknown:
         raise ValueError(
             f"TITAN_INSNS={raw!r}: unknown mnemonic(s) {unknown}; "
-            f"expected a round name (one..nine/all) or a "
+            f"expected a round name (one..ten/all) or a "
             f"subset of {ALL_SCOPE}")
     return chosen
 

@@ -99,7 +99,8 @@ def _every_geometry(vlen: int) -> Iterator[TileGeometry]:
     # rather than being silently absent.  An unsupported extension has no
     # geometry in this pool by construction, which is what
     # constants.ROUND_SEVEN_UNSUPPORTED declares.
-    resolved = set(rvv_ref.fpw_resolved_cells())
+    resolved = set(rvv_ref.fpw_resolved_cells()) \
+        - set(rvv_ref.FPW_ROUND_TEN_CELLS)
     yield from (g for g in rvv_ref.fpw_legal_configs(vlen)
                 if (g.w, g.sew) in resolved)
     # Round nine's integer tiers, appended last for the same reason: the
@@ -113,11 +114,18 @@ def _every_geometry(vlen: int) -> Iterator[TileGeometry]:
     # bfloat16, OFP8 accumulators), every N; generate() handles them as
     # kind='fpw' golden programs (no exact tier reaches a narrow C).
     yield from rvv_ref.fpn_legal_configs(vlen)
+    # Round ten, appended last: the E2M1 cells at vm=1 (kind='fpw', the
+    # round-seven program shape) and every MXFP geometry at vm=0
+    # (kind='mxf', v0 held for the paired E8M0 scales), every N.
+    yield from (g for g in rvv_ref.fpw_legal_configs(vlen)
+                if (g.w, g.sew) in rvv_ref.FPW_ROUND_TEN_CELLS)
+    yield from rvv_ref.mxf_legal_configs(vlen)
 
 
 def _allocatable(geom: TileGeometry) -> bool:
     try:
-        ime_tests.VectorAlloc.allocate(geom, reserve_v0=geom.kind == "mx")
+        ime_tests.VectorAlloc.allocate(geom,
+                                       reserve_v0=geom.kind in ("mx", "mxf"))
     except ValueError:
         return False
     return True
@@ -135,7 +143,7 @@ def generate(vlen: int, count: int, seed: int = 0
         # be a lie (the *inputs* are MXINT integers) and check_emits reads
         # the name back to confirm the geometry it was generated from.
         kind = {"int": "", "fp": "_fp", "mx": "_mx",
-                "fpw": "_fpw"}[geom.kind]
+                "fpw": "_fpw", "mxf": "_mxf"}[geom.kind]
         # Round nine: a signedness row other than the signed default is
         # named, so the pool can be bisected by row.  Empty for every
         # earlier geometry.
@@ -152,6 +160,12 @@ def generate(vlen: int, count: int, seed: int = 0
             # the mix covers both block sizes and both accumulator formats.
             plan = ime_tests.mx_random_plan(geom, rng)
             out.append((name, ime_tests.emit_mx_test(plan, name), geom))
+            continue
+        if geom.kind == "mxf":
+            # Round ten: an MXFP program needs the row, bs and the paired
+            # scale arrays; tier, row and bs are drawn from the legal sets.
+            plan = ime_tests.mxf_random_plan(geom, rng)
+            out.append((name, ime_tests.emit_mxf_test(plan, name), geom))
             continue
         if geom.kind == "fpw":
             # A round-seven program needs an encoding-map row (which pair of
@@ -251,6 +265,13 @@ def check_emits() -> None:
         assert (f"_w{geom.w}_" in name) == (geom.w != 1), name
         assert ("_fp_" in name) == (geom.kind == "fp"), name
         assert ("_mx_" in name) == (geom.kind == "mx"), name
+        assert ("_mxf_" in name) == (geom.kind == "mxf"), name
+        if geom.kind == "mxf":
+            # vm=0 on the widening FP opcode, scales in v0, A off v0.
+            assert "    vle16.v v0, (a0)" in asm, name
+            assert "(vm=0)" in asm and "v0.scale" in asm, name
+            alloc = ime_tests.VectorAlloc.allocate(geom, reserve_v0=True)
+            assert alloc.a != 0, name
         if geom.kind == "mx":
             # The microscaled programs load v0 with the paired block scales
             # and hold the A tile off v0 -- a stress program that fell back
@@ -316,6 +337,24 @@ def check_round_nine_in_pool() -> None:
         assert cells == set(rvv_ref.FPN_CELLS), (vlen, cells)
 
 
+def check_round_ten_in_pool() -> None:
+    """Every E2M1 cell and every MX cell (both bs) is in the stress pool."""
+    for vlen in (128, 256, 512):
+        geoms = [g for g in _every_geometry(vlen)
+                 if g.emul_c != 16 and _allocatable(g)]
+        fp4 = {(g.w, g.sew) for g in geoms if g.kind == "fpw"
+               and (g.w, g.sew) in rvv_ref.FPW_ROUND_TEN_CELLS}
+        assert fp4 == set(rvv_ref.FPW_ROUND_TEN_CELLS), (vlen, fp4)
+        mxf = [g for g in geoms if g.kind == "mxf"]
+        assert {(g.w, g.sew) for g in mxf} == set(rvv_ref.MXF_CELLS), vlen
+        for cell in rvv_ref.MXF_CELLS:
+            bss = {bs for g in mxf if (g.w, g.sew) == cell
+                   for bs in rvv_ref.mxf_legal_bs(g)}
+            assert bss == {0, 1}, (vlen, cell, bss)
+    progs = [p for p in generate(256, 3000, seed=10) if p[2].kind == "mxf"]
+    assert progs, "no MXFP program in 3000 stress draws"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256)
@@ -324,7 +363,7 @@ def main() -> int:
 
     for check in (check_coverage, check_reproducible_and_varied, check_emits,
                   check_pool_covers_every_instruction,
-                  check_round_nine_in_pool):
+                  check_round_nine_in_pool, check_round_ten_in_pool):
         check()
         print(f"  ok  {check.__name__}")
 

@@ -3451,7 +3451,35 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
                 f"E5M2 0x{d['default_nan']['e5m2']:02x}, frm={d['frm']}.",
             ]
         head.append("#")
-    if plan.tier == "special":
+    if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_TEN_CELLS:
+        # Round ten only (byte-identity for rounds seven to nine).
+        d = rvv_ref.OFP8_DISCLOSURE
+        head += [
+            "# Round ten: E2M1 (OFP4) inputs per OCP MX v1.0",
+            "#   (specs/ime/ocp-mx-v1.0.txt, sec 5.3.3): bias 1, no Inf/NaN,",
+            "#   max 6.0, one subnormal 0.5, 0x8 = -0; two per byte, element",
+            "#   2n in the low nibble (spec 1206-1219); altfmt_A/B = 1 reserved.",
+            "# Judged by rvv_ref.mxf_reference_gemm (Sail fp_gemm, G=1 psm=0",
+            "#   rnd=frm; group sum seeded +0, rvv_ref.MXF_DISCLOSURE).",
+        ]
+        if geom.sew == 8:
+            head += [
+                "# OFP8 accumulator (Zvvofp4ofp8mm), Titan disclosure "
+                "(rvv_ref.OFP8_DISCLOSURE):",
+                f"#   overflow={d['overflow']} (E4M3 -> NaN, E5M2 -> Inf), "
+                f"default NaN E4M3 0x{d['default_nan']['e4m3']:02x} / "
+                f"E5M2 0x{d['default_nan']['e5m2']:02x}, frm={d['frm']}.",
+            ]
+        head.append("#")
+    if plan.tier == "special" and \
+            (geom.w, geom.sew) in rvv_ref.FPW_ROUND_TEN_CELLS:
+        head += [
+            "# Special-value tier (round ten): E2M1 +-6.0 / 0.5 / -0 planted,",
+            "# C at max / NaN / Inf, OFP8-destination overflow (see",
+            "# rvv_ref.ofp4_special_case).  Expected image from rvv_ref.",
+            "#",
+        ]
+    elif plan.tier == "special":
         head += [
             "# Special-value tier (round eight): OFP8 NaN / Inf / max /",
             "# subnormal operands planted at fixed positions (see",
@@ -3535,6 +3563,8 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
         # so their golden bytes do not move.
         gemm = (rvv_ref.fpn_reference_gemm
                 if (geom.w, geom.sew) in rvv_ref.FPN_CELLS
+                else rvv_ref.mxf_reference_gemm
+                if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_TEN_CELLS
                 else rvv_ref.fpw_reference_gemm)
         tile = gemm(geom, plan.a, plan.b, plan.c, fmt_a, fmt_b, fmt_c)
         golden = rvv_ref.fpw_golden_bytes(geom, tile, fmt_c)
@@ -3556,6 +3586,8 @@ def _fpw_round_word(geom: TileGeometry) -> str:
     """"seven" or "eight": which round made this geometry's cell live."""
     if (geom.w, geom.sew) in rvv_ref.FPN_CELLS:
         return "nine"
+    if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_TEN_CELLS:
+        return "ten"
     return ("eight" if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_EIGHT_CELLS
             else "seven")
 
@@ -3601,7 +3633,10 @@ def fpw_directed_tiers(vlen: int, insns: Sequence[str], seed: int = 0):
         ([c for c in resolved if c in rvv_ref.FPW_ROUND_EIGHT_CELLS],
          random.Random(seed + 8000), ("golden", "exact"), True),
     )
-    assert sorted(passes[0][0] + passes[1][0]) == resolved, resolved
+    # Round ten's E2M1 cells resolve too now, but are emitted by
+    # ofp4_directed_tiers under the ``ofp4`` token, never here.
+    assert sorted(passes[0][0] + passes[1][0]) == [
+        c for c in resolved if c not in rvv_ref.FPW_ROUND_TEN_CELLS], resolved
     for cells, rng, tiers, special in passes:
         for (w, sew) in cells:
             geoms = [g for g in rvv_ref.fpw_legal_configs(vlen,
@@ -3919,6 +3954,549 @@ def check_round_nine_fpn_emission() -> None:
            f"    {_DATA_DIRECTIVE[g.sew]} 0x{first:x}," in asm
 
 
+# ---------------------------------------------------------------------------
+# round ten: OFP4 (E2M1) cells, and MXFP (vm=0 on the widening FP forms)
+# ---------------------------------------------------------------------------
+#
+# Two tier tokens (constants.ROUND_TEN_TIERS), both appended after every
+# earlier tier with their own rng so rounds one to nine are byte-identical:
+#
+#   ``ofp4``  ime_fp4_{golden,exact,special}_...  vm=1, E2M1 x E2M1 at the
+#             three E2M1 cells (rvv_ref.FPW_ROUND_TEN_CELLS), through
+#             emit_fpw_test; judged by rvv_ref.mxf_reference_gemm (Sail
+#             fp_gemm at FP_DISCLOSURE).  rng seed + 10000.
+#   ``mxfp``  ime_mxf_{golden,exact,special}_...  vm=0 (v0.scale) at every
+#             MX-capable cell x row x bs -- the sixteen Zvvx*/Zvvxn* FP
+#             extensions -- through emit_mxf_test; judged by
+#             rvv_ref.mxf_reference_gemm (Sail fp_scaled_gemm).  The v0
+#             layout, poison padding and allocation are round six's
+#             (mx_scale_image, MX_POISON_SCALE, VectorAlloc reserve_v0).
+#             rng seed + 10500.
+#
+# The exact tier (binary32 / binary64 C only) carries no model judgement:
+# small-integer elements and 2^0..2^2 scales make every rounding point exact,
+# and the expected C is an integer computed by rvv_ref.mxf_exact_value from
+# integer arithmetic alone, converted on the DUT with one fcvt.
+
+OFP4_TOKEN = "ofp4"
+MXF_TOKEN = "mxfp"
+
+
+def ofp4_directed_tiers(vlen: int, seed: int = 0):
+    """``(name, asm, geometry)`` for the unscaled E2M1 cells (round ten).
+
+    Per cell: every full-VL geometry x every row, golden and (binary32 C)
+    exact; one partial-N geometry x every row, golden; one special-value
+    geometry x every row (rvv_ref.ofp4_special_case), plus the rounding-
+    point witness (rvv_ref.r10_rounding_case, ``ime_fp4_special_rw_``) on
+    every row whose C format can round S.
+    """
+    rng = random.Random(seed + 10000)
+    out = []
+    for (w, sew) in rvv_ref.FPW_ROUND_TEN_CELLS:
+        geoms = [g for g in rvv_ref.fpw_legal_configs(vlen,
+                                                      full_vl_only=True)
+                 if (g.w, g.sew) == (w, sew) and g.emul_c != 16
+                 and _allocatable_here(g)]
+        if not geoms:
+            continue
+        rows = rvv_ref.fpw_rows(w, sew)
+        plans = []
+        for g in geoms:
+            plans.append((g, "golden"))
+            if fpw_exact_emittable(g):
+                plans.append((g, "exact"))
+        part = next((replace(g, vl=(g.n_max // 2) * g.lam * g.lmul)
+                     for g in geoms if g.n_max > 1), None)
+        if part is not None:
+            plans.append((part, "golden"))
+        plans.append((fpw_special_geometry(geoms), "special"))
+        for geom, tier in plans:
+            for key, row in rows.items():
+                if tier == "exact":
+                    case = rvv_ref.fpw_exact_case(geom, row, rng)
+                elif tier == "special":
+                    case = rvv_ref.ofp4_special_case(geom, row, rng)
+                else:
+                    case = rvv_ref.fpw_case(geom, row, rng)
+                plan = FpwPlan(geom, key, tier, *case,
+                               tag="OFP4 E2M1 inputs (OCP MX v1.0)")
+                name = (f"ime_fp4_{tier}_w{w}_sew{sew}_l{geom.lam}_"
+                        f"m{geom.lmul}_n{geom.n}_{plan.altfmt_a}"
+                        f"{plan.altfmt_b}{plan.altfmt}")
+                out.append((name, emit_fpw_test(plan, name), geom))
+        # The rounding-point witness (rvv_ref.r10_rounding_case, no rng):
+        # C = -round(S) so rnd=frm gives +0 and an unrounded S does not.
+        # Only rows where fmt_C can round S at all (not E2M1 -> binary16 /
+        # binary32, whose S is always exact).
+        geom = fpw_special_geometry(geoms)
+        for key, row in rows.items():
+            case = rvv_ref.r10_rounding_case(geom, row)
+            if case is None:
+                continue
+            plan = FpwPlan(geom, key, "special", *case[:3],
+                           tag="OFP4 rounding-point witness (rnd=frm)")
+            name = (f"ime_fp4_special_rw_w{w}_sew{sew}_l{geom.lam}_"
+                    f"m{geom.lmul}_n{geom.n}_{plan.altfmt_a}"
+                    f"{plan.altfmt_b}{plan.altfmt}")
+            out.append((name, emit_fpw_test(plan, name), geom))
+    return out
+
+
+@dataclass(frozen=True)
+class MxfPlan:
+    """One round-ten MXFP program: geometry, encoding row, bs, scales, case.
+
+    ``scales_a`` / ``scales_b`` are the whole M x R v0 pair array halves
+    (padding and inactive scale_B included, poisoned with 0xFF by
+    rvv_ref.mxf_scale_arrays), exactly round six's MxPlan convention.
+    """
+    geom: TileGeometry
+    key: tuple                  # (altfmt_A, altfmt_B, altfmt)
+    bs: int
+    tier: str                   # "golden" / "exact" / "special"
+    a: Matrix
+    b: Matrix
+    c: Matrix
+    scales_a: List[List[int]]
+    scales_b: List[List[int]]
+    tag: str = ""
+
+    @property
+    def row(self):
+        return rvv_ref.fpw_rows(self.geom.w, self.geom.sew)[self.key]
+
+    @property
+    def extension(self) -> str:
+        fa, _fb, fc = self.row
+        return rvv_ref.fp_extension(fa.name, fc.name, self.bs)
+
+    def describe(self) -> str:
+        fa, fb, fc = self.row
+        mixed = "" if fa.name == fb.name else " MIXED"
+        return (f"{self.geom.describe()} {fa.name}x{fb.name}->{fc.name} "
+                f"altfmt={self.key[2]} bs={self.bs} "
+                f"BLK={rvv_ref.mx_block_size(self.bs)} tier={self.tier}"
+                f"{mixed}")
+
+
+def _mxf_configure(geom: TileGeometry, *, lmul: int, vl: int, key, bs: int,
+                   comment: str) -> List[str]:
+    """vsetvl with altfmt_A / altfmt_B / altfmt and bs, on every vsetvl."""
+    word = vtype_value(geom, lmul=lmul, altfmt=key[2], altfmt_a=key[0],
+                       altfmt_b=key[1], bs=bs)
+    return [
+        f"    # {comment}",
+        f"    li    t0, {vl}",
+        f"    li    t1, 0x{word:x}",
+        "    vsetvl x0, t0, t1",
+    ]
+
+
+def _mxf_ime_path(plan: MxfPlan, alloc: VectorAlloc) -> List[str]:
+    """Round seven's tile sequence, plus v0 scales, with the macc at vm=0."""
+    geom, key, bs = plan.geom, plan.key, plan.bs
+    lam_imm = 0
+    out: List[str] = ["", "    # ---- IME path (microscaled MXFP, vm=0) ----"]
+    out += _mxf_configure(geom, lmul=geom.lmul_c, vl=geom.vl_c_full, key=key,
+                          bs=bs, comment=f"C tile transfer config (LMUL="
+                                         f"EMUL_C={geom.emul_c}, VL="
+                                         f"{geom.vl_c_full})")
+    out += _check_lambda_retained(geom)
+    out += [
+        "    la    a0, c_init",
+        f"    li    a1, {geom.m}          # LD = M: row-major M x M block",
+        f"    {ime.insn(geom.load_mnemonic, vd=alloc.c, rs1=RS1_ADDR, rs2=RS2_LD, vm=1, **{'lambda': lam_imm})}"
+        f"    # {geom.load_mnemonic} v{alloc.c}, (a0), a1",
+    ]
+    out += _mxf_configure(geom, lmul=geom.lmul,
+                          vl=geom.lmul * geom.elems_per_reg, key=key, bs=bs,
+                          comment=f"A/B config (LMUL={geom.lmul}, full VL)")
+    for label, base in (("mat_a_tile", alloc.a), ("mat_b_tile", alloc.b)):
+        out += [
+            f"    la    a0, {label}",
+            f"    li    a1, {geom.linesize}",
+            f"    {ime.insn(geom.load_mnemonic, vd=base, rs1=RS1_ADDR, rs2=RS2_LD, vm=1, **{'lambda': lam_imm})}"
+            f"    # {geom.load_mnemonic} v{base}, (a0), a1",
+        ]
+    r = rvv_ref.mx_scale_stride(geom.sew, geom.lam)
+    pairs = geom.vlen // rvv_ref.MX_PAIR_WIDTH
+    out += [
+        "",
+        f"    # paired E8M0 block scales into v0: {pairs} x 16-bit elements,",
+        f"    # pair p = m*R + s, R = LAMBDA*SEW/16 = {r}; low byte scale_A",
+        "    # (row m of A), high byte scale_B (column m of B^T) -- spec",
+        "    # 2129-2170, Sail read_block_scales.  Padding / inactive = 0xFF.",
+        f"    li    t0, {pairs}",
+        "    vsetvli t1, t0, e16, m1, ta, ma",
+        "    la    a0, v0_scales",
+        "    vle16.v v0, (a0)",
+    ]
+    out += _mxf_configure(geom, lmul=geom.lmul, vl=geom.vl, key=key, bs=bs,
+                          comment=f"compute config (VL={geom.vl} -> N="
+                                  f"{geom.n}, bs={bs})")
+    out += [
+        f"    {ime.insn(geom.mnemonic, vd=alloc.c, vs1=alloc.a, vs2=alloc.b, vm=0)}"
+        f"    # {geom.mnemonic} v{alloc.c}, v{alloc.a}, v{alloc.b}, v0.scale"
+        f"  (vm=0)",
+    ]
+    out += _mxf_configure(geom, lmul=geom.lmul_c, vl=geom.vl_c_full, key=key,
+                          bs=bs, comment="back to the C tile config to store")
+    out += [
+        "    la    a0, c_ime",
+        f"    li    a1, {geom.m}",
+        f"    {ime.insn(geom.store_mnemonic, vs3=alloc.c, rs1=RS1_ADDR, rs2=RS2_LD, vm=1, **{'lambda': lam_imm})}"
+        f"    # {geom.store_mnemonic} v{alloc.c}, (a0), a1",
+    ]
+    return out
+
+
+def _mxf_exact_ref_path(plan: MxfPlan) -> List[str]:
+    """C = C0 + sum_s 2^(eA+eB-254) * dot_s, in integers, one fcvt each."""
+    geom = plan.geom
+    fmt_a, fmt_b, fmt_c = plan.row
+    fcvt, fst, _fld = _FCVT_BY_WIDTH[geom.sew]
+    esz = geom.sew // 8
+    out: List[str] = ["", "    # ---- exact reference (integer MX dot + fcvt) ----",
+                      "    la    a5, c_rvv"]
+    for i in range(geom.m):
+        for j in range(geom.n_max):
+            off = _c_off(geom, i, j) * esz
+            c0 = _fpw_int_of(plan.c[i][j], fmt_c)
+            if j >= geom.n:
+                val, note = c0, "inactive"
+            else:
+                val = rvv_ref.mxf_exact_value(
+                    geom, plan.a, plan.b, c0, plan.scales_a[i],
+                    plan.scales_b[j], plan.bs, fmt_a, fmt_b, i, j)
+                note = "exact integer"
+            out += [f"    li    t0, {val}         # C[{i},{j}] {note}",
+                    f"    li    t1, {off}",
+                    "    add   t2, a5, t1",
+                    f"    {fcvt} ft0, t0",
+                    f"    {fst}   ft0, 0(t2)"]
+    return out
+
+
+def emit_mxf_test(plan: MxfPlan, name: str = "ime_mxf") -> str:
+    """One round-ten MXFP program (golden / exact / special tier)."""
+    geom = plan.geom
+    geom.validate()
+    if geom.kind != "mxf":
+        raise ValueError(f"{geom.describe()}: emit_mxf_test needs kind='mxf'")
+    if geom.emul_c == 16:
+        raise ValueError(f"{geom.describe()}: EMUL_C=16 has no C transfer")
+    fmt_a, fmt_b, fmt_c = plan.row
+    rvv_ref.mx_check_legality(geom.w, geom.lmul, geom.sew, geom.lam, plan.bs)
+    if plan.tier not in ("golden", "exact", "special"):
+        raise ValueError(f"unknown tier {plan.tier!r}")
+    if plan.tier == "exact" and not fpw_exact_emittable(geom):
+        raise ValueError(f"{geom.describe()}: no baseline fcvt to "
+                         f"{fmt_c.name}")
+    alloc = VectorAlloc.allocate(geom, reserve_v0=True)
+    width = geom.sew
+    desc = plan.describe()
+    d = rvv_ref.OFP8_DISCLOSURE
+    head = [
+        f"# {name}: {desc}",
+        "#",
+        "# Generated by ime_tests.py from rvv_ref.py -- do not edit by hand,",
+        "# and do not edit rvv_ref.py: it is the judge, not the defendant.",
+        "#",
+        f"# Round ten (MXFP), tier {plan.tier}: {plan.tag}.",
+        f"# Extension {plan.extension} (spec 7149-7201); encoding-map row "
+        f"(spec 7288-7370): altfmt_A={plan.key[0]} altfmt_B={plan.key[1]} "
+        f"altfmt={plan.key[2]} bs={plan.bs} -> {fmt_a.name} x {fmt_b.name} "
+        f"-> {fmt_c.name}, block size {rvv_ref.mx_block_size(plan.bs)}.",
+        "# Semantics: Sail fp_scaled_gemm at the Titan disclosure G=1 psm=0",
+        "# rnd=frm (rvv_ref.FP_DISCLOSURE, rvv_ref.MXF_DISCLOSURE): per block,",
+        "# scale_A and scale_B (E8M0, bias 127, 0xFF = NaN) are converted to",
+        f"# {fmt_c.name} under frm and multiplied there; a NaN product forces",
+        "# the element to the default NaN; each sub-dot-product of W exact",
+        "# products (sum seeded +0) is rounded to fmt_C, multiplied by the",
+        "# block scale in fmt_C (rounded), then C = round(C + that).",
+        "# Element formats: OCP MX v1.0 (specs/ime/ocp-mx-v1.0.txt) -- E2M1",
+        "#   bias 1, no Inf/NaN, max 6.0, subnormal 0.5, two per byte with",
+        "#   element 2n in the low nibble (spec 1206-1219); OFP8 per",
+        "#   specs/ime/ocp-ofp8-v1.0.txt.",
+    ]
+    if fmt_c.name in ("e4m3", "e5m2"):
+        head += [
+            "# OFP8 accumulator, Titan disclosure (rvv_ref.OFP8_DISCLOSURE):",
+            f"#   overflow={d['overflow']} (E4M3 -> NaN, E5M2 -> Inf), "
+            f"default NaN E4M3 0x{d['default_nan']['e4m3']:02x} / "
+            f"E5M2 0x{d['default_nan']['e5m2']:02x}, frm={d['frm']}; the",
+            "#   E8M0 scales convert to OFP8 under the same rule.",
+        ]
+    head.append("#")
+    if plan.tier == "exact":
+        head += [
+            "# Expected image: exact integers (small-integer elements, 2^0..2^2",
+            "# scales -- no rounding point can round), converted on the DUT",
+            "# with one fcvt.  This tier consults no FP judgement of rvv_ref.",
+            "#",
+        ]
+    else:
+        head += [
+            "# Expected image: computed by rvv_ref.mxf_reference_gemm and",
+            "# embedded below as bytes (the reference is the authority here;",
+            "# the exact tier is the independent check on it).",
+            "#",
+        ]
+    head.append(f"# IME instructions are emitted as .insn (encodings from "
+                f"Zvvm v{ime.SPEC_VERSION}):")
+    for mnemonic in (geom.load_mnemonic, geom.mnemonic, geom.store_mnemonic):
+        head.append(f"#   {mnemonic}")
+    head += [
+        "",
+        "    .text",
+        "    .balign 4",
+        "    .globl main",
+        "main:",
+        "    addi  sp, sp, -64",
+        "    sd    ra, 56(sp)",
+        "    sd    s1, 48(sp)         # carries the exit status past printf",
+        "    sd    s2, 40(sp)",
+        "    sd    s3, 32(sp)",
+        "    sd    s4, 24(sp)",
+        "    sd    s5, 16(sp)",
+        "    sd    s6, 8(sp)",
+        "    sd    s7, 0(sp)",
+        f"    li    t0, {MSTATUS_VS_INITIAL}",
+        "    csrs  mstatus, t0        # enable vector state",
+        f"    li    t0, {MSTATUS_FS_INITIAL}",
+        "    csrs  mstatus, t0        # enable scalar FP state",
+        "    fsrmi 0                  # frm = RNE (spec 1495); not trusted "
+        "from reset",
+    ]
+    body = _mxf_ime_path(plan, alloc)
+    if plan.tier == "exact":
+        body += _mxf_exact_ref_path(plan)
+    body += _compare(geom)
+
+    data = [
+        "", "    .data", "    .balign 8",
+        f'.Lfmt_pass:  .asciz "TITAN PASS {desc}\\n"',
+        f'.Lfmt_skip:  .asciz "TITAN SKIP lambda=%d (requested {geom.lam}) '
+        f'imm=%d {desc}\\n"',
+        f'.Lfmt_fail:  .asciz "TITAN FAIL row=%d col=%d {desc}\\n"',
+        f'.Lfmt_diff:  .asciz "TITAN DIFF r=%d c=%d '
+        f'exp={_hex_fmt(width)} got={_hex_fmt(width)}\\n"',
+        f'.Lfmt_cdump: .asciz "TITAN CDUMP r=%d:"',
+        f'.Lfmt_cref:  .asciz "TITAN CREF r=%d:"',
+        f'.Lfmt_elem:  .asciz " {_hex_fmt(width)}"',
+        '.Lfmt_nl:    .asciz "\\n"',
+        "    .balign 8",
+    ]
+    image = mx_scale_image(geom, plan.scales_a, plan.scales_b)
+    data += ["    # v0 paired E8M0 scales (low byte scale_A, high scale_B)"]
+    data += _matrix_data("v0_scales", [image[i:i + 8]
+                                       for i in range(0, len(image), 8)], 16)
+    data += ["    .balign 8"] + _matrix_data("c_init", plan.c, width)
+    data += ["    .balign 8"] + _fpw_tile_data("mat_a_tile", plan.a, geom)
+    data += ["    .balign 8"] + _fpw_tile_data("mat_b_tile", plan.b, geom)
+    data += ["    .balign 8", "c_ime:",
+             f"    .zero {geom.m * geom.m * width // 8}",
+             "    .balign 8", "c_rvv:"]
+    if plan.tier in ("golden", "special"):
+        tile = rvv_ref.mxf_reference_gemm(
+            geom, plan.a, plan.b, plan.c, fmt_a, fmt_b, fmt_c,
+            plan.scales_a, plan.scales_b, plan.bs)
+        golden = rvv_ref.fpw_golden_bytes(geom, tile, fmt_c)
+        words = [int.from_bytes(bytes(golden[i:i + width // 8]), "little")
+                 for i in range(0, len(golden), width // 8)]
+        data += ["    # golden C tile, row-major M x N_max, from rvv_ref"]
+        data += _matrix_data("", [words[i:i + geom.n_max]
+                                  for i in range(0, len(words), geom.n_max)],
+                             width)[1:]
+    else:
+        data += [f"    .zero {geom.m * geom.m * width // 8}"]
+    return "\n".join(head + body + data) + "\n"
+
+
+def _mxf_allocatable(geom: TileGeometry) -> bool:
+    try:
+        VectorAlloc.allocate(geom, reserve_v0=True)
+    except ValueError:
+        return False
+    return geom.emul_c != 16
+
+
+def mxf_random_plan(geom: TileGeometry, rng: random.Random,
+                    tier: str = None, key=None, bs: int = None) -> MxfPlan:
+    """A randomised MXFP plan (stress pool / sim sweep entry point)."""
+    rows = rvv_ref.fpw_rows(geom.w, geom.sew)
+    if key is None:
+        key = rng.choice(sorted(rows, key=str))
+    if bs is None:
+        bs = rng.choice(rvv_ref.mxf_legal_bs(geom))
+    row = rows[key]
+    if tier is None:
+        tier = rng.choice(["golden", "special"]
+                          + (["exact"] if fpw_exact_emittable(geom) else []))
+    make = {"golden": rvv_ref.mxf_case, "exact": rvv_ref.mxf_exact_case,
+            "special": rvv_ref.mxf_special_case}[tier]
+    return MxfPlan(geom, key, bs, tier, *make(geom, row, bs, rng),
+                   tag="randomised")
+
+
+def mxf_directed_tiers(vlen: int, seed: int = 0):
+    """``(name, asm, geometry)`` for the sixteen MXFP extensions.
+
+    Per MX cell and bs: every full-VL legal geometry, the encoding rows
+    rotated over the geometries (golden; plus exact at binary32 / binary64);
+    the geometry with the most scale blocks x every row (golden); one
+    partial-N geometry (golden, the scale_B-inactive columns); one special
+    geometry x every row (rvv_ref.mxf_special_case), plus the rounding-
+    point witness (rvv_ref.r10_rounding_case, ``ime_mxf_special_rw_``) on
+    every row whose C format can round S.
+    """
+    rng = random.Random(seed + 10500)
+    out = []
+    for (w, sew) in rvv_ref.MXF_CELLS:
+        rows = list(rvv_ref.fpw_rows(w, sew).items())
+        for bs in (0, 1):
+            geoms = [g for g in rvv_ref.mxf_legal_configs(
+                         vlen, full_vl_only=True)
+                     if (g.w, g.sew) == (w, sew) and _mxf_allocatable(g)
+                     and bs in rvv_ref.mxf_legal_bs(g)]
+            if not geoms:
+                continue
+            plans = []
+            for idx, g in enumerate(geoms):
+                key, row = rows[idx % len(rows)]
+                plans.append((g, "golden", key, row))
+                if fpw_exact_emittable(g):
+                    plans.append((g, "exact", key, row))
+            most = max(geoms, key=lambda g: (rvv_ref.mx_block_count(
+                g.k_eff, rvv_ref.mx_block_size(bs)), g.m))
+            plans += [(most, "golden", k, r) for k, r in rows]
+            part = next((replace(g, vl=(g.n_max // 2) * g.lam * g.lmul)
+                         for g in geoms if g.n_max > 1), None)
+            if part is not None:
+                key, row = rows[0]
+                plans.append((part, "golden", key, row))
+            sg = rvv_ref.mxf_special_geometry(geoms)
+            plans += [(sg, "special", k, r) for k, r in rows]
+            seen = set()
+            for geom, tier, key, row in plans:
+                make = {"golden": rvv_ref.mxf_case,
+                        "exact": rvv_ref.mxf_exact_case,
+                        "special": rvv_ref.mxf_special_case}[tier]
+                plan = MxfPlan(geom, key, bs, tier,
+                               *make(geom, row, bs, rng),
+                               tag=("mixed-format row" if row[0].name
+                                    != row[1].name else "same-format row"))
+                name = (f"ime_mxf_{tier}_w{w}_sew{sew}_bs{bs}_l{geom.lam}_"
+                        f"m{geom.lmul}_n{geom.n}_{key[0]}{key[1]}{key[2]}")
+                if name in seen:
+                    continue
+                seen.add(name)
+                out.append((name, emit_mxf_test(plan, name), geom))
+            # The rounding-point witness on the special geometry, every row
+            # that has one (rvv_ref.r10_rounding_case; unit scales, no rng).
+            for key, row in rows:
+                case = rvv_ref.r10_rounding_case(sg, row, bs)
+                if case is None:
+                    continue
+                plan = MxfPlan(sg, key, bs, "special", *case,
+                               tag="rounding-point witness (rnd=frm)")
+                name = (f"ime_mxf_special_rw_w{w}_sew{sew}_bs{bs}_l{sg.lam}_"
+                        f"m{sg.lmul}_n{sg.n}_{key[0]}{key[1]}{key[2]}")
+                out.append((name, emit_mxf_test(plan, name), sg))
+    return out
+
+
+def check_round_ten_emission() -> None:
+    """The round-ten programs, structurally, against rvv_ref."""
+    progs = ofp4_directed_tiers(256, seed=0)
+    names = [n for n, _, _ in progs]
+    assert len(set(names)) == len(names)
+    cells = {(g.w, g.sew) for _n, _a, g in progs}
+    assert cells == set(rvv_ref.FPW_ROUND_TEN_CELLS), cells
+    tiers = {n.split("_")[2] for n in names}
+    assert tiers == {"golden", "exact", "special"}, tiers
+    for name, asm, geom in progs:
+        assert "Round ten" in asm and "ocp-mx-v1.0.txt" in asm, name
+        assert asm.count(f"# {geom.mnemonic} v") == 1, name
+        assert "v0.scale" not in asm and "vle16.v v0" not in asm, name
+        word = int(re.search(r"\.insn 4, (0x[0-9a-f]+)\s+# "
+                             + re.escape(geom.mnemonic), asm).group(1), 16)
+        assert (word >> 25) & 1 == 1, name              # vm=1
+        if geom.sew == 8:
+            assert "nonsat" in asm, name
+    for (w, sew) in rvv_ref.FPW_ROUND_TEN_CELLS:
+        for key in rvv_ref.fpw_rows(w, sew):
+            assert any(n.endswith(f"_{key[0]}{key[1]}{key[2]}")
+                       and f"_w{w}_sew{sew}_" in n for n in names), (w, key)
+
+    mprogs = mxf_directed_tiers(256, seed=0)
+    mnames = [n for n, _, _ in mprogs]
+    assert len(set(mnames)) == len(mnames)
+    exts = set()
+    off_bs, _ = ime.VTYPE_IME_FIELDS["bs"]
+    for name, asm, geom in mprogs:
+        assert geom.kind == "mxf", name
+        bs = int(name.split("_bs")[1][0])
+        key = tuple(int(x) for x in name.rsplit("_", 1)[1])
+        row = rvv_ref.fpw_rows(geom.w, geom.sew)[key]
+        exts.add(rvv_ref.fp_extension(row[0].name, row[2].name, bs))
+        assert "vle16.v v0, (a0)" in asm and "v0_scales:" in asm, name
+        word = int(re.search(r"\.insn 4, (0x[0-9a-f]+)\s+# "
+                             + re.escape(geom.mnemonic), asm).group(1), 16)
+        assert (word >> 25) & 1 == 0, name              # vm=0
+        assert ime.decode(word)[0] == geom.mnemonic
+        alloc = VectorAlloc.allocate(geom, reserve_v0=True)
+        assert alloc.a != 0, name
+        for vw in (int(m, 16) for m in re.findall(
+                r"li    t1, 0x([0-9a-f]+)\n    vsetvl", asm)):
+            assert (vw >> (64 - off_bs)) & 1 == bs, name
+        assert asm.count("beq   t4, t5, 1f") == geom.m * geom.n_max, name
+    assert exts == set(rvv_ref.ROUND_TEN_MXF_EXTENSIONS), sorted(exts)
+    assert {n.split("_")[2] for n in mnames} == {"golden", "exact",
+                                                 "special"}
+    # Golden bytes are the model's, parsed back out of the assembly.
+    rng = random.Random(1013)
+    for cell in rvv_ref.MXF_CELLS:
+        g = next(g for g in rvv_ref.mxf_legal_configs(256, full_vl_only=True)
+                 if (g.w, g.sew) == cell and _mxf_allocatable(g))
+        plan = mxf_random_plan(g, rng, tier="golden")
+        asm = emit_mxf_test(plan, "probe")
+        tile = rvv_ref.mxf_reference_gemm(g, plan.a, plan.b, plan.c,
+                                          *plan.row, plan.scales_a,
+                                          plan.scales_b, plan.bs)
+        want = rvv_ref.fpw_golden_bytes(g, tile, plan.row[2])
+        nb = g.sew // 8
+        words = [int.from_bytes(bytes(want[i:i + nb]), "little")
+                 for i in range(0, len(want), nb)]
+        got = [int(t, 16) for t in re.findall(
+            r"0x[0-9a-f]+", asm.split("golden C tile")[1])]
+        assert got == words, cell
+        image = mx_scale_image(g, plan.scales_a, plan.scales_b)
+        vdata = asm.split("v0_scales:")[1].split("c_init:")[0]
+        assert [int(t, 16) for t in re.findall(r"0x[0-9a-f]+", vdata)] \
+            == image, cell
+
+
+def check_round_ten_declared_scope() -> None:
+    """Round ten's declared support is what is emitted, and rounds 7-9's
+    programs are unchanged by it."""
+    import constants
+    sup = set(constants.ROUND_TEN_SUPPORTED)
+    assert sup == set(rvv_ref.ROUND_TEN_OFP4_EXTENSIONS) | \
+        set(rvv_ref.ROUND_TEN_MXF_EXTENSIONS), sorted(sup)
+    assert len(sup) == 20
+    assert not sup & (set(constants.ROUND_SEVEN_SUPPORTED)
+                      | set(constants.ROUND_EIGHT_SUPPORTED)
+                      | set(constants.ROUND_NINE_SUPPORTED))
+    # fpw_directed_tiers (rounds seven / eight) never emits an E2M1 cell.
+    insns = constants.ROUND_SEVEN_INSNS + constants.ROUND_EIGHT_INSNS
+    for _n, asm, g in fpw_directed_tiers(256, insns, seed=0):
+        assert (g.w, g.sew) not in rvv_ref.FPW_ROUND_TEN_CELLS, _n
+    # Every mnemonic round ten exercises already existed.
+    assert set(constants.ROUND_TEN_INSNS) <= set(constants.ALL_INSNS)
+
+
 def directed_suite(vlen: int, seed: int = 0,
                    sews: Sequence[int] = (8, 16, 32, 64),
                    lmuls: Sequence[int] = (1, 2, 4, 8),
@@ -4092,9 +4670,15 @@ def directed_suite(vlen: int, seed: int = 0,
         out += int9_directed_tiers(vlen, round_nine, seed,
                                    full_vl_only=full_vl_only, sews=sews,
                                    lmuls=lmuls)
-    # Round nine's narrow floating-point cells, last of all.
+    # Round nine's narrow floating-point cells.
     if FPN_TOKEN in insns:
         out += fpn_directed_tiers(vlen, seed)
+    # Round ten, last of all, keyed on tier tokens like round nine: the
+    # E2M1 cells (vm=1) and the sixteen MXFP extensions (vm=0).
+    if OFP4_TOKEN in insns:
+        out += ofp4_directed_tiers(vlen, seed)
+    if MXF_TOKEN in insns:
+        out += mxf_directed_tiers(vlen, seed)
     return out
 
 
@@ -4317,11 +4901,14 @@ def check_round_eight_declared_scope() -> None:
             assert {row[0].name, row[1].name} <= {"e4m3", "e5m2"}, row
             got.add(ext[(row[2].name,)])
     assert got == supported, sorted(got)
-    # Every E2M1 extension stays unsupported, and its cells unresolved.
+    # Every E2M1 extension was unsupported in round eight (the tuple is
+    # history); round ten resolves the cells -- see ROUND_TEN_SUPPORTED.
     for cell in ((2, 8), (4, 16), (8, 32)):
-        assert cell not in rvv_ref.fpw_resolved_cells(), cell
+        assert cell in rvv_ref.FPW_ROUND_TEN_CELLS, cell
     assert {"Zvvofp4ofp8mm", "Zvvofp4fp16mm", "Zvvofp4bf16mm",
             "Zvvofp4fp32mm"} <= unsupported
+    assert set(rvv_ref.ROUND_TEN_OFP4_EXTENSIONS) <= \
+        set(constants.ROUND_TEN_SUPPORTED)
     # Zvvofp8mm (vfmmacc.vv at SEW=8) is W=1, outside the widening family,
     # and stays unsupported alongside Zvvfp16mm / Zvvbf16mm.
     assert "Zvvofp8mm" in unsupported
@@ -5663,7 +6250,9 @@ def main() -> int:
                   check_round_eight_emission,
                   check_round_eight_declared_scope,
                   check_round_nine_int_emission,
-                  check_round_nine_fpn_emission):
+                  check_round_nine_fpn_emission,
+                  check_round_ten_emission,
+                  check_round_ten_declared_scope):
         check()
         print(f"  ok  {check.__name__}")
 
