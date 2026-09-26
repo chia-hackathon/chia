@@ -2860,6 +2860,21 @@ def fpw_reference_gemm(geom: "TileGeometry", a, b, c,
                 s = _fpw_sum_exact(products)
                 acc = _fpw_add_into(acc, _fpw_reround(s, fmt_c), fmt_c)
             out[i][j] = acc
+    # r29: _fpw_sum_exact / _fpw_add_into hold values as Fractions, so an
+    # exact zero came out +0 even where IEEE 754 6.3 (spec fp_add /
+    # fp_internal_add, 1843-1860) makes it -0 -- (-0) + (-0) = -0.  The
+    # zero signs are taken from fpn_reference_gemm (the same (G, psm, rnd)
+    # with IEEE signed zeros, any W); every other bit must already agree.
+    # Changed no round 1-9 program (r29fix regression); see
+    # MXF_DISCLOSURE zero_seed and check_round_nine_signed_zero.
+    ieee = fpn_reference_gemm(geom, a, b, c, fmt_a, fmt_b, fmt_c)
+    neg0 = 1 << (fmt_c.width - 1)
+    for i in range(geom.m):
+        for j in range(geom.n):
+            if out[i][j] != ieee[i][j]:
+                assert out[i][j] == 0 and ieee[i][j] == neg0, \
+                    (i, j, hex(out[i][j]), hex(ieee[i][j]))
+                out[i][j] = neg0
     return out
 
 
@@ -5967,8 +5982,8 @@ def check_round_nine_negative_controls() -> None:
 # binary32 with one narrowing at the end, and not fused.  That is exactly
 # fpw_reference_gemm at W=1 (groups = LAMBDA*LMUL, W products each), which
 # is what fpn_reference_gemm computes -- with IEEE signed zeros, the one
-# place it differs from rounds seven / eight's fpw_reference_gemm
-# (check_round_nine_signed_zero); check_round_nine_fpn_gemm re-derives it by
+# place it differed from rounds seven / eight's fpw_reference_gemm until
+# r29 (check_round_nine_signed_zero); check_round_nine_fpn_gemm re-derives it by
 # an independent per-k route.
 #
 # OFP8 destination (Zvvofp8mm, the first live cell that ROUNDS to OFP8):
@@ -6382,9 +6397,9 @@ def fpn_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
     fp_round_to_frm(S) in fmt_C (rnd=frm); acc = fp_add(acc, S_bits) in
     fmt_C.  Written against internal (sign, magnitude) values so that a zero
     keeps its sign: -0 + -0 = -0 and 0 x -1 = -0 (IEEE 754 6.3, which the
-    spec's fp_add / fp_mul_exact follow -- 1831-1860).  This is where it
-    parts company with fpw_reference_gemm, whose _fpw_sum_exact collapses a
-    zero to +0; see check_round_nine_signed_zero.
+    spec's fp_add / fp_mul_exact follow -- 1831-1860).  fpw_reference_gemm
+    takes its zero signs from here since r29 (its _fpw_sum_exact collapses
+    a zero to +0); see check_round_nine_signed_zero.
 
     Keyword arguments exist for the negative controls only: *rounder*
     replaces RNE, *acc_fmt* keeps the accumulator in another format and
@@ -6420,11 +6435,10 @@ def fpn_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
 
 
 def check_round_nine_signed_zero() -> None:
-    """fpn_reference_gemm keeps IEEE zero signs; fpw_reference_gemm does not.
+    """fpn_reference_gemm and fpw_reference_gemm keep IEEE zero signs.
 
-    Rounds seven and eight's golden bytes come from fpw_reference_gemm, and
-    they are left byte-identical here; the discrepancy is confined to results
-    that are a zero whose sign IEEE makes negative, and is reported.
+    Until r29 fpw_reference_gemm collapsed every exact zero to +0 (the gap
+    this check used to pin); fixing it moved no round 1-9 program.
     """
     f = fp_format("binary16")
     g = next(x for x in fpn_legal_configs(256, full_vl_only=True)
@@ -6434,7 +6448,7 @@ def check_round_nine_signed_zero() -> None:
     b = [[0x3C00] * g.k_eff for _ in range(g.n_max)]
     c = [[neg0] * g.n_max for _ in range(g.m)]
     assert fpn_reference_gemm(g, a, b, c, f, f, f)[0][0] == neg0
-    assert fpw_reference_gemm(g, a, b, c, f, f, f)[0][0] == 0   # the gap
+    assert fpw_reference_gemm(g, a, b, c, f, f, f)[0][0] == neg0  # r29 fix
     # x + (-x) is +0 under RNE in both.
     a2 = [[0x3C00] * g.k_eff for _ in range(g.m)]
     c2 = [[0xBC00 if g.k_eff == 1 else 0] * g.n_max for _ in range(g.m)]
@@ -6508,7 +6522,7 @@ def check_round_nine_signed_zero() -> None:
 #   So under Titan's disclosure (FP_DISCLOSURE: G=1, psm=0, rnd=frm, the
 #   tuple applies to "unscaled or microscaled operation" alike, 1655-1659):
 #     per sub-dot-product (W products, one block, one step):
-#       S       = exact sum, seeded with fp_internal_zero (see zero_sign)
+#       S       = exact IEEE sum of the products (see zero_seed below)
 #       S_bits  = round_frm(S) in fmt_C
 #       scaled  = round_frm(blk_scale * S_bits) in fmt_C
 #       C       = round_frm(C + scaled) in fmt_C
@@ -6519,12 +6533,29 @@ def check_round_nine_signed_zero() -> None:
 MXF_DISCLOSURE = {
     # (G, psm, rnd) is FP_DISCLOSURE, unchanged, for scaled and unscaled.
     "tuple": "FP_DISCLOSURE (G=1, psm=0, rnd=frm)",
-    # Sail fp_group_sum seeds S with fp_internal_zero() (5015-5017) and the
-    # adoc never says which zero.  Titan: +0, so an all-(-0) group sums to
-    # +0 (+0 + -0 = +0, IEEE 754 6.3).  This is also what rounds seven and
-    # eight's fpw_reference_gemm yields, so the widening cells agree on it.
-    # C <- round(C + S) and the scale multiply keep IEEE zero signs.
-    "zero_seed": "+0",
+    # Sign of an all-zero group sum (r29 fix; was "+0" when round ten's
+    # judges were built).  The adoc never gives fp_internal_zero a sign:
+    # Sail 4934-4935 "Zero value of the abstract internal FP
+    # representation"; the one signed helper, fp_zero ("Return the positive
+    # zero bit pattern", 4839-4840), is never called.  The normative prose
+    # defines S as a sum of products and nothing else: 1528 "The W
+    # multiplications ... are performed and their products summed", 1561-
+    # 1565 "the group dot product is reduced into a partial sum S ... the
+    # contributing products and sums are computed in sufficiently precise
+    # internal form" -- no extra addend.  So fp_internal_zero is the
+    # additive identity of an exact sum of the products, and the sign of an
+    # exact zero sum is IEEE 754-2019 6.3's ("When the sum of two operands
+    # with opposite signs ... is exactly zero, the sign of that sum shall be
+    # +0 in all rounding-direction attributes except roundTowardNegative;
+    # under that attribute ... -0.  However, x + x = x - (-x) retains the
+    # same sign as x even when x is zero"): all products -0 -> S = -0 under
+    # every frm; otherwise +0 under RNE/RTZ/RUP/RMM, -0 under RDN.  Then
+    # C <- round(C + S): -0 + -0 = -0 (every frm), so C = -0 survives an
+    # all-(-0) group.  This is also round nine's fpn_reference_gemm (no
+    # seed) and, since r29, fpw_reference_gemm's.  Only RNE is generated.
+    "zero_seed": "none (additive identity; IEEE 754 6.3 zero sign)",
+    "zero_sum_sign": {"all -0 products": "-0 (every frm)",
+                      "mixed zero signs": "+0 (rne/rtz/rup/rmm), -0 (rdn)"},
     # E8M0 -> fmt_C conversion and the paired multiply are the IME's
     # (rounded in fmt_C under frm), not OCP 6.1's exact X(A)X(B): a scale
     # outside fmt_C's range saturates / overflows / underflows per fmt_C.
@@ -6678,6 +6709,7 @@ R10_CONTROLS = (
     "scale_exact",    # OCP-style exact X(A)X(B)*S, no fmt_C rounding
     "rnd_xct",        # S not rounded before scaling (rnd=xct, not frm)
     "per_op",         # every product rounded to fmt_C and added one by one
+    "zero_seed_pos",  # S seeded with +0: an all-(-0) group sums to +0
 )
 
 
@@ -6734,7 +6766,8 @@ def mxf_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
 
     Loop nest as the Sail: j, i, block s, LMUL=1 step, sub-dot-product g0
     (G=1).  Internal values are (kind, sign, |value|) so zeros keep their
-    sign through fp_mul / fp_add; S is seeded with +0 (MXF_DISCLOSURE).
+    sign through fp_mul / fp_add; S is the IEEE sum of the products with no
+    seed, so an all-(-0) group sums to -0 (MXF_DISCLOSURE zero_seed).
     *bad* selects negative-control sabotages (R10_CONTROLS); empty for the
     architecture.
     """
@@ -6788,7 +6821,11 @@ def mxf_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
                     for g0 in range((lo - step_lo) // w,
                                     (hi - step_lo) // w + 1):
                         k0 = step_lo + g0 * w
-                        s_int = ("num", 0, Fraction(0))   # fp_internal_zero
+                        # fp_internal_zero is the additive identity: S is
+                        # the products' IEEE sum (MXF_DISCLOSURE zero_seed).
+                        # zero_seed_pos is the +0-seeded mistake.
+                        s_int = (("num", 0, Fraction(0))
+                                 if "zero_seed_pos" in bad else None)
                         for k in range(k0, k0 + w):
                             ka = k ^ 1 if ("nibble_swap" in bad
                                            and fmt_a.width == 4) else k
@@ -6796,10 +6833,11 @@ def mxf_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
                                          _r10_val(b[j][k], fmt_b, bad))
                             if "per_op" in bad:
                                 p = _ieee_val(rnd(p), fmt_c)
-                                s_int = _ieee_val(rnd(_ieee_add(s_int, p)),
-                                                  fmt_c)
+                                s_int = p if s_int is None else _ieee_val(
+                                    rnd(_ieee_add(s_int, p)), fmt_c)
                             else:
-                                s_int = _ieee_add(s_int, p)
+                                s_int = (p if s_int is None
+                                         else _ieee_add(s_int, p))
                         if "rnd_xct" in bad:
                             s_val = s_int                   # rnd=xct
                         else:
@@ -6826,8 +6864,10 @@ def ofp4_special_case(geom: "TileGeometry", row, rng: random.Random):
         (E4M3: 448 + 36*W > 448 -> NaN 0x7F under nonsat; E5M2 -> Inf).
       * A row 1 all +0.5 (0x1, the subnormal) -- a flush-to-zero decoder
         loses it.
-      * A row 2 all -0 (0x8) with C row 2 all -0: S is +0 (seeded +0), so
-        C = -0 + +0 = +0 -- the zero-sign disclosure, pinned.
+      * A row 2 all -0 (0x8) with C row 2 all -0: at (2, 0) (B column 0
+        all +6.0) every product is -0, so S = -0 and C = -0 + -0 = -0 --
+        the zero-sign disclosure (MXF_DISCLOSURE zero_seed) pinned; a
+        +0-seeded sum gives +0 there (control zero_seed_pos).
       * A row 3 alternating -6.0 / +6.0 (0xF, 0x7): cancellation.
       * C[4][0] = fmt_C default NaN, C[4][1] = +Inf (or max where fmt_C has
         no Inf): NaN / Inf through the accumulation.
@@ -7022,7 +7062,41 @@ def mxf_special_case(geom: "TileGeometry", row, bs: int, rng: random.Random):
         a[wr] = [fpf_round(Fraction(1), fmt_a, FP_FRM)] * geom.k_eff
         b[wc] = [fpf_round(Fraction(1), fmt_b, FP_FRM)] * geom.k_eff
         c[wr][wc] = 0
+    # The zero-sign witness (r29; last, so nothing above moves): at
+    # mxf_zero_witness's (1, zc), B column zc is a signed zero opposite in
+    # sign to A row 1 element by element, so every product is -0, and C
+    # there is -0.  Scale row 1 is 0x00 and column zc's is random +-3, so
+    # the combined scale is finite and >= +0 in every fmt_C: the answer is
+    # -0 (S = -0, scale * -0 = -0, -0 + -0 = -0); a +0-seeded S gives +0.
+    zw = mxf_zero_witness(geom)
+    if zw is not None:
+        zr, zc = zw
+        sgn_a, sgn_b = 1 << (fmt_a.width - 1), 1 << (fmt_b.width - 1)
+        assert all(_ieee_val(x, fmt_a)[0] == "num" for x in a[zr]), a[zr]
+        b[zc] = [0 if x & sgn_a else sgn_b for x in a[zr]]
+        c[zr][zc] = 1 << (row[2].width - 1)
     return a, b, c, sa, sb
+
+
+def mxf_zero_witness(geom: "TileGeometry"):
+    """(1, column) of mxf_special_case's zero-sign witness, or None.
+
+    Row 1: scale_A 0x00 (finite, >= +0, in every fmt_C) and finite A in
+    both element plants.  Column: the first from 3 up clear of every
+    scale_B / element plant (columns 0-2, the NaN column, N-1, the per-op
+    column and the E8M0 witness column).
+    """
+    if geom.m < 2:
+        return None
+    _nr, nan_col = mxf_nan_positions(geom)
+    busy = {0, 1, 2, nan_col, geom.n - 1, mxf_perop_position(geom)[1]}
+    wit = mxf_e8m0_witness(geom)
+    if wit is not None:
+        busy.add(wit[1])
+    for col in range(3, geom.n):
+        if col not in busy:
+            return 1, col
+    return None
 
 
 def _r10_positive_values(fmt: FpFormat):
@@ -7369,9 +7443,9 @@ def _r10_geom(cell, kind, need_blocks=1, bs=0, vlen=256):
 def check_round_ten_sail_equivalence() -> None:
     """mxf_reference_gemm against the references it must agree with.
 
-    1. Unscaled, on round seven / eight cells: equal to fpw_reference_gemm
-       except where a result is a zero whose sign differs (the IEEE fp_add
-       vs fpw's collapsed zero; see MXF_DISCLOSURE zero_seed).
+    1. Unscaled, on round seven / eight cells: equal to fpw_reference_gemm,
+       bit for bit, zero signs included (since r29; the count returned is
+       of zero-sign differences and must be 0).
     2. Scaled with every scale 0x7F (2^0): equal to unscaled, bit for bit
        (fp_mul(1.0, S_bits) is exact).
     3. Scaled, exact-tier cases: equal to the integer closed form.
@@ -7390,10 +7464,8 @@ def check_round_ten_sail_equivalence() -> None:
                 for i in range(g.m):
                     for j in range(g.n_max):
                         if x[i][j] != y[i][j]:
-                            sb = 1 << (row[2].width - 1)
-                            assert (x[i][j] | sb) == (y[i][j] | sb) and \
-                                (x[i][j] & ~sb) == 0, (cell, i, j)
                             zero_sign += 1
+    assert zero_sign == 0, zero_sign
     for cell in MXF_CELLS:
         for bs in (0, 1):
             g = _r10_geom(cell, "mxf", bs=bs)
@@ -7457,8 +7529,27 @@ def check_round_ten_special_values() -> None:
             out = mxf_reference_gemm(g, a, b, c, *row)
             if row[2].name == "e4m3":
                 assert out[0][0] == 0x7F, hex(out[0][0])
-            # Row 2: all -0 products, C = -0: S = +0, -0 + +0 = +0.
-            assert out[2][0] == 0, (cell, hex(out[2][0]))
+            # Row 2 x column 0: all -0 products, C = -0: S = -0 and
+            # -0 + -0 = -0 (MXF_DISCLOSURE zero_seed); +0-seeded gives +0.
+            neg0 = 1 << (row[2].width - 1)
+            assert out[2][0] == neg0, (cell, hex(out[2][0]))
+            assert mxf_reference_gemm(g, a, b, c, *row,
+                                      bad={"zero_seed_pos"})[2][0] == 0
+    # Scaled zero-sign witness (mxf_zero_witness): -0 there, +0 if seeded.
+    for cell in MXF_CELLS:
+        for bs in (0, 1):
+            g = _r10_geom(cell, "mxf", bs=bs)
+            zw = mxf_zero_witness(g)
+            if zw is None:
+                continue
+            for key, row in fpw_rows(*cell).items():
+                a, b, c, sa, sb = mxf_special_case(g, row, bs, rng)
+                neg0 = 1 << (row[2].width - 1)
+                out = mxf_reference_gemm(g, a, b, c, *row, sa, sb, bs)
+                bad = mxf_reference_gemm(g, a, b, c, *row, sa, sb, bs,
+                                         bad={"zero_seed_pos"})
+                assert out[zw[0]][zw[1]] == neg0, (cell, bs, key)
+                assert bad[zw[0]][zw[1]] == 0, (cell, bs, key)
 
 
 def _r10_rows(cell, limit=4):
@@ -7602,6 +7693,8 @@ def r10_required(bad: str, geom: "TileGeometry", row, bs) -> bool:
         every partial sum is exact, or W = 2 with every product exact in
         fmt_C (then per-op rounding is the one rounding of S): E2M1 ->
         E4M3 (W=2), OFP8 -> bfloat16 (W=2), plus the rnd_xct list.
+      * zero_seed_pos needs the special tier's zero-sign witness: unscaled
+        M > 2, N > 1 (ofp4_special_case (2, 0)); scaled mxf_zero_witness.
     check_round_ten_blind_spots proves each absence.
     """
     if not r10_control_applies(bad, row, bs):
@@ -7617,6 +7710,10 @@ def r10_required(bad: str, geom: "TileGeometry", row, bs) -> bool:
     if bad == "per_op":
         return (geom.m > 1 and geom.n > 1
                 and r10_perop_witness(row, geom.w) is not None)
+    if bad == "zero_seed_pos":
+        if bs is None:          # ofp4_special_case's (2, 0) pin
+            return geom.m > 2 and geom.n > 1
+        return mxf_zero_witness(geom) is not None
     return True
 
 

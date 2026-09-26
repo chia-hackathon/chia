@@ -3460,7 +3460,8 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
             "#   max 6.0, one subnormal 0.5, 0x8 = -0; two per byte, element",
             "#   2n in the low nibble (spec 1206-1219); altfmt_A/B = 1 reserved.",
             "# Judged by rvv_ref.mxf_reference_gemm (Sail fp_gemm, G=1 psm=0",
-            "#   rnd=frm; group sum seeded +0, rvv_ref.MXF_DISCLOSURE).",
+            "#   rnd=frm; group sum = IEEE sum of the products, no +0 seed,",
+            "#   so all -0 products give -0; rvv_ref.MXF_DISCLOSURE).",
         ]
         if geom.sew == 8:
             head += [
@@ -4213,7 +4214,8 @@ def emit_mxf_test(plan: MxfPlan, name: str = "ime_mxf") -> str:
         "# scale_A and scale_B (E8M0, bias 127, 0xFF = NaN) are converted to",
         f"# {fmt_c.name} under frm and multiplied there; a NaN product forces",
         "# the element to the default NaN; each sub-dot-product of W exact",
-        "# products (sum seeded +0) is rounded to fmt_C, multiplied by the",
+        "# products (IEEE sum, no +0 seed: all -0 gives -0) is rounded to",
+        "# fmt_C, multiplied by the",
         "# block scale in fmt_C (rounded), then C = round(C + that).",
         "# Element formats: OCP MX v1.0 (specs/ime/ocp-mx-v1.0.txt) -- E2M1",
         "#   bias 1, no Inf/NaN, max 6.0, subnormal 0.5, two per byte with",
