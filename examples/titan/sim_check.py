@@ -648,9 +648,44 @@ def _printf(machine: Machine) -> str:
     return "".join(out)
 
 
+def _warl_lambda(vlen: int, sew: int, requested: int, current: int) -> int:
+    """The lambda a vtype write selects -- spec 1034-1062, full support.
+
+    The reference model supports every architecturally permissible lambda
+    (rvv_ref.permissible_lambdas), so a permissible request is retained and
+    anything else is clamped exactly as the write rules say.  Before r26 this
+    model kept whatever was written, which is how the ime_mxl_ tier could
+    demand lambda=1 back at SEW=8/VLEN=256 (EMUL_C=32) and still pass here.
+    """
+    supported = rvv_ref.permissible_lambdas(vlen, sew)
+    if not supported:
+        return 0                      # outside the IME-legal domain
+    if requested == 0:                # preserve-or-initialize
+        return current if current in supported else max(supported)
+    if requested in supported:
+        return requested
+    lower = [l for l in supported if l <= requested]
+    return max(lower) if lower else min(supported)
+
+
+#: The vtype-write lambda selection.  A module global so the negative
+#: control in check_mxl_warl_is_load_bearing can swap in a model that keeps
+#: the requested value verbatim.
+_WARL_LAMBDA = _warl_lambda
+
+
 def _vsetvl(machine: Machine, ops: List[str]) -> None:
     avl = machine.x[_reg(ops[1])]
-    machine.vtype = machine.x[_reg(ops[2])]
+    vtype = machine.x[_reg(ops[2])]
+    offset, width = ime.VTYPE_IME_FIELDS["lambda"]
+    shift, mask = 64 - offset, (1 << width) - 1
+    code = (vtype >> shift) & mask
+    sew = 8 << ((vtype >> 3) & 0x7)
+    lam = _WARL_LAMBDA(machine.vlen, sew, ime.LAMBDA_DECODING[code],
+                       machine.lam)
+    vtype = (vtype & ~(mask << shift)) | (
+        (ime.lambda_imm(lam) if lam else 0) << shift)
+    machine.vtype = vtype
     machine.vl = min(avl, machine.vlmax)
     if ops[0] not in ("x0", "zero"):
         machine.x[_reg(ops[0])] = machine.vl
@@ -807,6 +842,10 @@ def _mx_block_dot(machine: Machine, vs1: int, vs2: int, i: int, j: int,
 
 _MX_BLOCK_DOT = _mx_block_dot
 
+#: Round nine: the arithmetic of vfmmacc.vv's narrow cells, rebindable so
+#: the round-nine FP controls can substitute a wrong accumulator.
+_FPN_GEMM = rvv_ref.fpn_reference_gemm
+
 
 def _linear_c_index(i: int, j: int, geom: TileGeometry) -> int:
     """C indexed as a plain ``i*N_max + j``, the way Titan's RTL does it.
@@ -921,7 +960,7 @@ def _ime(machine: Machine, word: int) -> None:
                 machine.store(addr, width, machine.vget(reg, flat_idx, sew))
         return
 
-    if name in _FP_MACC_W:
+    if name in _FP_MACC_W and (1, sew) not in rvv_ref.FPN_CELLS:
         # Sail fp_gemm (5243-5268) at the Titan disclosure
         # G=1, psm=0, rnd=frm -- see rvv_ref.FP_DISCLOSURE and
         # rvv_ref.fp_gemm_reference, which is the single authority for the
@@ -952,7 +991,11 @@ def _ime(machine: Machine, word: int) -> None:
                 machine.vset(vd, c_flat, sew, acc)
         return
 
-    if name in _FPW_MACC_W:
+    if name in _FPW_MACC_W or name in _FP_MACC_W:
+        # (Round nine: vfmmacc.vv at SEW 8 / 16 -- the W=1 narrow cells in
+        # rvv_ref.FPN_CELLS -- arrives here too, as kind='fpw' with W=1, and
+        # is judged by rvv_ref.fpn_reference_gemm through _FPN_GEMM.)
+        #
         # Round seven.  Sail fp_gemm at the Titan disclosure G=1, psm=0,
         # rnd=frm, with W > 1 -- so unlike the W=1 case above a group is no
         # longer a single product: it is the W products of one
@@ -967,11 +1010,12 @@ def _ime(machine: Machine, word: int) -> None:
         # microscaled blocks follow.  What this block owns is the *register
         # addressing*: pulling A, B and C out of the vector file through the
         # same _AB_INDEX / _C_INDEX globals the negative controls sabotage.
-        w = _FPW_MACC_W[name]
+        w = _FPW_MACC_W.get(name, 1)
         geom = _geometry(machine, w, kind="fpw")
         geom.validate()
         cell = (geom.w, geom.sew)
-        if cell not in rvv_ref.fpw_resolved_cells():
+        if cell not in rvv_ref.fpw_resolved_cells() and \
+                cell not in rvv_ref.fpn_resolved_cells():
             raise SimError(
                 f"{name} at SEW={geom.sew} is an OFP4 (E2M1) cell; E2M1 is "
                 f"defined by OCP MX v1.0, which is not on disk, and this "
@@ -993,7 +1037,9 @@ def _ime(machine: Machine, word: int) -> None:
         # only the active ones would make it invent them.
         c = [[machine.vget(vd, _C_INDEX(i, j, geom), sew)
               for j in range(geom.n_max)] for i in range(geom.m)]
-        out = rvv_ref.fpw_reference_gemm(geom, a, b, c, fmt_a, fmt_b, fmt_c)
+        gemm = (_FPN_GEMM if cell in rvv_ref.FPN_CELLS
+                else rvv_ref.fpw_reference_gemm)
+        out = gemm(geom, a, b, c, fmt_a, fmt_b, fmt_c)
         # ... but only the active columns are written back, because the
         # instruction does not write the others.  Writing the pass-through
         # values would be harmless today and would hide a C-index bug that
@@ -1121,18 +1167,44 @@ def _ime(machine: Machine, word: int) -> None:
     # EEW_A = SEW/W, and the flat index for each side is produced by its own
     # mat_*_idx.  Only the N active columns participate; vta=0 in these
     # tests, so the tail columns keep their pre-instruction values.
+    #
+    # Round nine: the per-operand read is signed() or unsigned() by
+    # vtype.altfmt_A / altfmt_B (Sail 5137-5142; spec 1145-1154), EEW_A may
+    # be 4 (Int4, nibble-packed -- Machine.vget), and SEW may be 64 with
+    # W > 1.  The dot product and the C write-back are the rebindable
+    # globals _INT_DOT / _INT_WRITEBACK so the round-nine negative controls
+    # can sabotage exactly one of them.
     geom = _geometry(machine, _MACC_W[name])
-    eew_ab = geom.eew_ab
     vd, vs1, vs2 = fields["vd"], fields["vs1"], fields["vs2"]
+    ua, ub = machine.altfmt_ab
     for i in range(geom.m):
         for j in range(geom.n):
             c_flat = _C_INDEX(i, j, geom)
             acc = _sext(machine.vget(vd, c_flat, sew), sew)
-            for k in range(geom.k_eff):
-                a = machine.vget(vs1, _AB_INDEX(i, k, geom), eew_ab)
-                b = machine.vget(vs2, _AB_INDEX(j, k, geom), eew_ab)
-                acc += _sext(a, eew_ab) * _sext(b, eew_ab)
-            machine.vset(vd, c_flat, sew, acc)
+            acc += _INT_DOT(machine, vs1, vs2, i, j, geom, ua, ub)
+            machine.vset(vd, c_flat, sew, _INT_WRITEBACK(acc, sew))
+
+
+def _int_dot(machine: Machine, vs1: int, vs2: int, i: int, j: int,
+             geom: TileGeometry, ua: int, ub: int) -> int:
+    """Sail int_block_dot over k = 0 .. K_eff-1, exactly (5127-5145)."""
+    eew = geom.eew_ab
+    total = 0
+    for k in range(geom.k_eff):
+        a = machine.vget(vs1, _AB_INDEX(i, k, geom), eew)
+        b = machine.vget(vs2, _AB_INDEX(j, k, geom), eew)
+        total += (rvv_ref.int_operand(a, eew, ua)
+                  * rvv_ref.int_operand(b, eew, ub))
+    return total
+
+
+def _int_writeback(acc: int, sew: int) -> int:
+    """to_bits(EEW_C, acc): one reduction modulo 2**SEW (Machine.vset)."""
+    return acc
+
+
+_INT_DOT = _int_dot
+_INT_WRITEBACK = _int_writeback
 
 
 # ---------------------------------------------------------------------------
@@ -1148,6 +1220,10 @@ def _fpw_sweep_tier(geom: TileGeometry, seed: int) -> str:
     reaches the accumulator (binary16 / bfloat16).
     """
     tier = ("golden", "exact")[seed % 2]
+    if (geom.w, geom.sew) in rvv_ref.FPN_CELLS:
+        # Round nine: no exact tier exists; alternate golden / special.
+        return ("golden", "special")[seed % 2] if geom.k_eff >= 2 \
+            else "golden"
     if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_EIGHT_CELLS:
         tier = ("golden", "exact", "special")[seed % 3]
     if tier == "exact" and not ime_tests.fpw_exact_emittable(geom):
@@ -1176,8 +1252,11 @@ def simulate(geom: TileGeometry, seed: int = 0) -> Tuple[int, str]:
         rows = rvv_ref.fpw_rows(geom.w, geom.sew)
         key = sorted(rows, key=str)[seed % len(rows)]
         tier = _fpw_sweep_tier(geom, seed)
+        fpn = (geom.w, geom.sew) in rvv_ref.FPN_CELLS
         case = (rvv_ref.fpw_exact_case(geom, rows[key], rng)
                 if tier == "exact"
+                else rvv_ref.fpn_special_case(geom, rows[key], rng)
+                if tier == "special" and fpn
                 else rvv_ref.fpw_special_case(geom, rows[key], rng)
                 if tier == "special"
                 else rvv_ref.fpw_case(geom, rows[key], rng))
@@ -1500,6 +1579,17 @@ def main() -> int:
                                                           full_vl_only=True)
                      if (g.w, g.sew) == cell and g.emul_c != 16
                      and _allocatable(g) and g.m > 1][:1]
+    # ... and one per round-nine integer cell (Int4, Int16/Int32 -> Int64):
+    # a nibble-packed tile or an e64 reference path is a new way for the
+    # compare to be silently vacuous.
+    for cell in rvv_ref.ROUND_NINE_INT_CELLS:
+        controls += [g for g in rvv_ref.int_cell_geometries(args.vlen, cell)
+                     if _allocatable(g) and g.emul_c != 16 and g.m > 1][:1]
+    for cell in rvv_ref.fpn_resolved_cells():
+        controls += [g for g in rvv_ref.fpn_legal_configs(args.vlen,
+                                                          full_vl_only=True)
+                     if (g.w, g.sew) == cell and g.emul_c != 16
+                     and _allocatable(g) and g.m > 1][:1]
     for control in controls:
         check_negative_control(control)
         print(f"  ok  check_negative_control  {control.describe()}")
@@ -1516,12 +1606,21 @@ def main() -> int:
                   check_mx_nibble_order_is_load_bearing,
                   check_mxl_tier,
                   check_mxl_legality_is_load_bearing,
+                  check_mxl_warl_is_load_bearing,
                   check_round_seven_sub_byte_path,
                   check_round_seven_sweep_is_live,
                   check_round_eight_sweep_is_live,
-                  check_round_eight_ofp8_decode_is_load_bearing):
+                  check_round_eight_ofp8_decode_is_load_bearing,
+                  check_round_nine_sweep_is_live):
         check(args.vlen)
         print(f"  ok  {check.__name__}")
+    tally = check_round_nine_int_controls(args.vlen)
+    print("  ok  check_round_nine_int_controls  " + ", ".join(
+        f"{bad} {c}/{n}" for bad, (c, n) in tally.items()))
+    tally = check_round_nine_fpn_controls(args.vlen)
+    print("  ok  check_round_nine_fpn_controls  " + ", ".join(
+        f"{bad} rows {c}/{n} ({f} programs failed)"
+        for bad, (c, n, f) in tally.items()))
 
     tally = {}
     for g in geometries:
@@ -1590,6 +1689,45 @@ def check_mxl_legality_is_load_bearing(vlen: int = 256) -> None:
             f"raises illegal-instruction")
     finally:
         globals()["_ime"] = original
+
+
+def check_mxl_warl_is_load_bearing(vlen: int = 256) -> None:
+    """A model that retains an impermissible lambda must fail the tier.
+
+    r26: at VLEN=256 each ime_mxl_ program asks for LAMBDA=1 at SEW=8, which
+    no implementation may keep (EMUL_C=32; spec 139-145, 975-988, write
+    rules 1050-1054).  Swap the reference model's WARL selection for one that
+    keeps the request verbatim -- what the r25 RTL did -- and require every
+    program to be classified bad_geometry, with the SKIP line naming SEW=8.
+    """
+    import helpers
+
+    class _Run:
+        def __init__(self, log):
+            self.log, self.out, self.success, self.returncode = log, "", \
+                True, 0
+
+    global _WARL_LAMBDA
+    if 1 in rvv_ref.permissible_lambdas(vlen, 8):
+        vlen = 256                    # the probe only exists where L=1 is out
+    original = _WARL_LAMBDA
+    _WARL_LAMBDA = lambda vlen_, sew, requested, current: (  # noqa: E731
+        requested if requested else original(vlen_, sew, requested, current))
+    try:
+        for mnemonic in ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv"):
+            program = assemble(ime_tests.emit_mxl_test(vlen, mnemonic))
+            machine = Machine(vlen=vlen)
+            code = run(program, machine)
+            output = "".join(machine.stdout)
+            verdict = helpers.classify_run(_Run(output))
+            assert (code != ime_tests.EXIT_PASS
+                    and verdict.kind == "bad_geometry"
+                    and (verdict.sew, verdict.requested_lambda,
+                         verdict.selected_lambda) == (8, 1, 1)), (
+                f"ime_mxl_{mnemonic}: a model that keeps lambda=1 at SEW=8, "
+                f"VLEN={vlen} was not convicted: {verdict}\n{output.strip()}")
+    finally:
+        _WARL_LAMBDA = original
 
 
 def _mx_pool(vlen: int):
@@ -1768,6 +1906,13 @@ def _every_geometry(vlen: int):
     _resolved = set(rvv_ref.fpw_resolved_cells())
     yield from (g for g in rvv_ref.fpw_legal_configs(vlen)
                 if (g.w, g.sew) in _resolved)
+    # Round nine's integer tiers, appended last for the same reason: the new
+    # Int4 / Int64 cells over every N, and the signedness rows of all
+    # thirteen cells rotated over every N -- the directed gate's set.
+    yield from (g for _p, g in ime_tests.int9_geometries(
+        vlen, ime_tests.INT9_TOKENS, full_vl_only=False))
+    # ... and the W=1 narrow floating-point cells, every N.
+    yield from rvv_ref.fpn_legal_configs(vlen)
 
 
 def check_round_seven_sub_byte_path(vlen: int = 256) -> None:
@@ -1852,7 +1997,11 @@ def check_round_seven_sweep_is_live(vlen: int = 256) -> None:
     * no unresolved (OFP) cell is, so an extension this implementation
       declares unsupported is never judged.
     """
-    swept = {(g.w, g.sew) for g in _every_geometry(vlen) if g.kind == "fpw"}
+    # W=1 (round nine's narrow vfmmacc.vv cells, rvv_ref.FPN_CELLS) rides
+    # kind='fpw' too but is not part of the widening table; it is checked by
+    # check_round_nine_sweep_is_live.
+    swept = {(g.w, g.sew) for g in _every_geometry(vlen)
+             if g.kind == "fpw" and g.w > 1}
     resolved = set(rvv_ref.fpw_resolved_cells())
     assert resolved, "no resolved cell -- this check would be vacuous"
     assert swept == resolved, (sorted(swept), sorted(resolved))
@@ -1871,9 +2020,25 @@ def check_round_seven_sweep_is_live(vlen: int = 256) -> None:
             f"W={w} SEW={sew} resolved its formats without the OCP "
             f"documents -- FP_FORMAT_TABLE has been populated by guesswork")
 
+def check_round_nine_sweep_is_live(vlen: int = 256) -> None:
+    """Round nine's cells and signedness rows are all in the sweep."""
+    geoms = [g for g in _every_geometry(vlen)
+             if g.emul_c != 16 and _allocatable(g)]
+    fpn = {(g.w, g.sew) for g in geoms if g.kind == "fpw" and g.w == 1}
+    assert fpn == set(rvv_ref.FPN_CELLS), sorted(fpn)
+    assert all(g.mnemonic == "vfmmacc.vv" for g in geoms
+               if g.kind == "fpw" and g.w == 1)
+    rows = {((g.w, g.sew), tuple(g.altfmt_ab)) for g in geoms
+            if g.kind == "int" and g.check == "pair" and g.tload == "op"}
+    for cell in rvv_ref.INT_CELLS:
+        for signs in rvv_ref.INT_SIGNS:
+            assert (cell, signs) in rows, (cell, signs)
+
+
 def check_round_eight_sweep_is_live(vlen: int = 256) -> None:
     """Round eight's OFP8 cells are swept, vf8wmmacc.vv included, E2M1 not."""
-    swept = {(g.w, g.sew) for g in _every_geometry(vlen) if g.kind == "fpw"}
+    swept = {(g.w, g.sew) for g in _every_geometry(vlen)
+             if g.kind == "fpw" and g.w > 1}
     for cell in rvv_ref.FPW_ROUND_EIGHT_CELLS:
         assert cell in swept, cell
     for cell in ((2, 8), (4, 16), (8, 32)):
@@ -1959,6 +2124,167 @@ def check_round_eight_ofp8_decode_is_load_bearing(vlen: int = 256) -> None:
                     total += 1
             assert caught, f"{cell}: {bad_name} DUT passed every program"
             tally.append((cell, bad_name, caught, total))
+    return tally
+
+
+# ---------------------------------------------------------------------------
+# round nine: integer negative controls
+# ---------------------------------------------------------------------------
+
+def _r9_int_pool(vlen: int):
+    """One full-VL program shape per (cell, signedness row), all 13 x 4.
+
+    The shape is the smallest allocatable one with more than one C row and
+    more than one K element, so every control has something to see.
+    """
+    pool = []
+    for cell in sorted(rvv_ref.INT_CELLS):
+        for signs in rvv_ref.INT_SIGNS:
+            for g in rvv_ref.int_cell_geometries(vlen, cell,
+                                                 altfmt_ab=signs):
+                if g.emul_c != 16 and _allocatable(g) and g.m > 1 \
+                        and g.k_eff > 1:
+                    pool.append(g)
+                    break
+    return pool
+
+
+def _r9_bad_dot(bad: str):
+    """A sabotaged Sail int_block_dot for control *bad*."""
+    def dot(machine, vs1, vs2, i, j, geom, ua, ub):
+        eew = geom.eew_ab
+        sa, sb = ua, ub
+        if bad == "ext_swap":
+            sa, sb = 1 - ua, 1 - ub           # sext <-> zext, both operands
+        elif bad == "b_as_signed":
+            sb = 0                            # altfmt_B ignored
+        elif bad == "ab_sign_swap":
+            sa, sb = ub, ua                   # altfmt_A applied to B
+        total = 0
+        for k in range(geom.k_eff):
+            ia, ib = _AB_INDEX(i, k, geom), _AB_INDEX(j, k, geom)
+            if bad == "nibble_order" and eew == 4:
+                ia ^= 1                       # A side: high nibble first
+            if bad == "int4_as_int8" and eew == 4:
+                # The whole byte holding element k, read as an 8-bit value.
+                a = rvv_ref.int_operand(machine.vget(vs1, ia // 2, 8), 8, sa)
+                b = rvv_ref.int_operand(machine.vget(vs2, ib // 2, 8), 8, sb)
+            else:
+                a = rvv_ref.int_operand(machine.vget(vs1, ia, eew), eew, sa)
+                b = rvv_ref.int_operand(machine.vget(vs2, ib, eew), eew, sb)
+            total += a * b
+        return total
+    return dot
+
+
+def _acc32_writeback(acc: int, sew: int) -> int:
+    """An Int64 accumulator that only keeps 32 bits (sign-extended)."""
+    return _sext(acc, 32) if sew == 64 else acc
+
+
+def check_round_nine_int_controls(vlen: int = 256):
+    """Six round-nine mistakes, each run against the emitted programs.
+
+    For every control: every program the mistake *can* affect
+    (rvv_ref.r9_control_applies) must FAIL on the sabotaged model, and --
+    for the three signedness mistakes at W=1, where the architecture makes
+    them invisible -- the program must still PASS, which is the proof that
+    the W=1 blindness is structural and not a weak test.  Every program in
+    the pool PASSes on the correct model first.  Returns
+    {control: (caught, applicable)} for the report.
+    """
+    global _INT_DOT, _INT_WRITEBACK
+    pool = _r9_int_pool(vlen)
+    assert {(g.w, g.sew) for g in pool} == set(rvv_ref.INT_CELLS), vlen
+    for geom in pool:
+        code, out = simulate(geom, seed=0)
+        assert code == ime_tests.EXIT_PASS and "TITAN PASS" in out, \
+            (geom.describe(), out[-300:])
+    tally = {}
+    for bad in rvv_ref.R9_CONTROLS:
+        caught = applicable = 0
+        try:
+            if bad == "acc32":
+                _INT_WRITEBACK = _acc32_writeback
+            else:
+                _INT_DOT = _r9_bad_dot(bad)
+            for geom in pool:
+                code, out = simulate(geom, seed=0)
+                failed = code != ime_tests.EXIT_PASS and "TITAN FAIL" in out
+                if rvv_ref.r9_control_applies(bad, geom):
+                    applicable += 1
+                    assert failed, (bad, geom.describe(), out[-200:])
+                    caught += 1
+                elif bad in ("ext_swap", "b_as_signed", "ab_sign_swap") \
+                        and geom.w == 1:
+                    assert not failed, (bad, geom.describe())
+        finally:
+            _INT_DOT, _INT_WRITEBACK = _int_dot, _int_writeback
+        assert applicable, bad
+        tally[bad] = (caught, applicable)
+    return tally
+
+
+def _r9_fpn_programs(vlen: int):
+    """(cell, row, program) per narrow cell x row: one golden, one special."""
+    progs = []
+    for cell in rvv_ref.fpn_resolved_cells():
+        geoms = [g for g in rvv_ref.fpn_legal_configs(vlen, full_vl_only=True)
+                 if (g.w, g.sew) == cell and g.emul_c != 16
+                 and _allocatable(g)]
+        gold = next(g for g in geoms if g.k_eff >= 2 and g.m > 1)
+        spec = rvv_ref.fpn_special_geometry(geoms)
+        for idx, (key, row) in enumerate(rvv_ref.fpw_rows(*cell).items()):
+            for geom, tier in ((gold, "golden"), (spec, "special")):
+                rng = random.Random(900 + idx)
+                case = (rvv_ref.fpn_special_case(geom, row, rng)
+                        if tier == "special"
+                        else rvv_ref.fpn_case(geom, row, rng))
+                plan = ime_tests.FpwPlan(geom, key, tier, *case, tag="ctl")
+                progs.append((cell, row, geom,
+                              assemble(ime_tests.emit_fpw_test(plan))))
+    return progs
+
+
+def check_round_nine_fpn_controls(vlen: int = 256):
+    """Six narrow-FP mistakes, each run against emitted programs.
+
+    Every program passes on the correct model; for every control and every
+    (cell, encoding row) it applies to, at least one of that row's two
+    programs (golden, special) must FAIL -- so no row of any cell is blind
+    to any of them.  Returns {control: (rows caught, rows applicable,
+    programs failed)}.
+    """
+    global _FPN_GEMM
+    progs = _r9_fpn_programs(vlen)
+    for cell, row, geom, prog in progs:
+        machine = Machine(vlen=vlen)
+        code = run(prog, machine)
+        out = "".join(machine.stdout)
+        assert code == ime_tests.EXIT_PASS and "TITAN PASS" in out, \
+            (cell, [f.name for f in row], out[-300:])
+    tally = {}
+    for bad in rvv_ref.FPN_CONTROLS:
+        rows_hit, rows_app, failed = set(), set(), 0
+        _FPN_GEMM = (lambda bad_: lambda *args:
+                     rvv_ref.fpn_sabotaged_gemm(bad_, *args))(bad)
+        try:
+            for cell, row, geom, prog in progs:
+                if not rvv_ref.fpn_control_applies(bad, geom, row):
+                    continue
+                rid = (cell, tuple(f.name for f in row))
+                rows_app.add(rid)
+                machine = Machine(vlen=vlen)
+                code = run(prog, machine)
+                if code != ime_tests.EXIT_PASS and \
+                        "TITAN FAIL" in "".join(machine.stdout):
+                    rows_hit.add(rid)
+                    failed += 1
+        finally:
+            _FPN_GEMM = rvv_ref.fpn_reference_gemm
+        assert rows_app and rows_hit == rows_app, \
+            (bad, sorted(rows_app - rows_hit))
+        tally[bad] = (len(rows_hit), len(rows_app), failed)
     return tally
 
 

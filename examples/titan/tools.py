@@ -197,8 +197,12 @@ def write_status(status_path: str,
             where = f" at C[{outcome.row},{outcome.col}]" \
                 if outcome.row is not None else ""
             if outcome.kind == "bad_geometry":
+                # r26: the SEW the verdict line named, which for a
+                # multi-case program need not be the nominal geometry below.
                 where = (f": requested lambda={outcome.requested_lambda}, "
-                         f"DUT selected lambda={outcome.selected_lambda}")
+                         f"DUT selected lambda={outcome.selected_lambda}"
+                         + (f" at VLEN={outcome.vlen} SEW={outcome.sew}"
+                            if outcome.sew is not None else ""))
             lines.append(f"  {name}: {outcome.kind}{where}")
             if geom is not None:
                 lines.append(f"      {geom.describe()}")

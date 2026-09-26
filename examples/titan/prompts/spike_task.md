@@ -59,6 +59,42 @@ Its funct3 is **OPFVV (0x1), not OPIVV**, unlike every instruction so far.
 NaNs canonicalise and `fflags` OR across active elements, but the directed
 tests do not compare `fflags` either way.
 
+## Round nine: the rest of the integer table, and the narrow `vfmmacc.vv` cells
+
+Round nine adds no mnemonic. Everything since round one above is the
+regression surface; the new *cells and rows* of instructions you already
+have are the work (spec 810-844 tbl-extensions; tbl-int-encoding-map
+7389-7455; tbl-fp-encoding-map 7296-7311):
+
+- **Signedness is `vtype.altfmt_A` / `vtype.altfmt_B`** (`vtype[XLEN-6]`,
+  `vtype[XLEN-7]`; 0 = signed, 1 = unsigned, independent per operand; C is
+  always signed -- spec 486, 1145-1154, 7375). Not a mnemonic, not `vm`.
+  Only `vsetvl` reaches those bits. Sail `int_block_dot` (5127-5145) reads
+  each operand with `signed()` or `unsigned()` accordingly. All four rows
+  are legal for all thirteen integer cells. At W=1 the choice cannot change
+  a result bit (products and sums wrap at 2^SEW), so those programs only
+  check the encoding is accepted; at W>1 it is arithmetic. Directed names:
+  `ime_sg{su|us|uu}_w{W}_...` (e.g. `su` = A signed, B unsigned).
+- **Int4 cells**: `vwmmacc.vv` at SEW=8 (Zvvi4i8mm), `vqmmacc.vv` at SEW=16
+  (Zvvi4i16mm), `v8wmmacc.vv` at SEW=32 (Zvvi4i32mm). Two elements per
+  byte, element 2n in the LOW nibble, 2n+1 in the high nibble (spec
+  1206-1219); `vmtl.v` still moves SEW-wide storage elements. Names
+  `ime_i4w_`, `ime_i4q_`, `ime_i48w_`.
+- **Int64 cells**: `vqmmacc.vv` at SEW=64 (Int16 -> Int64, Zvvi16i64mm) and
+  `vwmmacc.vv` at SEW=64 (Int32 -> Int64, Zvvi32i64mm). One reduction of the
+  exact sum modulo 2^64 (spec 487, 1275-1277) -- never 2^32. Names
+  `ime_i64q_`, `ime_i64w_`.
+- **`vfmmacc.vv` at SEW=16 and SEW=8** (Zvvfp16mm, Zvvbf16mm, Zvvofp8mm):
+  binary16 / bfloat16 / mixed inputs into a binary16 or bfloat16 C selected
+  by `altfmt` ((0,0,1) and (1,1,0) are reserved), and E4M3/E5M2 inputs into
+  an E4M3 (`altfmt`=0) or E5M2 (`altfmt`=1) C. Same (G, psm, rnd) =
+  (1, 0, frm) as round four: per k, the exact product is rounded to the C
+  format, then added and rounded again **in the C format** -- not in binary32
+  with one narrowing at the end. IEEE signed zeros (-0 + -0 = -0). For an
+  OFP8 C the disclosed choices are: overflow non-saturating (E4M3 -> NaN,
+  E5M2 -> Inf), default NaN E4M3 0x7F / E5M2 0x7E, RNE only. These programs
+  embed expected bytes (`ime_fpn_golden_`, `ime_fpn_special_`).
+
 ## Suggested order
 
 1. **`vtype` first.** Add `lambda[2:0]`, `bs`, `altfmt_A` and `altfmt_B` at
@@ -120,6 +156,7 @@ independence is what makes an agreement between the three worth anything.
 
 From round seven onwards the directed programs for the widening
 floating-point instructions (`vfwmmacc.vv`, `vfqmmacc.vv`, `vf8wmmacc.vv`)
+-- and from round nine the narrow `vfmmacc.vv` cells (`ime_fpn_*`) --
 carry *embedded expected bytes*: the result of each multiply-accumulate,
 precomputed by the Titan reference model and compared with `memcmp`, because
 a narrow accumulator (OFP8, binary16, bfloat16) cannot be recomputed on the

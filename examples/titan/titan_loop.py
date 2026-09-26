@@ -121,6 +121,65 @@ PPA_SYNTH_WIRED = False
 #: continuing costs a build per iteration for nothing.
 LLM_MAX_CONSECUTIVE_FAILURES = 2
 
+#: No-progress stop (r26).  Stage 0 of r26_0926_0144 ran 25 attempts ($458)
+#: whose results were identical from attempt 2 on -- 795 pass / 1 skip /
+#: 2 bad_geometry, same two failing names -- because the agent had concluded
+#: (correctly) that the judge was wrong and stopped editing.  Iterating
+#: cannot fix that, so K consecutive graded attempts with the same counts and
+#: the same failing set end the stage.  0 disables it.
+NO_PROGRESS_STOP = int(os.environ.get("TITAN_NO_PROGRESS_STOP", "3"))
+
+#: Set by the first stage that stalls; copied into the run summary as
+#: ``result["stalled"]``.  Reset at the top of :func:`run`.
+_STALLED: Dict[str, object] = {}
+
+
+class _StallTracker:
+    """Counts consecutive graded attempts with an identical outcome.
+
+    An outcome is ``(counts, failing set)`` -- plus, for S2, the confirmed
+    regression failures -- so a changed count *or* a different failing name
+    is progress.  Attempts that were never graded (LLM failure) are not
+    observed at all; a build failure is observed as its own outcome, so it
+    breaks a streak of graded results rather than extending it.
+    """
+
+    def __init__(self, stage: str, limit: Optional[int] = None):
+        self.stage = stage
+        self.limit = NO_PROGRESS_STOP if limit is None else limit
+        self.key = None
+        self.streak = 0
+        self.first = 0
+
+    def observe(self, attempt: int, counts: Dict[str, int],
+                failing: Sequence[str], extra: Sequence[str] = ()
+                ) -> Optional[Dict[str, object]]:
+        key = (tuple(sorted((k, int(v)) for k, v in counts.items())),
+               tuple(sorted(failing)), tuple(sorted(extra)))
+        if key == self.key:
+            self.streak += 1
+        else:
+            self.key, self.streak, self.first = key, 1, attempt
+        if self.limit and self.limit > 0 and self.streak >= self.limit:
+            return {"stage": self.stage, "attempts": [self.first, attempt],
+                    "consecutive": self.streak, "limit": self.limit,
+                    "counts": dict(key[0]), "failing": list(key[1]),
+                    "s2_failing": list(key[2]),
+                    "reason": (f"{self.streak} consecutive attempts "
+                               f"({self.first}..{attempt}) produced the "
+                               f"identical outcome; stopping "
+                               f"(TITAN_NO_PROGRESS_STOP={self.limit})")}
+        return None
+
+
+def _stall(info: Dict[str, object]) -> None:
+    """Record the first stall of the run and emit it to the trace."""
+    if not _STALLED:
+        _STALLED.update(info)
+    _event("stage_stalled", **{k: v for k, v in info.items()
+                               if isinstance(v, (int, float, str, bool))})
+    print(f"[stall] {info['stage']}: {info['reason']}", flush=True)
+
 
 def _llm_call_failed(cli) -> bool:
     """True when the backend reported the turn itself failed.
@@ -1260,6 +1319,7 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
     # where its bash tool can read it.
     best = {"passed": -1, "attempt": 0}
     regression = ""
+    stall = _StallTracker(label)
     for attempt in range(1, max_iters + 1):
         _event("section_start", name=f"{label}:iter{attempt}")
         # No guard on `message`: the implement stage enters with none, and a
@@ -1363,6 +1423,7 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
                   getattr(artifact, "stdout", "") or "")
         if not artifact.success:
             _event("build_failure", attempt=attempt)
+            stall.observe(attempt, {"build_failure": 1}, ())
             path = _publish_logs(
                 run_id, f"iter{attempt}", pg_opts,
                 build_stdout=getattr(artifact, "stdout", "") or "",
@@ -1413,6 +1474,11 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
             logs=logs, status_path=status_path, summary=summary)
 
         if summary["failing"]:
+            stalled = stall.observe(attempt, summary["counts"],
+                                    summary["failing"])
+            if stalled:
+                _stall(stalled)
+                return False, artifact
             message = helpers.format_directed_failure(attempt + 1, outcomes,
                                                       logs, log_path=path)
             continue
@@ -1423,9 +1489,17 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
         # for one elaboration, not two.  The harness config is the loop's,
         # written into the tree here -- see _write_s2_cosim_config and
         # _run_s2 (shared with _rtl_resume's attempt-0 pre-run).
-        _, frag = _run_s2(dump, label, attempt, pg_opts, run_id,
-                          rvv_failing_path=rvv_failing_path)
+        s2_fail, frag = _run_s2(dump, label, attempt, pg_opts, run_id,
+                                rvv_failing_path=rvv_failing_path)
         if frag is not None:
+            # A cosim build failure (s2_fail None) is its own outcome.
+            stalled = stall.observe(
+                attempt, summary["counts"], summary["failing"],
+                ["<cosim build failure>"] if s2_fail is None
+                else [n for n, _, _ in s2_fail])
+            if stalled:
+                _stall(stalled)
+                return False, artifact
             message = frag
             continue
 
@@ -1695,6 +1769,7 @@ def _model_stage(dump: helpers.Dumper, status_path: str, tool_list,
     message = None
     artifact = None
     llm_failures = 0
+    stall = _StallTracker("model")
 
     for attempt in range(1, max_iters + 1):
         finish_tool.reset()
@@ -1725,6 +1800,7 @@ def _model_stage(dump: helpers.Dumper, status_path: str, tool_list,
                   getattr(artifact, "stdout", "") or "")
         if not artifact.success:
             _event("model_build_failure", attempt=attempt)
+            stall.observe(attempt, {"build_failure": 1}, ())
             message = helpers.format_build_failure(artifact, attempt + 1)
             continue
 
@@ -1735,6 +1811,16 @@ def _model_stage(dump: helpers.Dumper, status_path: str, tool_list,
         dump.json(f"model_attempt{attempt}.json", summary)
         _event("model_iter", attempt=attempt, **summary["counts"])
 
+        skipped = sum(1 for _, o in outcomes if o.kind == "skip")
+        converging = (not summary["failing"] and not (
+            outcomes and skipped / len(outcomes) > MODEL_MAX_SKIP_FRACTION))
+        if not converging:
+            stalled = stall.observe(attempt, summary["counts"],
+                                    summary["failing"])
+            if stalled:
+                _stall(stalled)
+                return False, artifact
+
         if summary["failing"]:
             message = helpers.format_directed_failure(attempt + 1, outcomes,
                                                       logs)
@@ -1743,7 +1829,6 @@ def _model_stage(dump: helpers.Dumper, status_path: str, tool_list,
         # Everything passed -- but a model that clamps LAMBDA everywhere
         # passes by declining to be tested, and would then agree with any RTL
         # in Stage 3 for the same empty reason.
-        skipped = sum(1 for _, o in outcomes if o.kind == "skip")
         if outcomes and skipped / len(outcomes) > MODEL_MAX_SKIP_FRACTION:
             _event("model_skip_rate", attempt=attempt, skipped=skipped)
             message = (
@@ -2148,6 +2233,7 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
     result: Dict[str, object] = {"run_id": run_id, "vlen": vlen,
                                  "converged": False}
     all_tools: List[object] = []
+    _STALLED.clear()
     try:
         _event("run_start", run_id=run_id, vlen=vlen)
         # Reset once, at the top.  Not between stages: the model stage's edits
@@ -2349,6 +2435,8 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
         result["converged"] = True
         return result
     finally:
+        if _STALLED:
+            result["stalled"] = dict(_STALLED)
         _event("run_end", **{k: v for k, v in result.items()
                              if isinstance(v, (int, float, str, bool))})
         for tool in all_tools:
@@ -2441,7 +2529,7 @@ def _render_summary(run_id: str, result: Dict[str, object]) -> str:
     for key in ("vlen", "model", "model_digest", "rtl_source", "rtl_digest",
                 "s1_s2", "regression_confirm", "gate", "gate_failure",
                 "stress_done",
-                "stress_failure",
+                "stress_failure", "stalled",
                 "converged"):
         if key in result:
             lines.append(f"- **{key}**: {result[key]}")

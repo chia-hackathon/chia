@@ -151,12 +151,13 @@ agent 生出成本與編輯都不在帳上的 sub-agent。見本分支的第一�
 | `r17_round5_rtl.diff` | 第五輪（C tile 讀回、修轉置）收斂的 RTL（只含 RTL 半邊） |
 | `r19_round6_last_attempt.diff` | 第六輪（MX）最後一次嘗試的模型 + RTL（該輪未收斂） |
 | `r21_round7.diff` | 第七輪（`vfwmmacc`/`vfqmmacc`）的模型 + RTL，由 r23 完整收斂驗證 |
-| `r24_round8_final.diff` | **第八輪，最終 15 條指令設計**（OFP8，模型 + RTL），r24 收斂、r25 以 1,024 支 S3 重驗 |
+| `r24_round8_final.diff` | 第八輪，15 條指令設計（OFP8，模型 + RTL），r24 收斂、r25 以 1,024 支 S3 重驗 |
+| `r27_round9_final.diff` | **第九輪，最終設計**（整數 13/13 cell、unsigned/混號、W=1 FP16/BF16/OFP8 累加器；模型 + RTL），r27 收斂 |
 | `round3_design.md` | 全 15 條指令調查、第三輪批次決策、依賴的 SAIL 行號、編碼與實作 |
 | `r15_full_verify.json` | 最終驗證結果（directed 80/80、S2 full 837/0、排除清單） |
 | `ledger.md` | 前 19 次 run（到 r15）的時間 / 成本 / 結果，含逐列敘述（累計 46h11m、$837.13） |
-| `run_ledger.md` | **全部 26 次 run**（r1–r25）的時間 / 成本 / 結果（累計 94h39m、$1,164.07），由 `titan_runs/tools/ledger.py` 產生 |
-| `rounds.json` | 第六至八輪逐 run 的結構化紀錄（階段結果、成本、發現、更正） |
+| `run_ledger.md` | **全部 run**（r1–r27）的時間 / 成本 / 結果，由 `titan_runs/tools/ledger.py` 產生 |
+| `rounds.json` | 第六至九輪逐 run 的結構化紀錄（階段結果、成本、發現、更正） |
 | `report_data.md` | 全語料庫的逐項證據與根因分析 |
 | `ppa_method.md` / `ppa_results.json` | 結構性 RTL proxy 比較的方法與結果（非真實 PPA） |
 | `report.html` | 已發布的完整報告 |

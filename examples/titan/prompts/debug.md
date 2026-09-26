@@ -67,6 +67,18 @@ dimension; one that appears everywhere points at something structural.
   1990-1993, and note it has no zero, infinity or subnormal encoding: byte
   0x00 is the ordinary finite value 2^-127, and only 0xFF is NaN.)
 
+- **Round nine: a W>1 integer test that fails only in its `ime_sg*`
+  variants, or only in some of them.** Check the `vtype.altfmt_A` /
+  `altfmt_B` read before the multiplier: `su`/`us` failing symmetrically
+  means the bits are ignored, `su` failing where `us` passes (or the
+  reverse) means A and B are swapped, `uu` alone failing means
+  sign- vs zero-extension is inverted. An Int4 cell that is wrong by a
+  permutation of K is the nibble order (element 2n is the LOW nibble, spec
+  1206-1219); an Int64 cell whose upper 32 bits are the sign of the lower
+  half is a 32-bit accumulator. A narrow `vfmmacc.vv` (`ime_fpn_*`) that is
+  off by an ulp in most elements is rounding in binary32 and narrowing once,
+  instead of rounding every term in the C format.
+
 ## Reading a directed failure
 
 The message gives you one line per failing test — geometry, the coordinate of

@@ -102,6 +102,17 @@ def _every_geometry(vlen: int) -> Iterator[TileGeometry]:
     resolved = set(rvv_ref.fpw_resolved_cells())
     yield from (g for g in rvv_ref.fpw_legal_configs(vlen)
                 if (g.w, g.sew) in resolved)
+    # Round nine's integer tiers, appended last for the same reason: the
+    # Int4 / Int64 cells at every N, and the unsigned / mixed-sign rows of
+    # all thirteen cells rotated over every N -- the directed gate's set,
+    # from the one function that defines it.  They ride the ordinary paired
+    # program; rvv_ref.random_case reads the geometry's altfmt_ab.
+    yield from (g for _p, g in ime_tests.int9_geometries(
+        vlen, ime_tests.INT9_TOKENS, full_vl_only=False))
+    # ... and vfmmacc.vv's W=1 narrow floating-point cells (binary16,
+    # bfloat16, OFP8 accumulators), every N; generate() handles them as
+    # kind='fpw' golden programs (no exact tier reaches a narrow C).
+    yield from rvv_ref.fpn_legal_configs(vlen)
 
 
 def _allocatable(geom: TileGeometry) -> bool:
@@ -125,7 +136,12 @@ def generate(vlen: int, count: int, seed: int = 0
         # the name back to confirm the geometry it was generated from.
         kind = {"int": "", "fp": "_fp", "mx": "_mx",
                 "fpw": "_fpw"}[geom.kind]
-        name = (f"stress_{index:06d}_sew{geom.sew}{widen}{trans}{kind}"
+        # Round nine: a signedness row other than the signed default is
+        # named, so the pool can be bisected by row.  Empty for every
+        # earlier geometry.
+        sgn = ("" if tuple(geom.altfmt_ab) == (0, 0) else
+               "_sg" + "".join("su"[v] for v in geom.altfmt_ab))
+        name = (f"stress_{index:06d}_sew{geom.sew}{widen}{trans}{kind}{sgn}"
                 f"_lam{geom.lam}_lmul{geom.lmul}_n{geom.n}")
         if geom.kind == "mx":
             # A microscaled program needs the paired E8M0 scale array as
@@ -253,6 +269,9 @@ def check_emits() -> None:
             assert "    csrwi frm, 0" in asm, name
             assert f"fmul.{ime_tests._FP_SUFFIX[geom.sew]} " in asm, name
             assert f"li    t0, {ime_tests.MSTATUS_FS_INITIAL}" in asm, name
+        assert ("_sg" in name) == (tuple(geom.altfmt_ab) != (0, 0)), name
+        if tuple(geom.altfmt_ab) != (0, 0):
+            assert "vtype.altfmt_A=" in asm, name
         assert f"# {geom.mnemonic} " in asm, name
         assert f"# {geom.load_mnemonic} " in asm, name
         assert f"# {geom.store_mnemonic} " in asm, name
@@ -277,6 +296,26 @@ def check_pool_covers_every_instruction() -> None:
         f"want {sorted(constants.ALL_INSNS)}")
 
 
+def check_round_nine_in_pool() -> None:
+    """Every integer cell and signedness row has a stress geometry."""
+    for vlen in (128, 256, 512):
+        rows = {((g.w, g.sew), tuple(g.altfmt_ab))
+                for g in _every_geometry(vlen)
+                if g.kind == "int" and g.tload == "op" and g.check == "pair"
+                and g.emul_c != 16 and _allocatable(g)}
+        for cell in rvv_ref.INT_CELLS:
+            for signs in rvv_ref.INT_SIGNS:
+                assert (cell, signs) in rows, (vlen, cell, signs)
+    progs = [p for p in generate(256, 2000, seed=9)
+             if tuple(p[2].altfmt_ab) != (0, 0) or p[2].eew_ab == 4]
+    assert progs, "no round-nine program in 2000 stress draws"
+    for vlen in (128, 256, 512):
+        cells = {(g.w, g.sew) for g in _every_geometry(vlen)
+                 if g.kind == "fpw" and g.w == 1 and _allocatable(g)
+                 and g.emul_c != 16}
+        assert cells == set(rvv_ref.FPN_CELLS), (vlen, cells)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256)
@@ -284,7 +323,8 @@ def main() -> int:
     args = parser.parse_args()
 
     for check in (check_coverage, check_reproducible_and_varied, check_emits,
-                  check_pool_covers_every_instruction):
+                  check_pool_covers_every_instruction,
+                  check_round_nine_in_pool):
         check()
         print(f"  ok  {check.__name__}")
 

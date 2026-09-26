@@ -125,6 +125,16 @@ class TileGeometry:
     #: multiply-accumulate cancels out in the memory image.  See
     #: :func:`clayout_capable` and titan_runs/round5_design.md.
     check: str = "pair"
+    #: Round nine.  (vtype.altfmt_A, vtype.altfmt_B) for an *integer*
+    #: multiply-accumulate: 0 = signed, 1 = unsigned, independently per
+    #: operand (spec 486, 1145-1154; tbl-int-encoding-map 7389-7455).  The
+    #: accumulator C is always signed.  Like ``check`` it is a program
+    #: property rather than a tile-shape one -- no index function reads it --
+    #: but it is carried on the geometry so that one geometry sequence can
+    #: hold every signedness row and so that the verdict line names the row.
+    #: Default (0, 0) is the plain signed form rounds one to eight generate,
+    #: and a default geometry describes itself byte-for-byte as before.
+    altfmt_ab: Tuple[int, int] = (0, 0)
 
     @property
     def elems_per_reg(self) -> int:
@@ -194,7 +204,9 @@ class TileGeometry:
                  # W>1, and relaxing that in place would change what an
                  # existing round-four geometry accepts.
                  "fpw": {2: "vfwmmacc.vv", 4: "vfqmmacc.vv",
-                         8: "vf8wmmacc.vv"}}
+                         8: "vf8wmmacc.vv",
+                         # Round nine: the W=1 narrow cells (FPN_CELLS).
+                         1: "vfmmacc.vv"}}
         try:
             return table[self.kind][self.w]
         except KeyError:
@@ -320,15 +332,18 @@ class TileGeometry:
             # existence is checked here, via the row that every cell has.
             _eew, _rows = FP_CELLS[(self.w, self.sew)] \
                 if (self.w, self.sew) in FP_CELLS else (None, None)
+            if (self.w, self.sew) in FPN_CELLS:
+                # Round nine: vfmmacc.vv's narrow (SEW 8 / 16) cells ride
+                # this kind -- same golden-bytes machinery, same format
+                # table -- because kind='fp' (round four) is binary32/64
+                # only and relaxing it would move round four's pools.
+                _eew, _rows = FPN_CELLS[(self.w, self.sew)]
             if _rows is None:
                 raise ValueError(
                     f"kind='fpw' W={self.w} SEW={self.sew} is a reserved "
-                    f"encoding; legal cells are {sorted(FP_CELLS)} "
+                    f"encoding; legal cells are "
+                    f"{sorted(FP_CELLS) + sorted(FPN_CELLS)} "
                     f"(spec 7288-7370)")
-            if self.w == 1:
-                raise ValueError(
-                    "kind='fpw' is the *widening* floating-point family "
-                    "(W in {2,4,8}); vfmmacc.vv (W=1) is kind='fp'")
             if self.tload != "op":
                 raise ValueError(
                     f"kind='fpw' with tload={self.tload!r}: the transposing "
@@ -375,19 +390,39 @@ class TileGeometry:
         if self.w != 1:
             # vqmmacc.vv Exceptions: "SEW = 8 (EEW = SEW / 4 = 2 is
             # reserved)"; the same rule generalises to every W as
-            # EEW_A = SEW/W >= 4.  EEW=4 (Int4) is packed two per byte,
-            # which no part of this harness emits, so the modelled set is
-            # EEW_A in {8,16,32}: W=2 at SEW>=16, W=4 at SEW>=32,
-            # W=8 at SEW=64.
+            # EEW_A = SEW/W >= 4 (tbl-int-encoding-map 7427, 7445-7446:
+            # vqmmacc SEW=8, v8wmmacc SEW=8/16 are the reserved rows).
+            #
+            # Round nine: EEW_A = 4 (Int4 / UInt4, packed two per byte in
+            # little-endian nibble order, spec 1206-1219) is now modelled for
+            # kind='int' too -- Zvvi4i8mm (W=2, SEW=8), Zvvi4i16mm (W=4,
+            # SEW=16), Zvvi4i32mm (W=8, SEW=32).  Rounds one to eight never
+            # enumerate those SEWs for kind='int' (every caller passes an
+            # explicit widening SEW list), so relaxing this changes no
+            # earlier geometry sequence.
             if self.eew_ab < 4:
                 raise ValueError(
                     f"W={self.w} with SEW={self.sew} is reserved "
                     f"(EEW = SEW/{self.w} < 4)")
-            if self.eew_ab < 8 and self.kind not in ("mx", "fpw"):
+            if self.eew_ab < 8 and self.kind not in ("mx", "fpw", "int"):
                 raise ValueError(
                     f"W={self.w} with SEW={self.sew} gives EEW_A="
-                    f"{self.eew_ab}; sub-byte (Int4) input tiles are not "
-                    f"modelled -- they pack two logical elements per byte")
+                    f"{self.eew_ab}; sub-byte input tiles are not "
+                    f"modelled for kind={self.kind!r}")
+        if tuple(self.altfmt_ab) != (0, 0):
+            # Round nine.  Only the integer family reads altfmt_A/altfmt_B
+            # as signedness (spec 1145-1154); every other kind selects its
+            # input formats through a plan, not the geometry.
+            if self.kind != "int":
+                raise ValueError(
+                    f"altfmt_ab={self.altfmt_ab} on kind={self.kind!r}: the "
+                    f"geometry carries signedness for kind='int' only")
+            if any(v not in (0, 1) for v in self.altfmt_ab) or \
+                    len(self.altfmt_ab) != 2:
+                raise ValueError(f"altfmt_ab={self.altfmt_ab}: two 1-bit "
+                                 f"fields")
+            if self.check != "pair":
+                raise ValueError("the clayout probe is signed-only")
         if self.lmul not in (1, 2, 4, 8):
             raise ValueError(
                 f"LMUL={self.lmul}: Zvvm supports only integer LMUL in "
@@ -449,9 +484,15 @@ class TileGeometry:
         # geometry -- every geometry rounds one to four generate -- must
         # print byte-for-byte what round four printed.
         chk = "" if self.check == "pair" else f" CHK={self.check}"
+        # Round nine's signedness clause, last of all and only when it is
+        # not the signed default, for the same byte-identity reason: "SGN=su"
+        # reads A signed, B unsigned (altfmt_A=0, altfmt_B=1).
+        sgn = ("" if tuple(self.altfmt_ab) == (0, 0) else
+               " SGN=" + "".join("su"[v] for v in self.altfmt_ab))
         return (f"VLEN={self.vlen} SEW={self.sew} LAMBDA={self.lam}{widen} "
                 f"LMUL={self.lmul} VL={self.vl} -> M={self.m} N={self.n} "
-                f"K_eff={self.k_eff} EMUL_C={self.emul_c}{trans}{fp}{chk}")
+                f"K_eff={self.k_eff} EMUL_C={self.emul_c}{trans}{fp}{chk}"
+                f"{sgn}")
 
 
 def permissible_lambdas(vlen: int, sew: int, w: int = 1) -> List[int]:
@@ -975,9 +1016,15 @@ def random_case(geom: TileGeometry, rng: random.Random
     """
     if geom.kind == "fp":
         return random_fp_case(geom, rng)
-    return (random_matrix(geom.m, geom.k_eff, geom.eew_ab, rng),
+    case = (random_matrix(geom.m, geom.k_eff, geom.eew_ab, rng),
             random_matrix(geom.n_max, geom.k_eff, geom.eew_ab, rng),
             random_matrix(geom.m, geom.n_max, geom.sew, rng))
+    if tuple(geom.altfmt_ab) != (0, 0):
+        # Round nine: an unsigned operand is re-read as its unsigned value.
+        # Same draws, same rng consumption -- only the interpretation moves,
+        # so the signed default is untouched.  See int_case.
+        return int_case_from_signed(geom, *case)
+    return case
 
 
 # ---------------------------------------------------------------------------
@@ -2494,6 +2541,40 @@ FP_CELLS = {
 FP_SEWS_BY_W = {w: tuple(sorted(sew for (ww, sew) in FP_CELLS if ww == w))
                 for w in sorted({w for (w, _s) in FP_CELLS})}
 
+#: Round nine: the W=1 narrow floating-point cells of vfmmacc.vv, spec
+#: 7296-7311 (tbl-fp-encoding-map).  Kept OUT of FP_CELLS on purpose:
+#: FP_CELLS is the widening family's table, and fpw_resolved_cells /
+#: fpw_legal_configs / FP_SEWS_BY_W derive rounds seven and eight's pools
+#: from it, so adding rows there would move those pools.  The lookups that
+#: must see both go through _fp_cell.
+#:
+#:   (1, 8)   Zvvofp8mm   E4M3/E5M2 x E4M3/E5M2 -> E4M3 (altfmt=0) or
+#:            E5M2 (altfmt=1); all eight rows legal (7296-7303).
+#:   (1, 16)  Zvvfp16mm   binary16 x binary16 -> binary16 (0,0,0);
+#:            Zvvbf16mm   bfloat16 x bfloat16 -> bfloat16 (1,1,1);
+#:            mixed binary16 x bfloat16 either way, C either format, needs
+#:            both (7308-7311, 1462-1478).  (0,0,1) and (1,1,0) -- same
+#:            16-bit input format, the *other* accumulator format -- are
+#:            reserved (7305-7306).
+FPN_CELLS = {
+    (1, 8): (8, _ofp8_rows({0: "e4m3", 1: "e5m2"}, mx=False)),
+    (1, 16): (16, {k: v for k, v in (
+        ((0, 0, 0), ("binary16", "binary16", "binary16", False)),
+        ((1, 1, 1), ("bfloat16", "bfloat16", "bfloat16", False)),
+        ((0, 1, 0), ("binary16", "bfloat16", "binary16", False)),
+        ((0, 1, 1), ("binary16", "bfloat16", "bfloat16", False)),
+        ((1, 0, 0), ("bfloat16", "binary16", "binary16", False)),
+        ((1, 0, 1), ("bfloat16", "binary16", "bfloat16", False)))}),
+}
+FPN_RESERVED_ROWS = {(1, 16): ((0, 0, 1), (1, 1, 0))}
+
+
+def _fp_cell(w: int, sew: int):
+    """FP_CELLS or, for round nine's W=1 narrow cells, FPN_CELLS."""
+    if (w, sew) in FP_CELLS:
+        return FP_CELLS[(w, sew)]
+    return FPN_CELLS[(w, sew)]
+
 
 def fpw_legal_row(w, sew, altfmt=0, altfmt_a=0, altfmt_b=0):
     """``(fmt_A, fmt_B, fmt_C, mx_allowed)`` for a legal row, else raise.
@@ -2507,7 +2588,7 @@ def fpw_legal_row(w, sew, altfmt=0, altfmt_a=0, altfmt_b=0):
     silently normalised away.
     """
     try:
-        _eew, rows = FP_CELLS[(w, sew)]
+        _eew, rows = _fp_cell(w, sew)
     except KeyError:
         raise ValueError(
             f"W={w} SEW={sew} is a reserved encoding for the widening "
@@ -2527,7 +2608,7 @@ def fpw_legal_row(w, sew, altfmt=0, altfmt_a=0, altfmt_b=0):
 
 def fpw_eew_ab(w: int, sew: int) -> int:
     """Input element width at a legal cell.  Always SEW/W; asserted, not assumed."""
-    eew, _rows = FP_CELLS[(w, sew)]
+    eew, _rows = _fp_cell(w, sew)
     assert eew == sew // w, (w, sew, eew)
     return eew
 
@@ -3164,8 +3245,15 @@ def check_round_three_widening() -> None:
     for i, k, want in ((0, 0, 0), (1, 0, 16), (1, 15, 31)):
         assert ab_element_index(i, k, w8b) == want, (i, k, want)
 
-    # ---- reserved / unmodelled widths ----------------------------------
-    for sew, w in ((8, 2), (16, 4), (16, 8), (32, 8)):
+    # ---- reserved widths ------------------------------------------------
+    # Round nine: (8, 2), (16, 4) and (32, 8) are the Int4 cells
+    # (Zvvi4i8mm / Zvvi4i16mm / Zvvi4i32mm) and now validate -- see
+    # check_round_nine_int_cells.  What must still be rejected is the three
+    # reserved rows of tbl-int-encoding-map (EEW < 4).
+    for sew, w in ((8, 2), (16, 4), (32, 8)):
+        for lam in permissible_lambdas(256, sew):
+            TileGeometry(256, sew, lam, 1, lam, w).validate()
+    for sew, w in ((16, 8), (8, 4), (8, 8)):
         try:
             TileGeometry(256, sew, 1, 1, 1).validate()
         except ValueError:
@@ -4216,7 +4304,7 @@ def fpw_resolved_cells():
 
 def fpw_rows(w: int, sew: int):
     """Legal ``(altfmt_A, altfmt_B, altfmt) -> (fmt_A, fmt_B, fmt_C)`` rows."""
-    _eew, rows = FP_CELLS[(w, sew)]
+    _eew, rows = _fp_cell(w, sew)
     return {k: (fp_format(v[0]), fp_format(v[1]), fp_format(v[2]))
             for k, v in sorted(rows.items(), key=lambda kv: str(kv[0]))}
 
@@ -5469,6 +5557,867 @@ def check_round_eight_nan_controls() -> None:
     assert got != good, "E5M2 Inf -> NaN sabotage has no teeth"
 
 
+# ---------------------------------------------------------------------------
+# round nine: the rest of the integer family -- Int4, Int64, [U]Int
+# ---------------------------------------------------------------------------
+#
+# Spec 810-825 (tbl-extensions) lists thirteen integer cells, every one of
+# them "[U]IntN x [U]IntN -> IntM".  Rounds one to three built eight, signed
+# only.  Round nine adds the other five and the unsigned / mixed-sign rows of
+# all thirteen.  What the spec says, by line:
+#
+#   * Signedness is NOT a mnemonic and NOT a W: it is vtype.altfmt_A /
+#     vtype.altfmt_B, one bit each, 0 = signed, 1 = unsigned, independent per
+#     operand; the accumulator C is always signed (spec 486, 1145-1154, 7375).
+#     Every one of the thirteen cells has all four rows legal
+#     (tbl-int-encoding-map 7389-7455).  The fields sit at vtype[XLEN-6] /
+#     vtype[XLEN-7] (spec 852-853), outside the vsetvli immediate, so only
+#     vsetvl reaches them (spec 888-909).  (The C-intrinsics' _su / _us
+#     suffixes at 4310-4337 are software spellings of the same vtype bits.)
+#   * Sail int_block_dot (5127-5145) reads each A/B element at EEW_A and
+#     applies signed() or unsigned() per operand, sums the products as an
+#     unbounded integer; int_gemm (5213-5227) adds signed(C) and writes
+#     to_bits(EEW_C, acc) -- one reduction modulo 2**SEW of the exact sum
+#     (spec 487, 1275-1277).  So an Int64 accumulator wraps at 2**64 and
+#     never at 2**32.
+#   * Int4 is packed two per byte, element 2n in the LOW nibble [3:0] of
+#     byte n, element 2n+1 in the HIGH nibble (spec 1206-1219); a UInt4 uses
+#     the same packing with a zero-extending read.
+#
+# Consequence worth stating: at W=1 signedness cannot change a single result
+# bit (the low SEW bits of a product and of a modular sum do not depend on
+# the operands' signedness -- check_signedness_is_immaterial).  Round nine's
+# W=1 unsigned programs therefore test that the encoding is *accepted* and
+# decoded without disturbing anything; the controls that make a program FAIL
+# on a sign bug are all W > 1.
+
+#: tbl-int-encoding-map (spec 7389-7455), transcribed: (W, SEW) -> (EEW_A,
+#: extension).  All four (altfmt_A, altfmt_B) rows of every cell are legal
+#: and name the same extension; the reserved rows are the three whose EEW
+#: would be below 4.
+INT_CELLS = {
+    (1, 8): (8, "Zvvi8mm"),       (1, 16): (16, "Zvvi16mm"),
+    (1, 32): (32, "Zvvi32mm"),    (1, 64): (64, "Zvvi64mm"),
+    (2, 8): (4, "Zvvi4i8mm"),     (2, 16): (8, "Zvvi8i16mm"),
+    (2, 32): (16, "Zvvi16i32mm"), (2, 64): (32, "Zvvi32i64mm"),
+    (4, 16): (4, "Zvvi4i16mm"),   (4, 32): (8, "Zvvi8i32mm"),
+    (4, 64): (16, "Zvvi16i64mm"),
+    (8, 32): (4, "Zvvi4i32mm"),   (8, 64): (8, "Zvvi8i64mm"),
+}
+INT_RESERVED = ((4, 8), (8, 8), (8, 16))
+
+#: The four signedness rows, (altfmt_A, altfmt_B).
+INT_SIGNS = ((0, 0), (0, 1), (1, 0), (1, 1))
+
+#: Cells rounds one to eight generate programs for (signed only): W=1 at
+#: every SEW, plus WIDENING_SEWS_BY_W.  Derived, not listed, so the report of
+#: "what round nine adds" cannot drift from what the older tiers emit.
+INT_CELLS_BEFORE_R9 = tuple(sorted(
+    [(1, s) for s in (8, 16, 32, 64)]
+    + [(w, s) for w, sews in WIDENING_SEWS_BY_W.items() for s in sews]))
+
+#: Round nine's new cells: Int4 inputs, and Int16/Int32 into Int64.
+ROUND_NINE_INT4_CELLS = ((2, 8), (4, 16), (8, 32))
+ROUND_NINE_INT64_CELLS = ((4, 64), (2, 64))
+ROUND_NINE_INT_CELLS = ROUND_NINE_INT4_CELLS + ROUND_NINE_INT64_CELLS
+
+
+def int_operand(raw: int, eew: int, unsigned: int) -> int:
+    """Sail int_block_dot's read: signed() or unsigned() of an EEW-bit field.
+
+    ``unsigned`` is the altfmt bit itself (spec 1151-1154: 1 = unsigned).
+    """
+    raw &= (1 << eew) - 1
+    if not unsigned and raw >> (eew - 1):
+        raw -= 1 << eew
+    return raw
+
+
+def int_case_from_signed(geom: TileGeometry, a: Matrix, b: Matrix,
+                         c: Matrix) -> Tuple[Matrix, Matrix, Matrix]:
+    """Re-read A / B as unsigned where geom.altfmt_ab says so.
+
+    The operand *values* are what reference_gemm multiplies, so an unsigned
+    operand has to arrive as a non-negative value in [0, 2**EEW).  The draw
+    is random_matrix's signed one, masked: its pool of extremes (lo, hi, -1)
+    becomes 2**(EEW-1), 2**(EEW-1)-1 and 2**EEW-1 -- exactly the codes where
+    signed and unsigned reads disagree.
+    """
+    ua, ub = geom.altfmt_ab
+    eew = geom.eew_ab
+    conv = lambda mat, u: [[int_operand(v, eew, u) for v in row]
+                           for row in mat]
+    return conv(a, ua), conv(b, ub), c
+
+
+def int_case(geom: TileGeometry, rng: random.Random
+             ) -> Tuple[Matrix, Matrix, Matrix]:
+    """(A, B, C) values for an integer geometry, honouring its signedness."""
+    return random_case(geom, rng)
+
+
+def int_pack_int4(values: Sequence[int]) -> List[int]:
+    """Int4 / UInt4 elements packed two per byte (spec 1206-1219).
+
+    Element 2n -> bits [3:0] of byte n, element 2n+1 -> bits [7:4].  The
+    bit pattern of a UInt4 and of the Int4 with the same low four bits is the
+    same, so packing is signedness-blind; only the *read* differs.
+    """
+    return mx_pack_int4([v & 0xF for v in values])
+
+
+def int_unpack_int4(data: Sequence[int], unsigned: int) -> List[int]:
+    """Inverse of int_pack_int4, with the Sail read applied."""
+    out = []
+    for byte in data:
+        out.append(int_operand(byte & 0xF, 4, unsigned))
+        out.append(int_operand(byte >> 4, 4, unsigned))
+    return out
+
+
+def int_gemm_sail(geom: TileGeometry, a_bits: Matrix, b_bits: Matrix,
+                  c_bits: Matrix) -> Matrix:
+    """Sail int_gemm / int_block_dot (5127-5145, 5213-5227), on raw bits.
+
+    Deliberately a second route to reference_gemm's answer: this one takes
+    the *bit patterns* the registers hold and applies the altfmt reads itself,
+    where reference_gemm takes values that the case generator already
+    interpreted.  The self-test asserts the two agree for every cell and row.
+    Returns C as SEW-bit patterns.
+    """
+    ua, ub = geom.altfmt_ab
+    eew, sew = geom.eew_ab, geom.sew
+    out = [[v & ((1 << sew) - 1) for v in row] for row in c_bits]
+    for j in range(geom.n):
+        for i in range(geom.m):
+            acc = int_operand(out[i][j], sew, 0)       # C always signed
+            for k in range(geom.k_eff):
+                acc += (int_operand(a_bits[i][k], eew, ua)
+                        * int_operand(b_bits[j][k], eew, ub))
+            out[i][j] = acc & ((1 << sew) - 1)          # to_bits(EEW_C, acc)
+    return out
+
+
+def int_cell_geometries(vlen: int, cell, *, full_vl_only: bool = True,
+                        altfmt_ab=(0, 0), lmuls=(1, 2, 4, 8)):
+    """Legal kind='int' geometries of one (W, SEW) cell, one signedness row."""
+    w, sew = cell
+    for g in ime_legal_configs(vlen, sews=(sew,), ws=(w,), lmuls=lmuls,
+                               full_vl_only=full_vl_only):
+        g2 = replace(g, altfmt_ab=tuple(altfmt_ab))
+        g2.validate()
+        yield g2
+
+
+def _bits(mat, width):
+    return [[v & ((1 << width) - 1) for v in row] for row in mat]
+
+
+def check_round_nine_int_cells() -> None:
+    """INT_CELLS is the spec's table, and the coverage claim is derived."""
+    assert len(INT_CELLS) == 13
+    for (w, sew), (eew, name) in INT_CELLS.items():
+        assert eew == sew // w, (w, sew)
+        assert eew >= 4
+        want = (f"Zvvi{eew}mm" if w == 1 else f"Zvvi{eew}i{sew}mm")
+        assert name == want, (name, want)
+    for w, sew in INT_RESERVED:
+        assert sew // w < 4 and (w, sew) not in INT_CELLS
+        try:
+            TileGeometry(256, sew, 1, 1, 1, w).validate()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"reserved ({w},{sew}) validated")
+    assert len(INT_CELLS_BEFORE_R9) == 8, INT_CELLS_BEFORE_R9
+    assert set(INT_CELLS_BEFORE_R9) | set(ROUND_NINE_INT_CELLS) == \
+        set(INT_CELLS)
+    assert not set(INT_CELLS_BEFORE_R9) & set(ROUND_NINE_INT_CELLS)
+    for cell in INT_CELLS:
+        for vlen in (128, 256, 512):
+            assert list(int_cell_geometries(vlen, cell)), (cell, vlen)
+
+
+def check_round_nine_int4_packing() -> None:
+    """Spec 1206-1219, and that the packed image is what the tile holds."""
+    assert int_pack_int4([1, 2]) == [0x21]
+    assert int_pack_int4([-1, 0]) == [0x0F]
+    assert int_pack_int4([0, -8]) == [0x80]
+    assert int_pack_int4([15, 8]) == [0x8F]          # UInt4 15, 8
+    vals = list(range(-8, 8))
+    assert int_unpack_int4(int_pack_int4(vals), 0) == vals
+    uvals = list(range(16))
+    assert int_unpack_int4(int_pack_int4(uvals), 1) == uvals
+    # Same bits, two readings: 0xF is -1 signed, 15 unsigned.
+    assert int_unpack_int4([0xF8], 0) == [-8, -1]
+    assert int_unpack_int4([0xF8], 1) == [8, 15]
+
+
+def check_round_nine_sail_equivalence() -> None:
+    """reference_gemm(values) == int_gemm_sail(bits), every cell and row.
+
+    The Int4 case goes through the nibble packer and back, so the element
+    order is inside the loop, not assumed.
+    """
+    rng = random.Random(909)
+    for cell in sorted(INT_CELLS):
+        for signs in INT_SIGNS:
+            geoms = list(int_cell_geometries(256, cell, altfmt_ab=signs,
+                                             full_vl_only=False))
+            for geom in (geoms[0], geoms[len(geoms) // 2], geoms[-1]):
+                a, b, c = random_case(geom, rng)
+                eew = geom.eew_ab
+                for mat, u in ((a, signs[0]), (b, signs[1])):
+                    for row in mat:
+                        for v in row:
+                            assert v == int_operand(v, eew, u), (cell, signs)
+                a_bits, b_bits = _bits(a, eew), _bits(b, eew)
+                if eew == 4:
+                    a_bits = [[x & 0xF for x in
+                               int_unpack_int4(int_pack_int4(r), 1)]
+                              for r in a]
+                    b_bits = [[x & 0xF for x in
+                               int_unpack_int4(int_pack_int4(r), 1)]
+                              for r in b]
+                want = _bits(reference_gemm(a, b, c, geom), geom.sew)
+                got = int_gemm_sail(geom, a_bits, b_bits, c)
+                assert got == want, (geom.describe(),)
+
+
+def check_round_nine_signedness_material() -> None:
+    """At W>1 each signedness row changes the result; at W=1 none can."""
+    for cell in sorted(INT_CELLS):
+        w, sew = cell
+        eew = sew // w
+        base = next(int_cell_geometries(256, cell))
+        # All-ones operands: -1 signed, 2**EEW-1 unsigned.
+        a_bits = [[(1 << eew) - 1] * base.k_eff for _ in range(base.m)]
+        b_bits = [[(1 << eew) - 1] * base.k_eff for _ in range(base.n_max)]
+        c = [[0] * base.n_max for _ in range(base.m)]
+        results = {s: int_gemm_sail(replace(base, altfmt_ab=s), a_bits,
+                                    b_bits, c)[0][0] for s in INT_SIGNS}
+        if w == 1:
+            assert len(set(results.values())) == 1, (cell, results)
+        else:
+            # ss: K*1, su/us: K*-(2^e-1), uu: K*(2^e-1)^2 -- all distinct
+            # modulo 2**SEW because (2^e-1)^2 < 2**SEW at W >= 2.
+            assert results[(0, 1)] == results[(1, 0)]
+            assert len({results[(0, 0)], results[(0, 1)],
+                        results[(1, 1)]}) == 3, (cell, results)
+            # ... and the mixed rows are A/B-asymmetric on asymmetric data.
+            a2 = [[(1 << eew) - 1] + [1] * (base.k_eff - 1)
+                  for _ in range(base.m)]
+            b2 = [[1] * base.k_eff for _ in range(base.n_max)]
+            su = int_gemm_sail(replace(base, altfmt_ab=(0, 1)), a2, b2, c)
+            us = int_gemm_sail(replace(base, altfmt_ab=(1, 0)), a2, b2, c)
+            assert su[0][0] != us[0][0], cell
+
+
+def check_round_nine_int64_wrap() -> None:
+    """Int64 accumulation wraps modulo 2**64, once, on the exact sum.
+
+    Spec 487 / 1275-1277 and Sail int_gemm's to_bits(EEW_C, acc).  Built so
+    that (a) the true sum exceeds 2**64 -- the UInt32 x UInt32 products are
+    near 2**64 each -- and (b) a 32-bit accumulator would give a different
+    answer.
+    """
+    for cell in ((2, 64), (4, 64), (8, 64), (1, 64)):
+        w, sew = cell
+        eew = sew // w
+        geom = replace(next(int_cell_geometries(256, cell)), altfmt_ab=(1, 1))
+        a = [[(1 << eew) - 1] * geom.k_eff for _ in range(geom.m)]
+        b = [[(1 << eew) - 1] * geom.k_eff for _ in range(geom.n_max)]
+        c = [[(1 << 63) - 1] * geom.n_max for _ in range(geom.m)]
+        got = int_gemm_sail(geom, a, b, c)[0][0]
+        exact = (1 << 63) - 1 + geom.k_eff * ((1 << eew) - 1) ** 2
+        assert got == exact % (1 << 64)
+        if w > 1:
+            assert exact >= 1 << 63           # overflowed the signed range
+        trunc32 = exact & 0xFFFFFFFF
+        assert got != trunc32 and got != _wrap(exact, 32) & ((1 << 64) - 1)
+
+
+def _r9_sabotaged(geom, a_bits, b_bits, c, bad):
+    """int_gemm_sail with one deliberate mistake (the controls below)."""
+    ua, ub = geom.altfmt_ab
+    eew, sew = geom.eew_ab, geom.sew
+    out = [[v & ((1 << sew) - 1) for v in row] for row in c]
+    for j in range(geom.n):
+        for i in range(geom.m):
+            acc = int_operand(out[i][j], sew, 0)
+            for k in range(geom.k_eff):
+                ka = k
+                if bad == "nibble_order" and eew == 4:
+                    ka = k ^ 1                     # A side only
+                ra, rb = a_bits[i][ka], b_bits[j][k]
+                sa, sb = ua, ub
+                if bad == "ext_swap":
+                    sa, sb = 1 - ua, 1 - ub
+                elif bad == "b_as_signed":
+                    sb = 0
+                elif bad == "ab_sign_swap":
+                    sa, sb = ub, ua
+                if bad == "int4_as_int8" and eew == 4:
+                    # The packed byte that holds element k, read as Int8.
+                    pa = a_bits[i][k & ~1] | (a_bits[i][k | 1] << 4)
+                    pb = b_bits[j][k & ~1] | (b_bits[j][k | 1] << 4)
+                    acc += int_operand(pa, 8, sa) * int_operand(pb, 8, sb)
+                    continue
+                acc += int_operand(ra, eew, sa) * int_operand(rb, eew, sb)
+            if bad == "acc32" and sew == 64:
+                acc = _wrap(acc, 32)
+            out[i][j] = acc & ((1 << sew) - 1)
+    return out
+
+
+#: The six round-nine mistakes, and which (cell, signedness) programs can
+#: see each.  Anything outside these sets is provably blind to it (W=1 for
+#: the sign mistakes; symmetric rows for the A/B swap; non-Int4 / non-Int64
+#: cells for the format-specific ones), which the control asserts too.
+R9_CONTROLS = ("ext_swap", "nibble_order", "int4_as_int8", "acc32",
+               "b_as_signed", "ab_sign_swap")
+
+
+def r9_control_applies(bad: str, geom: TileGeometry) -> bool:
+    ua, ub = geom.altfmt_ab
+    if bad == "ext_swap":
+        return geom.w > 1
+    if bad in ("nibble_order", "int4_as_int8"):
+        return geom.eew_ab == 4 and geom.k_eff > 1
+    if bad == "acc32":
+        return geom.sew == 64
+    if bad == "b_as_signed":
+        return geom.w > 1 and ub == 1
+    if bad == "ab_sign_swap":
+        return geom.w > 1 and ua != ub
+    raise KeyError(bad)
+
+
+def check_round_nine_negative_controls() -> None:
+    """Each deliberate mistake changes the reference on the programs it can.
+
+    The meta-judge version (sim_check) sabotages the DUT model and runs the
+    emitted programs; this one proves at the model level that the case
+    generator produces data on which each mistake is visible at all.
+    """
+    rng = random.Random(4242)
+    seen = {bad: 0 for bad in R9_CONTROLS}
+    for cell in sorted(INT_CELLS):
+        for signs in INT_SIGNS:
+            geom = list(int_cell_geometries(256, cell, altfmt_ab=signs))[-1]
+            a, b, c = random_case(geom, rng)
+            ab, bb = _bits(a, geom.eew_ab), _bits(b, geom.eew_ab)
+            good = int_gemm_sail(geom, ab, bb, c)
+            for bad in R9_CONTROLS:
+                got = _r9_sabotaged(geom, ab, bb, c, bad)
+                if r9_control_applies(bad, geom):
+                    assert got != good, (bad, geom.describe())
+                    seen[bad] += 1
+                elif bad in ("ext_swap", "b_as_signed", "ab_sign_swap") \
+                        and geom.w == 1:
+                    assert got == good, (bad, geom.describe())
+    assert all(seen.values()), seen
+
+
+# ---------------------------------------------------------------------------
+# round nine: the W=1 narrow floating-point cells (vfmmacc.vv at SEW 8 / 16)
+# ---------------------------------------------------------------------------
+#
+# Zvvfp16mm, Zvvbf16mm and Zvvofp8mm (spec 810-844; rows 7296-7311).  The
+# arithmetic is fp_gemm (Sail 5231-5270) at W=1 under Titan's disclosed
+# (G, psm, rnd) = (1, 0, frm) -- FP_DISCLOSURE, which spec 1596-1599 makes
+# uniform across every format combination of a geometry entry, so it covers
+# these cells without a second disclosure.  At W=1 a group is ONE exact
+# product, so per k, in increasing k:
+#
+#     S   = fp_round_to_frm(a_k * b_k)       -> fmt_C      (rnd=frm, 1584)
+#     acc = fp_add(acc, S)                   rounded in fmt_C under frm
+#
+# i.e. two roundings per term, both *in the accumulator format* -- not in
+# binary32 with one narrowing at the end, and not fused.  That is exactly
+# fpw_reference_gemm at W=1 (groups = LAMBDA*LMUL, W products each), which
+# is what fpn_reference_gemm computes -- with IEEE signed zeros, the one
+# place it differs from rounds seven / eight's fpw_reference_gemm
+# (check_round_nine_signed_zero); check_round_nine_fpn_gemm re-derives it by
+# an independent per-k route.
+#
+# OFP8 destination (Zvvofp8mm, the first live cell that ROUNDS to OFP8):
+#   * rounding mode: the IME spec says final accumulation uses frm (spec
+#     1433, 1496) and fp_round_to_frm may raise inexact / overflow /
+#     underflow (1851-1853); OCP OFP8 requires only RNE and leaves other
+#     modes optional.  Titan models frm = RNE only (OFP8_DISCLOSURE["frm"]),
+#     and every program sets frm = 0.
+#   * overflow: the IME spec never mentions saturation; OFP8_DISCLOSURE
+#     "nonsat" -- E4M3 -> NaN (it has no Inf), E5M2 -> +-Inf (OCP Table 3).
+#   * default NaN: E4M3 0x7F, E5M2 0x7E (OFP8_DISCLOSURE; spec 1872-1878
+#     requires "the default canonical NaN for that format" but only OCP
+#     could define it, and OCP leaves it implementation-defined).
+#   * fflags: architecturally part of the result (spec 1794-1809); no
+#     program in any round reads fflags, so the flag side is not judged.
+#
+# Controls (reference level here, DUT level in sim_check): accumulator kept
+# in binary32 and narrowed once, binary16 <-> bfloat16 accumulator swap,
+# flush-to-zero, RTZ instead of RNE, saturating OFP8 overflow, E4M3 <-> E5M2
+# accumulator swap, wrong OFP8 default NaN.
+
+FPN_ROUND_NINE_CELLS = ((1, 8), (1, 16))
+
+
+def fpn_resolved_cells():
+    """FPN cells whose every row uses resolved formats (all of them)."""
+    return [cell for cell, (_e, rows) in sorted(FPN_CELLS.items())
+            if all(FP_FORMAT_TABLE[f].resolved
+                   for row in rows.values() for f in row[:3])]
+
+
+def fpn_legal_configs(vlen: int, **kwargs):
+    """Every W=1 narrow-FP geometry, SEW 8 then 16 (kind='fpw', W=1)."""
+    for (w, sew) in sorted(FPN_CELLS):
+        yield from ime_legal_configs(vlen, sews=(sew,), ws=(w,),
+                                     kinds=("fpw",), **kwargs)
+
+
+def fpf_min_subnormal(fmt: FpFormat) -> int:
+    return 1
+
+
+def fpf_round_rtz(value: "Fraction", fmt: FpFormat) -> int:
+    """Round toward zero into *fmt* -- a wrong rounding, for the controls.
+
+    Derived from the RNE result: if RNE moved away from zero, step one ulp
+    back toward it (magnitude bit patterns are monotone for every format
+    here).  Overflow under RTZ gives the largest finite value (IEEE 754
+    4.3.2 / 7.4), for every format.
+    """
+    if value == 0:
+        return fpf_round(value, fmt, FP_FRM)
+    sign = 1 if value < 0 else 0
+    sbit = sign << (fmt.width - 1)
+    mag = -value if sign else value
+    _k, _s, max_mag = fpf_unpack(fpf_max_finite(fmt), fmt)
+    if mag >= max_mag:
+        return sbit | fpf_max_finite(fmt)
+    bits = fpf_round(value, fmt, FP_FRM)
+    kind, _s2, got = fpf_unpack(bits, fmt)
+    if kind != "num":
+        return sbit | fpf_max_finite(fmt)
+    if got > mag:
+        bits = sbit | ((bits & ~sbit) - 1)
+    return bits
+
+
+def _fpn_gemm_sequential(geom, a, b, c, fmt_a, fmt_b, fmt_c):
+    """W=1 fp_gemm written out per k, as a second route to the answer.
+
+    Does not call _fpw_mul_exact / _fpw_sum_exact / _fpw_add_into: it
+    decodes with fpf_unpack, rounds with fpf_round, and handles the special
+    values itself from spec 1839-1878.  Finite-only inputs are required
+    except for NaN (default-NaN propagation) and Inf.
+    """
+    dn = fpf_default_nan(fmt_c)
+    out = [row[:] for row in c]
+
+    def val(bits, fmt):
+        k, s, m = fpf_unpack(bits, fmt)
+        if k == "num":
+            return ("n", -m if s else m, s)
+        return (k, s)
+
+    def mat(x):
+        if x[0] == "nan":
+            return dn
+        if x[0] == "inf":
+            return _fpw_materialise(("inf", x[1]), fmt_c)
+        return fpf_round(x[1], fmt_c, FP_FRM)
+
+    for i in range(geom.m):
+        for j in range(geom.n):
+            acc = c[i][j]
+            for k in range(geom.k_eff):
+                pa, pb = val(a[i][k], fmt_a), val(b[j][k], fmt_b)
+                if "nan" in (pa[0], pb[0]):
+                    p = ("nan",)
+                elif pa[0] == "inf" or pb[0] == "inf":
+                    other = pb if pa[0] == "inf" else pa
+                    if other[0] == "n" and other[1] == 0:
+                        p = ("nan",)
+                    else:
+                        sa = pa[1] if pa[0] == "inf" else pa[2]
+                        sb = pb[1] if pb[0] == "inf" else pb[2]
+                        p = ("inf", sa ^ sb)
+                else:
+                    p = ("n", pa[1] * pb[1], pa[2] ^ pb[2])
+                if p[0] == "n" and p[1] == 0:
+                    s_bits = p[2] << (fmt_c.width - 1)   # 0 x -1 = -0
+                else:
+                    s_bits = mat(p)
+                ca, sv = val(acc, fmt_c), val(s_bits, fmt_c)
+                if "nan" in (ca[0], sv[0]):
+                    acc = dn
+                elif ca[0] == "inf" and sv[0] == "inf":
+                    acc = dn if ca[1] != sv[1] else acc
+                elif ca[0] == "inf":
+                    pass
+                elif sv[0] == "inf":
+                    acc = s_bits
+                else:
+                    total = ca[1] + sv[1]
+                    if total == 0:
+                        # RNE: exact zero sum is +0 unless both are -0.
+                        both_neg = (acc >> (fmt_c.width - 1)) & \
+                            (s_bits >> (fmt_c.width - 1)) & 1
+                        acc = both_neg << (fmt_c.width - 1)
+                    else:
+                        acc = fpf_round(total, fmt_c, FP_FRM)
+            out[i][j] = acc
+    return out
+
+
+def fpn_case(geom: "TileGeometry", row, rng: random.Random):
+    """Golden-tier operands for a W=1 narrow cell: fpw_case, unchanged."""
+    return fpw_case(geom, row, rng)
+
+
+def fpn_special_case(geom: "TileGeometry", row, rng: random.Random):
+    """fpw_special_case plus the accumulator-side specials a narrow C needs.
+
+    Rows (when M is large enough), on top of fpw_special_case's 0-4:
+      5  A = +max_A at every k against B = +max_B: the running sum overflows
+         fmt_C -- E4M3 NaN / E5M2 Inf under the disclosed nonsat rule,
+         binary16 / bfloat16 Inf.  A saturating model gives +-max.
+      6  C = a non-canonical NaN of fmt_C where one exists (else the
+         canonical one) and A = 0: the output must be fmt_C's default NaN.
+      7  C = the minimum positive subnormal of fmt_C, A = 0: the result is
+         that subnormal (x + 0 = x); a flush-to-zero model writes 0.
+    """
+    fmt_a, fmt_b, fmt_c = row
+    a, b, c = fpw_special_case(geom, row, rng)
+    max_a, max_b = fpf_max_finite(fmt_a), fpf_max_finite(fmt_b)
+    if geom.m > 5:
+        a[5] = [max_a] * geom.k_eff
+        for j in range(geom.n):
+            b[j] = [max_b if k != 0 else b[j][k] for k in range(geom.k_eff)]
+            b[j][0] = max_b
+    if geom.m > 6:
+        a[6] = [0] * geom.k_eff
+        if fmt_c.nan_rule == "ieee":
+            nan_c = (fmt_c.emax << (fmt_c.prec - 1)) | 1
+        else:
+            nan_c = fpf_default_nan(fmt_c) | (1 << (fmt_c.width - 1))
+        assert fpf_is_nan(nan_c, fmt_c) and nan_c != fpf_default_nan(fmt_c)
+        c[6] = [nan_c] * geom.n_max
+    if geom.m > 7:
+        a[7] = [0] * geom.k_eff
+        c[7] = [fpf_min_subnormal(fmt_c)] * geom.n_max
+    return a, b, c
+
+
+def fpn_special_geometry(geoms):
+    """First geometry with M >= 8 and K_eff >= 2, else the largest M."""
+    geoms = [g for g in geoms if g.k_eff >= 2]     # fpw_special_case needs 2
+    hit = [g for g in geoms if g.m >= 8]
+    if hit:
+        return hit[0]
+    return max(geoms, key=lambda g: (g.m, g.k_eff)) if geoms else None
+
+
+def _fpn_ftz_bits(bits, fmt):
+    """Flush a subnormal encoding to the same-signed zero."""
+    kind, sign, mag = fpf_unpack(bits, fmt)
+    if kind == "num" and mag != 0 and mag < _pow2(1 - fmt.bias):
+        return sign << (fmt.width - 1)
+    return bits
+
+
+def fpn_sabotaged_gemm(bad: str, geom, a, b, c, fmt_a, fmt_b, fmt_c):
+    """fpn_reference_gemm with one round-nine mistake (the controls)."""
+    if bad == "wide_acc":
+        # Accumulate in binary32 across all of K, narrow once at the end.
+        return fpn_reference_gemm(geom, a, b, c, fmt_a, fmt_b, fmt_c,
+                                  acc_fmt=fp_format("binary32"))
+    if bad == "c_fmt_swap":
+        other = {"binary16": "bfloat16", "bfloat16": "binary16",
+                 "e4m3": "e5m2", "e5m2": "e4m3"}[fmt_c.name]
+        return fpn_reference_gemm(geom, a, b, c, fmt_a, fmt_b,
+                                  fp_format(other))
+    if bad == "ftz":
+        return fpn_reference_gemm(geom, a, b, c, fmt_a, fmt_b, fmt_c,
+                                  ftz=True)
+    if bad == "saturate":
+        return fpn_reference_gemm(geom, a, b, c, fmt_a, fmt_b,
+                                  replace(fmt_c, overflow="saturate"))
+    if bad == "rtz":
+        return fpn_reference_gemm(geom, a, b, c, fmt_a, fmt_b, fmt_c,
+                                  rounder=fpf_round_rtz)
+    if bad == "default_nan":
+        saved = dict(OFP8_DISCLOSURE["default_nan"])
+        OFP8_DISCLOSURE["default_nan"].update({"e4m3": 0xFF, "e5m2": 0x7F})
+        try:
+            return fpn_reference_gemm(geom, a, b, c, fmt_a, fmt_b, fmt_c)
+        finally:
+            OFP8_DISCLOSURE["default_nan"].update(saved)
+    raise KeyError(bad)
+
+
+#: The round-nine FP controls and the cells / rows each applies to.
+FPN_CONTROLS = ("wide_acc", "c_fmt_swap", "ftz", "rtz", "saturate",
+                "default_nan")
+
+
+def fpn_control_applies(bad: str, geom, row) -> bool:
+    fmt_c = row[2]
+    if bad in ("saturate", "default_nan"):
+        return fmt_c.name in ("e4m3", "e5m2")
+    return True
+
+
+def check_round_nine_fpn_encoding_map() -> None:
+    """FPN_CELLS against spec 7296-7311; the two reserved rows trap."""
+    assert len(FPN_CELLS[(1, 8)][1]) == 8
+    assert {v[2] for k, v in FPN_CELLS[(1, 8)][1].items()} == {"e4m3", "e5m2"}
+    for (a, b, f), v in FPN_CELLS[(1, 8)][1].items():
+        assert v[:3] == (_OFP8[a], _OFP8[b], _OFP8[f])
+    assert len(FPN_CELLS[(1, 16)][1]) == 6
+    for (a, b, f), v in FPN_CELLS[(1, 16)][1].items():
+        assert v[:3] == (_F16[a], _F16[b], _F16[f])
+    for key in FPN_RESERVED_ROWS[(1, 16)]:
+        try:
+            fpw_legal_row(1, 16, key[2], key[0], key[1])
+        except ValueError:
+            continue
+        raise AssertionError(f"reserved row {key} accepted")
+    assert fpn_resolved_cells() == [(1, 8), (1, 16)]
+    # Rounds seven / eight's tables did not move.
+    assert (1, 8) not in FP_CELLS and (1, 16) not in FP_CELLS
+    assert 1 not in FP_SEWS_BY_W
+    for vlen in (128, 256, 512):
+        geoms = list(fpn_legal_configs(vlen, full_vl_only=True))
+        assert {g.sew for g in geoms} == {8, 16}, vlen
+        assert all(g.mnemonic == "vfmmacc.vv" for g in geoms)
+
+
+def check_round_nine_fpn_gemm() -> None:
+    """fpw_reference_gemm at W=1 == the per-k sequential model, all rows.
+
+    Golden and special cases, every row of both cells, several geometries.
+    """
+    rng = random.Random(9091)
+    for cell in sorted(FPN_CELLS):
+        geoms = [g for g in fpn_legal_configs(256, full_vl_only=True)
+                 if (g.w, g.sew) == cell]
+        rows = fpw_rows(*cell)
+        for key, row in rows.items():
+            sg = fpn_special_geometry(geoms)
+            for geom, maker in ((geoms[0], fpn_case), (sg, fpn_case),
+                                (sg, fpn_special_case)):
+                if True:
+                    a, b, c = maker(geom, row, rng)
+                    got = fpn_reference_gemm(geom, a, b, c, *row)
+                    want = _fpn_gemm_sequential(geom, a, b, c, *row)
+                    assert got == want, (cell, key, geom.describe(),
+                                         maker.__name__)
+                    # ... and rounds seven / eight's model agrees except
+                    # on the sign of a zero (check_round_nine_signed_zero).
+                    old = fpw_reference_gemm(geom, a, b, c, *row)
+                    zmask = (1 << (row[2].width - 1)) - 1
+                    for i in range(geom.m):
+                        for j in range(geom.n_max):
+                            if old[i][j] != got[i][j]:
+                                assert old[i][j] & zmask == 0 and \
+                                    got[i][j] & zmask == 0, (cell, key, i, j)
+
+
+def check_round_nine_fpn_special_values() -> None:
+    """The special-tier outcomes, spelled out for one geometry per row."""
+    rng = random.Random(77)
+    for cell in sorted(FPN_CELLS):
+        geoms = [g for g in fpn_legal_configs(256, full_vl_only=True)
+                 if (g.w, g.sew) == cell]
+        geom = fpn_special_geometry(geoms)
+        assert geom.m >= 8, geom.describe()
+        for key, row in fpw_rows(*cell).items():
+            fmt_a, fmt_b, fmt_c = row
+            a, b, c = fpn_special_case(geom, row, rng)
+            out = fpn_reference_gemm(geom, a, b, c, *row)
+            dn = fpf_default_nan(fmt_c)
+            assert all(out[0][j] == dn for j in range(geom.n)), (cell, key)
+            assert all(out[6][j] == dn for j in range(geom.n)), (cell, key)
+            assert all(out[7][j] == 1 for j in range(geom.n)), (cell, key)
+            ovf = out[5][0]
+            if fmt_c.name == "e4m3":
+                assert ovf == dn, hex(ovf)                 # nonsat: NaN
+            else:
+                assert fpf_is_inf(ovf, fmt_c), (fmt_c.name, hex(ovf))
+
+
+def check_round_nine_fpn_rtz() -> None:
+    """fpf_round_rtz is truncation: never away from zero, never above max."""
+    for name in ("binary16", "bfloat16", "e4m3", "e5m2"):
+        fmt = fp_format(name)
+        _k, _s, mx = fpf_unpack(fpf_max_finite(fmt), fmt)
+        for num in range(1, 400):
+            v = Fraction(num, 7) * _pow2(num % 9 - 4)
+            for sv in (v, -v, v * 10 ** 6):
+                bits = fpf_round_rtz(sv, fmt)
+                k, s, m = fpf_unpack(bits, fmt)
+                assert k == "num" and m <= abs(sv) and m <= mx, (name, sv)
+                assert s == (sv < 0)
+
+
+def check_round_nine_fpn_negative_controls() -> None:
+    """Each FP mistake changes the reference on the cases the tiers build."""
+    rng = random.Random(4343)
+    for cell in sorted(FPN_CELLS):
+        geoms = [g for g in fpn_legal_configs(256, full_vl_only=True)
+                 if (g.w, g.sew) == cell]
+        for key, row in fpw_rows(*cell).items():
+            for bad in FPN_CONTROLS:
+                if not fpn_control_applies(bad, geoms[0], row):
+                    continue
+                hit = False
+                for geom, maker in ((geoms[-1], fpn_case),
+                                    (fpn_special_geometry(geoms),
+                                     fpn_special_case)):
+                    a, b, c = maker(geom, row, rng)
+                    good = fpn_reference_gemm(geom, a, b, c, *row)
+                    if fpn_sabotaged_gemm(bad, geom, a, b, c, *row) != good:
+                        hit = True
+                assert hit, (cell, key, bad)
+
+
+def _ieee_val(bits: int, fmt: FpFormat):
+    """("nan",) / ("inf", s) / ("num", s, Fraction >= 0) -- zero keeps its sign."""
+    k, s, m = fpf_unpack(bits, fmt)
+    if k == "nan":
+        return ("nan",)
+    if k == "inf":
+        return ("inf", s)
+    return ("num", s, m)
+
+
+def _ieee_round(v, fmt: FpFormat, rounder=None) -> int:
+    """Materialise an internal value in *fmt*: default NaN, Inf per the
+    descriptor, signed zero kept, otherwise fpf_round (or *rounder*)."""
+    if v[0] == "nan":
+        return fpf_default_nan(fmt)
+    if v[0] == "inf":
+        return _fpw_materialise(("inf", v[1]), fmt)
+    _n, s, m = v
+    if m == 0:
+        return s << (fmt.width - 1)
+    val = -m if s else m
+    return (rounder or (lambda x, f: fpf_round(x, f, FP_FRM)))(val, fmt)
+
+
+def _ieee_add(x, y):
+    """Exact internal sum of two internal values (spec 1843-1849), with the
+    IEEE 754 6.3 zero-sign rule under RNE: x + (-x) = +0, (-0) + (-0) = -0."""
+    if x[0] == "nan" or y[0] == "nan":
+        return ("nan",)
+    if x[0] == "inf" and y[0] == "inf":
+        return ("nan",) if x[1] != y[1] else x
+    if x[0] == "inf":
+        return x
+    if y[0] == "inf":
+        return y
+    tot = (-x[2] if x[1] else x[2]) + (-y[2] if y[1] else y[2])
+    if tot == 0:
+        both_neg = x[1] and y[1] and x[2] == 0 and y[2] == 0
+        return ("num", 1 if both_neg else 0, Fraction(0))
+    return ("num", 1 if tot < 0 else 0, abs(tot))
+
+
+def _ieee_mul(a_bits, fmt_a, b_bits, fmt_b):
+    """Exact product (spec 1384, 1839-1841); a zero product has sign sa^sb."""
+    x, y = _ieee_val(a_bits, fmt_a), _ieee_val(b_bits, fmt_b)
+    if x[0] == "nan" or y[0] == "nan":
+        return ("nan",)
+    sx = x[1]
+    sy = y[1]
+    if x[0] == "inf" or y[0] == "inf":
+        other = y if x[0] == "inf" else x
+        if other[0] == "num" and other[2] == 0:
+            return ("nan",)
+        return ("inf", sx ^ sy)
+    return ("num", sx ^ sy, x[2] * y[2])
+
+
+def fpn_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
+                       fmt_c: FpFormat, *, rounder=None, acc_fmt=None,
+                       ftz=False):
+    """Round nine's authority for the W=1 narrow cells: Sail fp_gemm at
+    (G, psm, rnd) = (1, 0, frm), with IEEE signed zeros.
+
+    Per group (W products, W = 1 here): S = exact sum (psm=0); S_bits =
+    fp_round_to_frm(S) in fmt_C (rnd=frm); acc = fp_add(acc, S_bits) in
+    fmt_C.  Written against internal (sign, magnitude) values so that a zero
+    keeps its sign: -0 + -0 = -0 and 0 x -1 = -0 (IEEE 754 6.3, which the
+    spec's fp_add / fp_mul_exact follow -- 1831-1860).  This is where it
+    parts company with fpw_reference_gemm, whose _fpw_sum_exact collapses a
+    zero to +0; see check_round_nine_signed_zero.
+
+    Keyword arguments exist for the negative controls only: *rounder*
+    replaces RNE, *acc_fmt* keeps the accumulator in another format and
+    narrows once at the end, *ftz* flushes subnormal inputs and results.
+    """
+    w, groups = geom.w, geom.lam * geom.lmul
+    af = acc_fmt or fmt_c
+
+    def flush(bits, fmt):
+        return _fpn_ftz_bits(bits, fmt) if ftz else bits
+
+    out = [[c[i][j] for j in range(geom.n_max)] for i in range(geom.m)]
+    for i in range(geom.m):
+        for j in range(geom.n):
+            acc = flush(c[i][j], fmt_c)
+            if af is not fmt_c:
+                acc = _ieee_round(_ieee_val(acc, fmt_c), af, rounder)
+            for g in range(groups):
+                s = None
+                for k in range(g * w, (g + 1) * w):
+                    p = _ieee_mul(flush(a[i][k], fmt_a), fmt_a,
+                                  flush(b[j][k], fmt_b), fmt_b)
+                    s = p if s is None else _ieee_add(s, p)
+                s_bits = flush(_ieee_round(s, af, rounder), af)
+                acc = flush(_ieee_round(_ieee_add(_ieee_val(acc, af),
+                                                  _ieee_val(s_bits, af)),
+                                        af, rounder), af)
+            if af is not fmt_c:
+                acc = flush(_ieee_round(_ieee_val(acc, af), fmt_c, rounder),
+                            fmt_c)
+            out[i][j] = acc
+    return out
+
+
+def check_round_nine_signed_zero() -> None:
+    """fpn_reference_gemm keeps IEEE zero signs; fpw_reference_gemm does not.
+
+    Rounds seven and eight's golden bytes come from fpw_reference_gemm, and
+    they are left byte-identical here; the discrepancy is confined to results
+    that are a zero whose sign IEEE makes negative, and is reported.
+    """
+    f = fp_format("binary16")
+    g = next(x for x in fpn_legal_configs(256, full_vl_only=True)
+             if x.sew == 16)
+    neg0 = 0x8000
+    a = [[neg0] * g.k_eff for _ in range(g.m)]      # -0 x +1 = -0
+    b = [[0x3C00] * g.k_eff for _ in range(g.n_max)]
+    c = [[neg0] * g.n_max for _ in range(g.m)]
+    assert fpn_reference_gemm(g, a, b, c, f, f, f)[0][0] == neg0
+    assert fpw_reference_gemm(g, a, b, c, f, f, f)[0][0] == 0   # the gap
+    # x + (-x) is +0 under RNE in both.
+    a2 = [[0x3C00] * g.k_eff for _ in range(g.m)]
+    c2 = [[0xBC00 if g.k_eff == 1 else 0] * g.n_max for _ in range(g.m)]
+    if g.k_eff == 1:
+        assert fpn_reference_gemm(g, a2, b, c2, f, f, f)[0][0] == 0
+    # 0 x -1 = -0 (product sign), and +0 + -0 = +0.
+    a3 = [[0] * g.k_eff for _ in range(g.m)]
+    b3 = [[0xBC00] * g.k_eff for _ in range(g.n_max)]
+    assert fpn_reference_gemm(g, a3, b3, c, f, f, f)[0][0] == neg0
+    c4 = [[0] * g.n_max for _ in range(g.m)]
+    assert fpn_reference_gemm(g, a3, b3, c4, f, f, f)[0][0] == 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256,
@@ -5507,7 +6456,19 @@ def main() -> int:
                   check_round_eight_ofp8_decode,
                   check_round_eight_ofp8_round,
                   check_round_eight_negative_controls,
-                  check_round_eight_nan_controls):
+                  check_round_eight_nan_controls,
+                  check_round_nine_int_cells,
+                  check_round_nine_int4_packing,
+                  check_round_nine_sail_equivalence,
+                  check_round_nine_signedness_material,
+                  check_round_nine_int64_wrap,
+                  check_round_nine_negative_controls,
+                  check_round_nine_fpn_encoding_map,
+                  check_round_nine_fpn_gemm,
+                  check_round_nine_fpn_special_values,
+                  check_round_nine_fpn_rtz,
+                  check_round_nine_fpn_negative_controls,
+                  check_round_nine_signed_zero):
         check()
         print(f"  ok  {check.__name__}")
 

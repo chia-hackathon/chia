@@ -586,9 +586,68 @@ ALL_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
 ROUND_FIVE_TIERS = ("clayout",)
 
 
+#: Round nine (2026-09-26) completes the integer half of the Zvvm table and
+#: opens the W=1 narrow floating-point cells.  Like round five it adds no
+#: mnemonic -- every cell below belongs to an instruction rounds one to four
+#: already emit -- so it is named by tier tokens and kept out of ALL_INSNS.
+#:
+#: Integer (spec 810-825, tbl-int-encoding-map 7389-7455).  Before round
+#: nine the directed suite generated 8 of the 13 integer cells, signed only:
+#: Zvvi8mm, Zvvi16mm, Zvvi32mm, Zvvi64mm (vmmacc.vv), Zvvi8i16mm,
+#: Zvvi16i32mm (vwmmacc.vv), Zvvi8i32mm (vqmmacc.vv), Zvvi8i64mm
+#: (v8wmmacc.vv).  Round nine adds
+#:
+#:   ``int4``     Zvvi4i8mm   vwmmacc.vv  W=2 SEW=8   [U]Int4 -> Int8
+#:                Zvvi4i16mm  vqmmacc.vv  W=4 SEW=16  [U]Int4 -> Int16
+#:                Zvvi4i32mm  v8wmmacc.vv W=8 SEW=32  [U]Int4 -> Int32
+#:                (two per byte, element 2n in the low nibble, spec
+#:                1206-1219)
+#:   ``int64``    Zvvi16i64mm vqmmacc.vv  W=4 SEW=64  [U]Int16 -> Int64
+#:                Zvvi32i64mm vwmmacc.vv  W=2 SEW=64  [U]Int32 -> Int64
+#:   ``intsign``  the unsigned and mixed-sign rows of ALL thirteen cells.
+#:                Signedness is vtype.altfmt_A / altfmt_B (0 = signed,
+#:                1 = unsigned, independent per operand; C always signed --
+#:                spec 486, 1145-1154, 7375), written with vsetvl (spec
+#:                852-853, 888-909).  At W=1 it cannot change a result bit,
+#:                so those programs test acceptance; at W>1 it is arithmetic.
+#:
+#: rvv_ref.INT_CELLS transcribes the table; INT_CELLS_BEFORE_R9 derives the
+#: 8-of-13 claim from the older tiers rather than asserting it.
+ROUND_NINE_INT_TIERS = ("int4", "int64", "intsign")
+
+#: Floating point: the W=1 narrow cells of vfmmacc.vv that rounds four and
+#: eight deferred (spec 7296-7311), token ``fpnarrow``:
+#:
+#:   Zvvfp16mm   SEW=16  binary16 x binary16 -> binary16      (0,0,0)
+#:   Zvvbf16mm   SEW=16  bfloat16 x bfloat16 -> bfloat16      (1,1,1)
+#:               mixed binary16 x bfloat16, C either (needs both, 1462-1478)
+#:   Zvvofp8mm   SEW=8   E4M3/E5M2 x E4M3/E5M2 -> E4M3 / E5M2 (8 rows) --
+#:               the first live cell that ROUNDS to OFP8.  Overflow, default
+#:               NaN and frm follow rvv_ref.OFP8_DISCLOSURE (nonsat: E4M3 ->
+#:               NaN, E5M2 -> Inf; NaN 0x7F / 0x7E; RNE only).
+#:
+#: Judged against rvv_ref.fpn_reference_gemm (G=1, psm=0, rnd=frm at W=1:
+#: product rounded to fmt_C, then added and rounded in fmt_C; IEEE signed
+#: zeros) through embedded golden bytes -- baseline rv64imafd cannot round
+#: to 8/16-bit formats, so there is no exact tier.  ROUND_EIGHT_UNSUPPORTED
+#: still lists Zvvofp8mm: that tuple is round eight's declaration and is
+#: left as history; ROUND_NINE_SUPPORTED supersedes it.
+ROUND_NINE_FP_TIERS = ("fpnarrow",)
+
+#: The mnemonics round nine's tiers exercise.  All are already in ALL_INSNS.
+ROUND_NINE_INSNS = ("vmmacc.vv", "vwmmacc.vv", "vqmmacc.vv", "v8wmmacc.vv",
+                    "vfmmacc.vv")
+
+ROUND_NINE_SUPPORTED = (
+    "Zvvi4i8mm", "Zvvi4i16mm", "Zvvi4i32mm", "Zvvi16i64mm", "Zvvi32i64mm",
+    "Zvvfp16mm", "Zvvbf16mm", "Zvvofp8mm",
+)
+
+ROUND_NINE_TIERS = ROUND_NINE_INT_TIERS + ROUND_NINE_FP_TIERS
+
 #: The full selectable scope: every instruction, plus every check tier.
 #: ``TITAN_INSNS`` validates against this, not against ALL_INSNS.
-ALL_SCOPE = ALL_INSNS + ROUND_FIVE_TIERS
+ALL_SCOPE = ALL_INSNS + ROUND_FIVE_TIERS + ROUND_NINE_TIERS
 
 #: What a seeded tree already implements, and what this round adds.
 #: ``helpers.instruction_scope`` reads these two names first and only falls
@@ -597,11 +656,17 @@ ALL_SCOPE = ALL_INSNS + ROUND_FIVE_TIERS
 #: them and every prompt names the right halves: rounds one and two are the
 #: regression surface, round three is the work.
 IMPLEMENTED_INSNS = (ROUND_ONE_INSNS + ROUND_TWO_INSNS + ROUND_THREE_INSNS
-                     + ROUND_FOUR_INSNS + ROUND_SIX_INSNS + ROUND_SEVEN_INSNS)
+                     + ROUND_FOUR_INSNS + ROUND_SIX_INSNS + ROUND_SEVEN_INSNS
+                     + ROUND_EIGHT_INSNS)
 # Round 8 (2026-09-24) adds OFP8 (E4M3/E5M2) input *cells*: the new mnemonic
 # vf8wmmacc plus new cells of vfwmmacc/vfqmmacc, whose IEEE cells are round 7
 # and must keep passing.  Hence the overlap with IMPLEMENTED_INSNS.
-NEW_INSNS = ROUND_EIGHT_INSNS + ROUND_SEVEN_INSNS
+# Round 9 (2026-09-26) adds no mnemonic: new cells (Int4, Int16/Int32->Int64,
+# and the W=1 narrow FP cells) and the unsigned / mixed-sign altfmt_A/B rows
+# of instructions rounds 1-4 implement for their signed / wide cells, which
+# must keep passing.  So NEW_INSNS is entirely an overlap with
+# IMPLEMENTED_INSNS, by design.
+NEW_INSNS = ROUND_NINE_INSNS
 
 
 def _scope_insns() -> tuple:
@@ -640,6 +705,7 @@ def _scope_insns() -> tuple:
              "six": ROUND_SIX_INSNS, "6": ROUND_SIX_INSNS,
              "seven": ROUND_SEVEN_INSNS, "7": ROUND_SEVEN_INSNS,
              "eight": ROUND_EIGHT_INSNS, "8": ROUND_EIGHT_INSNS,
+             "nine": ROUND_NINE_TIERS, "9": ROUND_NINE_TIERS,
              "all": ALL_SCOPE, "": ALL_SCOPE}
     if raw.lower() in named:
         return named[raw.lower()]
@@ -648,7 +714,7 @@ def _scope_insns() -> tuple:
     if unknown:
         raise ValueError(
             f"TITAN_INSNS={raw!r}: unknown mnemonic(s) {unknown}; "
-            f"expected a round name (one/two/three/four/five/six/all) or a "
+            f"expected a round name (one..nine/all) or a "
             f"subset of {ALL_SCOPE}")
     return chosen
 
@@ -715,7 +781,11 @@ MAX_ITERS = int(os.environ.get("TITAN_MAX_ITERS", "60"))
 #: microarchitecture search, so it should converge in far fewer turns
 #: than the RTL stage -- and if it does not, that is a signal about the
 #: spec or the prompt rather than a reason to keep paying.
-MODEL_MAX_ITERS = int(os.environ.get("TITAN_MODEL_MAX_ITERS", "25"))
+#: r26: it used to ignore TITAN_MAX_ITERS entirely, so a launch with
+#: TITAN_MAX_ITERS=10 still let Stage 0 run 25 attempts ($458).  An explicit
+#: TITAN_MODEL_MAX_ITERS wins; otherwise the cap is min(25, MAX_ITERS).
+MODEL_MAX_ITERS = int(os.environ.get("TITAN_MODEL_MAX_ITERS",
+                                     str(min(25, MAX_ITERS))))
 DEBUG_MAX_ITERS = int(os.environ.get("TITAN_DEBUG_MAX_ITERS", "5"))
 SIM_TIMEOUT_CYCLES = int(os.environ.get("TITAN_SIM_TIMEOUT_CYCLES", "10000000"))
 

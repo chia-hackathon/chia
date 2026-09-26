@@ -60,7 +60,7 @@ import argparse
 import random
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Sequence, Tuple
 
 import ime_encodings as ime
@@ -264,7 +264,7 @@ def _configure(geom: TileGeometry, *, lmul: int, vl: int,
     return [
         f"    # {comment}",
         f"    li    t0, {vl}",
-        f"    li    t1, 0x{vtype_value(geom, lmul=lmul):x}",
+        f"    li    t1, 0x{vtype_value(geom, lmul=lmul, altfmt_a=geom.altfmt_ab[0], altfmt_b=geom.altfmt_ab[1]):x}",
         "    vsetvl x0, t0, t1",
     ]
 
@@ -867,6 +867,12 @@ def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
         used = (geom.load_mnemonic, geom.mnemonic, geom.store_mnemonic)
     for mnemonic in used:
         head.append(f"#   {mnemonic}")
+    if tuple(geom.altfmt_ab) != (0, 0):
+        # Round nine; absent from every signed program, so rounds one to
+        # eight stay byte-identical.
+        head.append(f"# vtype.altfmt_A={geom.altfmt_ab[0]} altfmt_B="
+                    f"{geom.altfmt_ab[1]} (0 = signed, 1 = unsigned; spec "
+                    f"1145-1154)")
     head += [
         "",
         "    .text",
@@ -956,6 +962,14 @@ def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
             width = geom.m
             buf = rvv_ref.tile_layout_buffer_t(mat, width, geom)
         chunked = [buf[i:i + width] for i in range(0, len(buf), width)]
+        if geom.eew_ab == 4:
+            # Round nine's Int4 / UInt4 cells: two logical elements per byte,
+            # element 2n in the LOW nibble (spec 1206-1219).  K_eff is even
+            # at every W >= 2, so a line never splits a byte.  The nibble
+            # image is signedness-blind; altfmt_A/B decide how it is read.
+            data += ["    .balign 8"] + _matrix_data(
+                label, [rvv_ref.int_pack_int4(row) for row in chunked], 8)
+            continue
         data += ["    .balign 8"] + _matrix_data(label, chunked, geom.eew_ab)
     data += ["    .balign 8", "c_ime:",
              f"    .zero {geom.m * geom.m * geom.sew // 8}",
@@ -2555,9 +2569,25 @@ def mxl_cases(vlen: int, mnemonic: str) -> List[MxlCase]:
     #        and an implementation must trap; it is documented as
     #        multiply-illegal because a green result here does not prove
     #        that *this* check is the one that fired.
-    add("SEW*LAMBDA = 8 < pw = 16 (Sail 5155); also a reserved cell and "
-        "EMUL_C=32, so this only asserts that something traps",
-        8, 1, 1)
+    #
+    #    r26: at VLEN >= 256 LAMBDA=1 is not architecturally permissible at
+    #    SEW=8 at all (EMUL_C = VLEN/8 >= 32; spec 139-145, 975-988), so a
+    #    vsetvl asking for it MUST read back a permissible value (spec
+    #    1050-1054) and the old "read back exactly 1" check demanded a WARL
+    #    violation.  The request is kept -- it is the WARL probe that
+    #    convicts a DUT which retains lambda=1 -- but emit_mxl_test checks the
+    #    read-back against the permissible set instead (see
+    #    _mxl_lambda_is_permissible), and the tag says what is really judged.
+    if 1 in rvv_ref.permissible_lambdas(vlen, 8):
+        add("SEW*LAMBDA = 8 < pw = 16 (Sail 5155); also a reserved cell and "
+            "EMUL_C=32, so this only asserts that something traps",
+            8, 1, 1)
+    else:
+        add(f"LAMBDA=1 at SEW=8 is not permissible at VLEN={vlen} "
+            f"(EMUL_C={vlen // 8}, spec 139-145/975-988): vtype.lambda must "
+            f"read back one of {rvv_ref.permissible_lambdas(vlen, 8)} "
+            f"(spec 1050-1054), and the reserved cell must still trap",
+            8, 1, 1)
 
     # 6. The vm=1 regression.  Same funct6, same vtype as case 4 -- which is
     #    illegal for the MX form precisely because altfmt_A=1 -- but at vm=1
@@ -2580,7 +2610,71 @@ def mxl_cases(vlen: int, mnemonic: str) -> List[MxlCase]:
                                            hex(mx_word), hex(int_word))
     assert any(c.expect_trap for c in cases), mnemonic
     assert any(not c.expect_trap for c in cases), mnemonic
+    for c in cases:
+        if _mxl_lambda_is_permissible(c):
+            continue
+        # The DUT must substitute a permissible lambda; the verdict may not
+        # depend on which one it picks.
+        for lam in rvv_ref.permissible_lambdas(vlen, c.geom.sew):
+            assert c.vm == 0 and _mxl_is_illegal(
+                w, c.geom.sew, lam, c.geom.lmul, bs=0, altfmt=0,
+                altfmt_a=0, altfmt_b=0), (mnemonic, c.tag, lam)
     return cases
+
+
+def _mxl_lambda_is_permissible(case: "MxlCase") -> bool:
+    """Is the lambda this case requests architecturally permissible?
+
+    When it is not, WARL forbids the DUT from retaining it, so the program
+    must accept any permissible read-back rather than skipping on anything
+    but the request.  Derived from rvv_ref, like helpers._permissible, so the
+    tier and the classifier cannot disagree.
+    """
+    g = case.geom
+    return g.lam in rvv_ref.permissible_lambdas(g.vlen, g.sew)
+
+
+def _mxl_case_desc(case: "MxlCase", mnemonic: str) -> str:
+    """The case's OWN geometry for its TITAN SKIP line.
+
+    r26: the SKIP line used to carry the program's nominal geometry
+    (``SEW=32 LAMBDA=1`` for vfqimmacc), so a read-back at SEW=8 was
+    classified -- and reported to the agent -- as a SEW=32 round-up.  Same
+    family as the r19 defect the ``case=`` field was added for: the verdict
+    named the wrong case.  ``VLEN= SEW= LAMBDA=`` stay adjacent and first
+    for helpers._GEOM_RE.  No M/N/EMUL_C: a reserved cell has none.
+    """
+    g = case.geom
+    return (f"VLEN={g.vlen} SEW={g.sew} LAMBDA={g.lam} W={g.w} "
+            f"LMUL={g.lmul} VL={case.vl} MXL={mnemonic} vm={case.vm} "
+            f"vtype=0x{case.vtype:x}")
+
+
+def _check_lambda_permissible(vlen: int, sew: int,
+                              xlen: int = 64) -> List[str]:
+    """Continue if vtype.lambda holds ANY permissible value, else skip.
+
+    For a request WARL cannot honour: the spec fixes which values are legal
+    answers, not which one this implementation supports, so the check is set
+    membership.  An impermissible read-back (the request itself, or 0) goes
+    to .Lskip, whose line the classifier turns into ``bad_geometry`` because
+    the value is outside helpers._permissible.
+    """
+    offset, width = ime.VTYPE_IME_FIELDS["lambda"]
+    out = [
+        "    csrr  t2, vtype",
+        f"    srli  t3, t2, {xlen - offset}",
+        f"    andi  t3, t3, {(1 << width) - 1}",
+    ]
+    for lam in rvv_ref.permissible_lambdas(vlen, sew):
+        out += [f"    li    t4, {ime.lambda_imm(lam)}",
+                "    beq   t3, t4, 1f"]
+    out += [
+        "    mv    a1, t3             # report the lambda the DUT chose",
+        "    j     .Lskip",
+        "1:",
+    ]
+    return out
 
 
 def emit_mxl_test(vlen: int, mnemonic: str, name: str = "ime_mxl") -> str:
@@ -2678,7 +2772,13 @@ def emit_mxl_test(vlen: int, mnemonic: str, name: str = "ime_mxl") -> str:
         # -altfmt case further down the list.  a2 carries the index so the
         # two are distinguishable.
         body.append(f"    li    a3, {index}       # case index, for TITAN SKIP")
-        body += _check_lambda_retained(case.geom)
+        # r26: and the case's own requested lambda and geometry, not the
+        # program's nominal one -- see _mxl_case_desc.
+        body.append(f"    la    a4, .Lfmt_skip_{index}")
+        if _mxl_lambda_is_permissible(case):
+            body += _check_lambda_retained(case.geom)
+        else:
+            body += _check_lambda_permissible(vlen, case.geom.sew)
         body += [
             f"    .insn 4, {case.word:#010x}"
             f"    # {case.mnemonic} (vm={case.vm})",
@@ -2709,7 +2809,7 @@ def emit_mxl_test(vlen: int, mnemonic: str, name: str = "ime_mxl") -> str:
         "    li    t1, 1",
         "    sll   a1, t1, t0         # lambda = 1 << (imm - 1)",
         "1:",
-        "    la    a0, .Lfmt_skip",
+        "    mv    a0, a4             # the skipping case's own format",
         "    call  printf",
         f"    li    s1, {EXIT_UNSUPPORTED_GEOMETRY}",
         "    j     .Lret",
@@ -2765,8 +2865,12 @@ def emit_mxl_test(vlen: int, mnemonic: str, name: str = "ime_mxl") -> str:
     data = [
         "", "    .data", "    .balign 8",
         f'.Lfmt_pass:  .asciz "TITAN PASS {desc}\\n"',
-        f'.Lfmt_skip:  .asciz "TITAN SKIP lambda=%d (requested {shown.lam}) '
-        f'imm=%d case=%d {desc}\\n"',
+    ] + [
+        f'.Lfmt_skip_{index}:  .asciz "TITAN SKIP lambda=%d (requested '
+        f'{case.geom.lam}) imm=%d case=%d {_mxl_case_desc(case, mnemonic)}'
+        f'\\n"'
+        for index, case in enumerate(cases)
+    ] + [
         f'.Lfmt_fail:  .asciz "TITAN FAIL row=%d col=%d {desc}\\n"',
         '.Lfmt_diff:  .asciz "TITAN DIFF r=%d c=%d exp=0x%x got=0x%x\\n"',
     ]
@@ -3147,8 +3251,12 @@ def _fpw_ime_path(geom: TileGeometry, alloc: VectorAlloc, key) -> List[str]:
                           comment=f"compute config (VL={geom.vl} -> "
                                   f"N={geom.n})")
     out += [
-        f"    {ime.insn(geom.mnemonic, vd=alloc.c, vs1=alloc.a, vs2=alloc.b, vm=1)}"
-        f"    # {geom.mnemonic} v{alloc.c}, v{alloc.a}, v{alloc.b}",
+        # vfmmacc.vv (round nine's W=1 cells) has no vm operand: its vm=0
+        # is reserved (spec 1257), so its encoder fixes vm=1 itself.
+        (f"    {ime.insn(geom.mnemonic, vd=alloc.c, vs1=alloc.a, vs2=alloc.b)}"
+         if geom.w == 1 else
+         f"    {ime.insn(geom.mnemonic, vd=alloc.c, vs1=alloc.a, vs2=alloc.b, vm=1)}")
+        + f"    # {geom.mnemonic} v{alloc.c}, v{alloc.a}, v{alloc.b}",
     ]
     out += _fpw_configure(geom, lmul=geom.lmul_c, vl=geom.vl_c_full, key=key,
                           comment="back to the C tile config to store")
@@ -3325,6 +3433,24 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
             "#   altfmt_A/altfmt_B = 0 -> E4M3, 1 -> E5M2 (spec 1133-1140).",
             "#",
         ]
+    if (geom.w, geom.sew) in rvv_ref.FPN_CELLS:
+        # Round nine only (byte-identity for rounds seven / eight).
+        d = rvv_ref.OFP8_DISCLOSURE
+        head += [
+            "# Round nine: vfmmacc.vv narrow cell (W=1), spec 7296-7311.",
+            "# Per k: S = round_frm(a*b) in fmt_C, acc = round_frm(acc + S)",
+            "# in fmt_C -- two roundings per term, both in the accumulator",
+            "# format; IEEE signed zeros (rvv_ref.fpn_reference_gemm).",
+        ]
+        if geom.sew == 8:
+            head += [
+                "# OFP8 accumulator (Zvvofp8mm), Titan disclosure "
+                "(rvv_ref.OFP8_DISCLOSURE):",
+                f"#   overflow={d['overflow']} (E4M3 -> NaN, E5M2 -> Inf), "
+                f"default NaN E4M3 0x{d['default_nan']['e4m3']:02x} / "
+                f"E5M2 0x{d['default_nan']['e5m2']:02x}, frm={d['frm']}.",
+            ]
+        head.append("#")
     if plan.tier == "special":
         head += [
             "# Special-value tier (round eight): OFP8 NaN / Inf / max /",
@@ -3404,8 +3530,13 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
              f"    .zero {geom.m * geom.m * width // 8}",
              "    .balign 8", "c_rvv:"]
     if plan.tier in ("golden", "special"):
-        tile = rvv_ref.fpw_reference_gemm(geom, plan.a, plan.b, plan.c,
-                                          fmt_a, fmt_b, fmt_c)
+        # Round nine's W=1 narrow cells are judged by fpn_reference_gemm
+        # (IEEE signed zeros); rounds seven / eight keep fpw_reference_gemm
+        # so their golden bytes do not move.
+        gemm = (rvv_ref.fpn_reference_gemm
+                if (geom.w, geom.sew) in rvv_ref.FPN_CELLS
+                else rvv_ref.fpw_reference_gemm)
+        tile = gemm(geom, plan.a, plan.b, plan.c, fmt_a, fmt_b, fmt_c)
         golden = rvv_ref.fpw_golden_bytes(geom, tile, fmt_c)
         assert len(golden) == geom.m * geom.n_max * (width // 8)
         # Emitted at the accumulator width rather than as raw bytes so that a
@@ -3423,6 +3554,8 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
 
 def _fpw_round_word(geom: TileGeometry) -> str:
     """"seven" or "eight": which round made this geometry's cell live."""
+    if (geom.w, geom.sew) in rvv_ref.FPN_CELLS:
+        return "nine"
     return ("eight" if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_EIGHT_CELLS
             else "seven")
 
@@ -3511,6 +3644,279 @@ def fpw_directed_tiers(vlen: int, insns: Sequence[str], seed: int = 0):
                         f"{plan.altfmt_a}{plan.altfmt_b}{plan.altfmt}")
                 out.append((name, emit_fpw_test(plan, name), geom))
     return out
+
+
+# ---------------------------------------------------------------------------
+# round nine: Int4 / Int64 cells and the [U]Int signedness rows
+# ---------------------------------------------------------------------------
+
+#: Name prefixes of round nine's new integer cells (signed rows).
+INT9_CELL_PREFIX = {(2, 8): "ime_i4w_", (4, 16): "ime_i4q_",
+                    (8, 32): "ime_i48w_", (4, 64): "ime_i64q_",
+                    (2, 64): "ime_i64w_"}
+
+#: Round nine's integer tier tokens -> which cells / rows they select.
+INT9_TOKENS = ("int4", "int64", "intsign")
+
+#: The non-default signedness rows, in the order the rotation walks them.
+INT9_SIGN_ROWS = ((0, 1), (1, 0), (1, 1))
+
+
+def _int9_ok(geom: TileGeometry) -> bool:
+    if geom.emul_c == 16:
+        return False
+    try:
+        VectorAlloc.allocate(geom)
+    except ValueError:
+        return False
+    return True
+
+
+def _int9_partial(geoms):
+    """One partial-N geometry: half of N_max at the first shape with N_max>1.
+
+    The per-iteration suite otherwise runs full VL only, and partial N is
+    where the C tile tail policy lives -- for a cell nothing earlier has
+    ever exercised, that is worth one program per iteration, not just the
+    gate.
+    """
+    for g in geoms:
+        if g.n_max > 1:
+            n = g.n_max // 2
+            return replace(g, vl=n * g.lam * g.lmul)
+    return None
+
+
+def int9_geometries(vlen: int, tokens: Sequence[str], *,
+                    full_vl_only: bool = True,
+                    sews: Sequence[int] = (8, 16, 32, 64),
+                    lmuls: Sequence[int] = (1, 2, 4, 8)):
+    """(prefix, geometry) for round nine's integer tiers, in emission order.
+
+    ``int4`` / ``int64``: every legal geometry of the new cells, signed row
+    (plus one partial-N geometry per cell in the per-iteration suite).
+    ``intsign``: every one of the thirteen cells (spec 810-825), the three
+    non-signed rows rotated over its geometries so every geometry carries
+    one of them and every row lands on at least one geometry per cell, plus
+    one partial-N geometry per cell.  Shared by directed_suite, ime_stress
+    and sim_check so the three cannot disagree about what round nine is.
+    """
+    out = []
+    for token, cells in (("int4", rvv_ref.ROUND_NINE_INT4_CELLS),
+                         ("int64", rvv_ref.ROUND_NINE_INT64_CELLS)):
+        if token not in tokens:
+            continue
+        for cell in cells:
+            if cell[1] not in sews:
+                continue
+            geoms = [g for g in rvv_ref.int_cell_geometries(
+                vlen, cell, full_vl_only=full_vl_only, lmuls=lmuls)
+                if _int9_ok(g)]
+            if full_vl_only:
+                part = _int9_partial(geoms)
+                if part is not None:
+                    geoms.append(part)
+            out += [(INT9_CELL_PREFIX[cell], g) for g in geoms]
+    if "intsign" in tokens:
+        for index, cell in enumerate(sorted(rvv_ref.INT_CELLS)):
+            if cell[1] not in sews:
+                continue
+            geoms = [g for g in rvv_ref.int_cell_geometries(
+                vlen, cell, full_vl_only=full_vl_only, lmuls=lmuls)
+                if _int9_ok(g)]
+            if not geoms:
+                continue
+            picked = []
+            for pos, g in enumerate(geoms):
+                picked.append(replace(
+                    g, altfmt_ab=INT9_SIGN_ROWS[(pos + index) % 3]))
+            have = {g.altfmt_ab for g in picked}
+            for row in INT9_SIGN_ROWS:
+                if row not in have:
+                    # Too few geometries for the rotation to reach every row
+                    # (a two-shape cell at VLEN=128): put the missing row on
+                    # the last shape rather than dropping it.
+                    picked.append(replace(geoms[-1], altfmt_ab=row))
+            if full_vl_only:
+                part = _int9_partial(geoms)
+                if part is not None:
+                    picked.append(replace(part,
+                                          altfmt_ab=INT9_SIGN_ROWS[index % 3]))
+            out += [("ime_sg{}_w{}_".format(
+                "".join("su"[v] for v in g.altfmt_ab), g.w), g)
+                for g in picked]
+    return out
+
+
+def int9_directed_tiers(vlen: int, tokens: Sequence[str], seed: int = 0, *,
+                        full_vl_only: bool = True,
+                        sews: Sequence[int] = (8, 16, 32, 64),
+                        lmuls: Sequence[int] = (1, 2, 4, 8)):
+    """Round nine's integer programs: the ordinary paired shape.
+
+    Same emit_test as rounds one to three -- the IME path and an RVV 1.0
+    reference path over one data set, compared element by element -- because
+    nothing about the new cells needs a different judge:
+
+      * Int4: the tile image is nibble-packed (emit_test), the RVV copy
+        (mat_a / mat_b) carries each element already extended to SEW, so an
+        ordinary vmul.vv / vredsum.vs reproduces Sail int_block_dot.
+      * Int64: vmul.vv / vredsum.vs at e64 wrap modulo 2**64, which is the
+        spec's single reduction of the exact sum (spec 1275-1277).
+      * Unsigned: the RVV copy holds the *zero*-extended value; the vtype
+        words carry altfmt_A / altfmt_B (vtype_value, via _configure).
+
+    Its own rng (seed + 9000), so nothing earlier moves.
+    """
+    rng = random.Random(seed + 9000)
+    out = []
+    for prefix, geom in int9_geometries(vlen, tokens,
+                                        full_vl_only=full_vl_only,
+                                        sews=sews, lmuls=lmuls):
+        name = (f"{prefix}sew{geom.sew}_lam{geom.lam}_lmul{geom.lmul}"
+                f"_n{geom.n}")
+        out.append((name, emit_test(geom, rvv_ref.random_case(geom, rng),
+                                    name), geom))
+    return out
+
+
+def check_round_nine_int_emission() -> None:
+    """Round nine's integer programs, structurally.
+
+    The vtype words carry the geometry's altfmt_A / altfmt_B bits (and only
+    those IME bits besides lambda), an Int4 tile is nibble-packed in the
+    spec's order, and the RVV copy holds the value the altfmt row reads.
+    """
+    progs = int9_directed_tiers(256, INT9_TOKENS, seed=3)
+    names = [n for n, _, _ in progs]
+    assert len(set(names)) == len(names), "round-nine names collide"
+    cells = {(g.w, g.sew) for _, _, g in progs}
+    assert cells == set(rvv_ref.INT_CELLS), sorted(cells)
+    rows = {((g.w, g.sew), g.altfmt_ab) for _, _, g in progs}
+    for cell in rvv_ref.INT_CELLS:
+        for signs in rvv_ref.INT_SIGNS:
+            if signs == (0, 0) and cell not in rvv_ref.ROUND_NINE_INT_CELLS:
+                continue      # rounds one to three's signed programs
+            assert (cell, signs) in rows, (cell, signs)
+    assert any(g.n < g.n_max for _, _, g in progs)
+    off_a, _ = ime.VTYPE_IME_FIELDS["altfmt_A"]
+    off_b, _ = ime.VTYPE_IME_FIELDS["altfmt_B"]
+    for name, asm, geom in progs:
+        words = [int(m, 16) for m in
+                 re.findall(r"li    t1, 0x([0-9a-f]+)\n    vsetvl", asm)]
+        assert len(words) == 4, name
+        for word in words:
+            assert (word >> (64 - off_a)) & 1 == geom.altfmt_ab[0], name
+            assert (word >> (64 - off_b)) & 1 == geom.altfmt_ab[1], name
+        if geom.eew_ab == 4:
+            assert "mat_a_tile:\n    .byte" in asm, name
+    # Nibble order, end to end on one program: the first A line of the tile
+    # image is the packed pair (A[0][0], A[0][1]) with element 0 low.
+    geom = next(g for _, _, g in progs if g.eew_ab == 4)
+    a, b, c = rvv_ref.random_case(geom, random.Random(1))
+    asm = emit_test(geom, (a, b, c), "probe")
+    line = asm.split("mat_a_tile:\n")[1].split("\n")[0]
+    first = int(line.split()[1].rstrip(","), 16)
+    assert first == ((a[0][0] & 0xF) | ((a[0][1] & 0xF) << 4)), line
+    # ... and the RVV copy of an unsigned all-ones Int4 is 15, not -1.
+    ug = replace(geom, altfmt_ab=(1, 1))
+    ones = ([[15] * ug.k_eff for _ in range(ug.m)],
+            [[15] * ug.k_eff for _ in range(ug.n_max)], c)
+    asm = emit_test(ug, ones, "probe")
+    assert "mat_a:\n    .byte 0xf," in asm, asm.split("mat_a:\n")[1][:40]
+    # And a signed program is byte-identical to what it was before the
+    # altfmt_ab field existed: the default contributes nothing.
+    base = rvv_ref.TileGeometry(256, 32, 2, 1, 2, 4)
+    assert "altfmt_A" not in emit_test(base, rvv_ref.random_case(
+        base, random.Random(0)), "probe")
+
+
+# ---------------------------------------------------------------------------
+# round nine: vfmmacc.vv's narrow cells (Zvvfp16mm, Zvvbf16mm, Zvvofp8mm)
+# ---------------------------------------------------------------------------
+
+FPN_TOKEN = "fpnarrow"
+
+
+def fpn_directed_tiers(vlen: int, seed: int = 0):
+    """``(name, asm, geometry)`` for the W=1 narrow floating-point cells.
+
+    The round-seven program shape (emit_fpw_test) at W=1: golden bytes from
+    rvv_ref.fpn_reference_gemm, because no baseline rv64imafd instruction
+    rounds to binary16, bfloat16 or OFP8, so there is no exact tier.
+    Per cell: every full-VL geometry x every encoding row (golden); one
+    partial-N geometry x every row (golden); one special-value geometry x
+    every row (rvv_ref.fpn_special_case: NaN / Inf / max / subnormal
+    operands, accumulator overflow, NaN and subnormal C).  Own rng
+    (seed + 9500).
+    """
+    rng = random.Random(seed + 9500)
+    out = []
+    for (w, sew) in rvv_ref.fpn_resolved_cells():
+        geoms = [g for g in rvv_ref.fpn_legal_configs(vlen, full_vl_only=True)
+                 if (g.w, g.sew) == (w, sew) and g.emul_c != 16
+                 and _allocatable_here(g)]
+        if not geoms:
+            continue
+        part = next((replace(g, vl=(g.n_max // 2) * g.lam * g.lmul)
+                     for g in geoms if g.n_max > 1), None)
+        rows = rvv_ref.fpw_rows(w, sew)
+        plans = [(g, "golden") for g in geoms]
+        if part is not None:
+            plans.append((part, "golden"))
+        sg = rvv_ref.fpn_special_geometry(geoms)
+        if sg is not None:
+            plans.append((sg, "special"))
+        for geom, tier in plans:
+            for key, row in rows.items():
+                mixed = row[0].name != row[1].name
+                case = (rvv_ref.fpn_special_case(geom, row, rng)
+                        if tier == "special"
+                        else rvv_ref.fpn_case(geom, row, rng))
+                plan = FpwPlan(geom, key, tier, *case,
+                               tag=("narrow W=1, " + ("mixed-format row"
+                                                      if mixed else
+                                                      "same-format row")))
+                name = (f"ime_fpn_{tier}_sew{sew}_l{geom.lam}_m{geom.lmul}"
+                        f"_n{geom.n}_{plan.altfmt_a}{plan.altfmt_b}"
+                        f"{plan.altfmt}")
+                out.append((name, emit_fpw_test(plan, name), geom))
+    return out
+
+
+def check_round_nine_fpn_emission() -> None:
+    """The narrow-FP programs: vtype rows, golden bytes, OFP8 disclosure."""
+    progs = fpn_directed_tiers(256, seed=5)
+    names = [n for n, _, _ in progs]
+    assert len(set(names)) == len(names)
+    seen = {(g.sew, n.rsplit("_", 1)[1]) for n, _, g in progs}
+    for (w, sew) in rvv_ref.FPN_CELLS:
+        for key in rvv_ref.fpw_rows(w, sew):
+            assert (sew, f"{key[0]}{key[1]}{key[2]}") in seen, (sew, key)
+    assert any("_special_" in n for n in names)
+    assert any(g.n < g.n_max for _, _, g in progs)
+    off_a, _ = ime.VTYPE_IME_FIELDS["altfmt_A"]
+    off_b, _ = ime.VTYPE_IME_FIELDS["altfmt_B"]
+    lsb, _ = ime.VTYPE_BASE_FIELDS["altfmt"]
+    for name, asm, geom in progs:
+        assert "# vfmmacc.vv " in asm and "Round nine" in asm, name
+        key = tuple(int(x) for x in name.rsplit("_", 1)[1])
+        for word in (int(m, 16) for m in re.findall(
+                r"li    t1, 0x([0-9a-f]+)\n    vsetvl", asm)):
+            assert ((word >> (64 - off_a)) & 1, (word >> (64 - off_b)) & 1,
+                    (word >> lsb) & 1) == key, name
+        if geom.sew == 8:
+            assert "nonsat" in asm and "0x7f" in asm.lower(), name
+    # The golden tile is fpn_reference_gemm's, not fpw_reference_gemm's.
+    g = progs[0][2]
+    rows = rvv_ref.fpw_rows(g.w, g.sew)
+    key, row = next(iter(rows.items()))
+    a, b, c = rvv_ref.fpn_case(g, row, random.Random(3))
+    asm = emit_fpw_test(FpwPlan(g, key, "golden", a, b, c), "probe")
+    tile = rvv_ref.fpn_reference_gemm(g, a, b, c, *row)
+    first = tile[0][0] & ((1 << g.sew) - 1)
+    assert f"c_rvv:\n    # golden C tile, row-major M x N_max, from rvv_ref\n" \
+           f"    {_DATA_DIRECTIVE[g.sew]} 0x{first:x}," in asm
 
 
 def directed_suite(vlen: int, seed: int = 0,
@@ -3676,6 +4082,19 @@ def directed_suite(vlen: int, seed: int = 0,
                    if m in insns]
     if round_seven:
         out += fpw_directed_tiers(vlen, round_seven, seed)
+
+    # Round nine, appended last for the same byte-identity reason, and
+    # keyed on *tier tokens* like round five's clayout: it adds no mnemonic,
+    # only cells and signedness rows of instructions rounds one to three
+    # already emit.  See int9_geometries.
+    round_nine = [t for t in INT9_TOKENS if t in insns]
+    if round_nine:
+        out += int9_directed_tiers(vlen, round_nine, seed,
+                                   full_vl_only=full_vl_only, sews=sews,
+                                   lmuls=lmuls)
+    # Round nine's narrow floating-point cells, last of all.
+    if FPN_TOKEN in insns:
+        out += fpn_directed_tiers(vlen, seed)
     return out
 
 
@@ -5075,6 +5494,45 @@ def check_mxl_emission() -> None:
 
     _must_fail("vm=1 routed back to the MX form", vm_confused)
 
+    # r26: no case may demand that the DUT retain a lambda WARL forbids it
+    # to retain.  A case whose request is impermissible at its (VLEN, SEW)
+    # must accept exactly the permissible set, never the request itself.
+    def check_requests(vlen):
+        impermissible = 0
+        for mnemonic in ("vfwimmacc.vv", "vfqimmacc.vv", "vf8wimmacc.vv"):
+            cases = mxl_cases(vlen, mnemonic)
+            asm = emit_mxl_test(vlen, mnemonic, "mxl_probe")
+            blocks = re.split(r"\n    # ---- case \d+: ", asm)[1:]
+            assert len(blocks) == len(cases), (vlen, mnemonic)
+            for index, (case, block) in enumerate(zip(cases, blocks)):
+                block = block.split(".insn 4,")[0]
+                accepted = {int(v) for v in
+                            re.findall(r"li    t4, (\d+)\n", block)}
+                allowed = {ime.lambda_imm(l) for l in
+                           rvv_ref.permissible_lambdas(vlen, case.geom.sew)}
+                assert accepted and accepted <= allowed, (
+                    vlen, mnemonic, index, case.tag, accepted, allowed)
+                assert f"la    a4, .Lfmt_skip_{index}\n" in block
+                if case.geom.lam not in rvv_ref.permissible_lambdas(
+                        vlen, case.geom.sew):
+                    impermissible += 1
+                    assert accepted == allowed, (vlen, mnemonic, index)
+        return impermissible
+
+    assert check_requests(128) == 0
+    assert check_requests(256) == 3      # the SEW=8 LAMBDA=1 WARL probes
+    assert check_requests(512) == 4      # ... plus vf8wimmacc SEW=16 L=1
+
+    # Negative control 3: the r26 judge bug itself -- demand the read-back
+    # equal the request even where the request is impermissible.
+    def demands_retention():
+        with _sabotage(sys.modules[__name__],
+                       _mxl_lambda_is_permissible=lambda case: True):
+            check_requests(256)
+
+    _must_fail("impermissible lambda demanded back verbatim",
+               demands_retention)
+
 
 def check_mx_verdict_contract() -> None:
     """helpers.classify_run must read round six's verdicts too.
@@ -5114,7 +5572,25 @@ def check_mx_verdict_contract() -> None:
 
     mxl = emit_mxl_test(256, "vfwimmacc.vv", "mxl_probe")
     fmts = dict(re.findall(r'^\.Lfmt_(\w+):\s+\.asciz "(.*)"$', mxl, re.M))
-    assert set(fmts) == {"pass", "skip", "fail", "diff"}, sorted(fmts)
+    mxl_cases_ = mxl_cases(256, "vfwimmacc.vv")
+    assert set(fmts) == {"pass", "fail", "diff"} | {
+        f"skip_{i}" for i in range(len(mxl_cases_))}, sorted(fmts)
+    # r26: every SKIP line names its own case's SEW and requested lambda,
+    # so the classifier judges the read-back against the right (VLEN, SEW).
+    for i, case in enumerate(mxl_cases_):
+        got = 2 if case.geom.lam == 1 else 1
+        sk = helpers.classify_run(_Run(expand(fmts, f"skip_{i}", got,
+                                              got, i)))
+        assert (sk.sew, sk.requested_lambda) == (
+            case.geom.sew, case.geom.lam), (i, sk)
+    # ... and the SEW=8 LAMBDA=1 probe convicts a retained lambda=1 at
+    # VLEN=256, where it is not permissible (EMUL_C=32).
+    probe = [i for i, c in enumerate(mxl_cases_)
+             if (c.geom.sew, c.geom.lam) == (8, 1)]
+    assert len(probe) == 1, probe
+    kept = helpers.classify_run(_Run(expand(fmts, f"skip_{probe[0]}",
+                                            1, 1, probe[0])))
+    assert kept.kind == "bad_geometry" and kept.failed, kept
     assert helpers.classify_run(_Run(expand(fmts, "pass"))).kind == "pass"
     failed = helpers.classify_run(_Run(expand(fmts, "fail", 5, 1)))
     assert failed.kind == "mismatch" and failed.failed, failed
@@ -5185,7 +5661,9 @@ def main() -> int:
                   check_round_seven_golden_matches_model,
                   check_round_seven_declared_scope,
                   check_round_eight_emission,
-                  check_round_eight_declared_scope):
+                  check_round_eight_declared_scope,
+                  check_round_nine_int_emission,
+                  check_round_nine_fpn_emission):
         check()
         print(f"  ok  {check.__name__}")
 

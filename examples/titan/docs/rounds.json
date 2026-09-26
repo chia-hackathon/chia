@@ -1049,5 +1049,65 @@
   },
   "rtl_digest": "dc4e9248d090",
   "model_digest": "c24d535beaca"
+ },
+ {
+  "round": 9,
+  "id": "r26_0926_0144",
+  "kind": "CHIA loop run (model-seed + rtl-diff)",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-09-26T01:44+08:00",
+  "ended": "2026-09-26T02:49+08:00",
+  "wall_minutes": 63,
+  "llm_cost_usd": 458.0,
+  "insns": [
+   "vmmacc.vv",
+   "vwmmacc.vv",
+   "vqmmacc.vv",
+   "v8wmmacc.vv",
+   "vfmmacc.vv"
+  ],
+  "scope": "Integer completion: Zvvi4i8mm, Zvvi4i16mm, Zvvi4i32mm, Zvvi16i64mm, Zvvi32i64mm (13/13 int cells) + unsigned/mixed signedness via altfmt_A/B on all int cells (52/52 rows); W=1 FP: Zvvfp16mm, Zvvbf16mm, Zvvofp8mm (OFP8 dest: non-saturating, RNE only, default NaN 0x7F/0x7E per rvv_ref.OFP8_DISCLOSURE).",
+  "submission_id": "titan-r26_0926_0144",
+  "model_seed": "r24_0924_2217/20260924_234913_impl_diff_attempt1.diff",
+  "rtl_diff": "same file (RTL half)",
+  "judges": "round-9 judges built 2026-09-26: rvv_ref 55 ok, ime_tests ok, ime_encodings 8, ime_stress 5 ok (400 progs 0 fail), sim_check VLEN128/256 full sweep 0 failed (3110/5730 runs), 12 new negative controls all fire; rounds 1-8 CHANGED=0 REMOVED=0 ADDED=1588",
+  "open_decisions": [
+   "fpw_reference_gemm signed-zero (-0)+(-0)->+0 bug in round-7/8 W>1 path (affects 0 existing programs, left unfixed)",
+   "fflags unchecked in all rounds",
+   "S3 pool ~54% round-9 geometries"
+  ],
+  "result": "FAILED in Stage 0: 25 model attempts, every one 795 pass / 1 skip / 2 bad_geometry; no progress after attempt 1",
+  "llm_calls": 25,
+  "findings": [
+   "CONFIRMED judge defect: round-6 ime_mxl_* SEW=8 lambda=1 probes demanded readback 1 (EMUL_C=32 not permissible, spec L141-143, L975-983, WARL rule L1050-1054 -> must read 2 or 4); SKIP line printed nominal geometry (mislabel, same class as r19 defect ix); sim_check _vsetvl had no WARL. Fixed 2026-09-26 (ime_tests/sim_check/tools, 18 per-iter + 12 gate mxl programs changed, all else byte-identical, new control check_mxl_warl_is_load_bearing). RTL (r24/r25 tree) also keeps illegal lambda=1 -> RTL agent must fix.",
+   "Loop policy defect: Stage 0 ran 25 attempts with identical outcomes ($458, ~$440 after attempt 1 wasted); no-progress stop being added"
+  ],
+  "model_diff_captured": "r26_0926_0144/r26_stage0_model_final.diff (26 files, captured read-only from chipyard tree after run)"
+ },
+ {
+  "round": 9,
+  "id": "r27_0926_0302",
+  "kind": "CHIA loop run (model-seed r26 model + rtl-diff r24)",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-09-26T03:02+08:00",
+  "ended": "2026-09-26T11:26+08:00",
+  "wall_minutes": 502,
+  "llm_cost_usd": 25.66,
+  "submission_id": "titan-r27_0926_0302",
+  "model_seed": "r26_0926_0144/r26_stage0_model_final.diff",
+  "rtl_diff": "r24_0924_2217/20260924_234913_impl_diff_attempt1.diff (RTL half)",
+  "loop_changes": "no-progress stop (TITAN_NO_PROGRESS_STOP=3 default); Stage-0 limit = min(25, TITAN_MAX_ITERS); mxl WARL judge fix",
+  "result": "CONVERGED end to end (Stage 0 -> S1 -> S2 -> Gate -> S3), one attempt per agent stage",
+  "llm_calls": 2,
+  "stages": {
+   "model": "Stage 0 attempt 1: directed 798/798",
+   "resume_attempt0": "r24 RTL on round-9 suite: 611 pass / 50 mismatch / 134 trap / 3 bad_geometry",
+   "impl": "S1 attempt 1: directed 798/798 (incl. lambda WARL fix in RTL)",
+   "S2": "sample 150, 0 single-run failures, 0 survived unanimity",
+   "gate": "directed 1959/1959; RVV 837/837, 0 single-run failures, 14768 s",
+   "S3": "64/64 lockstep"
+  },
+  "model_digest": "48167998fa3f",
+  "best_rtl_diff": "r27_0926_0302/best_rtl.diff"
  }
 ]
