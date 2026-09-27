@@ -1109,5 +1109,97 @@
   },
   "model_digest": "48167998fa3f",
   "best_rtl_diff": "r27_0926_0302/best_rtl.diff"
+ },
+ {
+  "round": 9,
+  "id": "r28_0926_1658",
+  "kind": "verification-only rerun (model-diff + rtl-diff, fast path expected) with enlarged S3",
+  "llm_model": "claude-opus-5-5 (not invoked; fast path)",
+  "started": "2026-09-26T16:58+08:00",
+  "ended": "2026-09-27T00:16+08:00",
+  "wall_minutes": 436,
+  "llm_cost_usd": 0.0,
+  "submission_id": "titan-r28_0926_1658",
+  "model_diff": "r27_0926_0302/20260926_052847_impl_diff_attempt1.diff",
+  "rtl_diff": "same file",
+  "settings": "TITAN_STRESS_CASES_PER_GEOM=1024, TITAN_STRESS_TEST_HOURS=4, TITAN_MAX_ITERS=3",
+  "purpose": "larger S3 for the round-9 final tree",
+  "result": "CONVERGED (verification rerun of the round-9 tree, no agent turn)",
+  "stages": {
+   "gate": "directed 1959/1959; RVV 837/837, 0 single-run failures",
+   "S3": "1024/1024 lockstep"
+  }
+ },
+ {
+  "round": 10,
+  "id": "r29_0927_0017",
+  "kind": "CHIA loop run (model-seed + rtl-diff)",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-09-27T00:17+08:00",
+  "ended": "2026-09-27T00:57+08:00",
+  "wall_minutes": 39,
+  "llm_cost_usd": 33.01,
+  "submission_id": "titan-r29_0927_0017",
+  "insns": [
+   "vfwmmacc.vv",
+   "vfqmmacc.vv",
+   "vf8wmmacc.vv"
+  ],
+  "scope": "OFP4 (E2M1) cells Zvvofp4ofp8mm/fp16mm/bf16mm/fp32mm and the 16 MXFP cells (61/61 cells). Judges: commit ce80531 (MXF_DISCLOSURE, OFP4_DISCLOSURE, OFP8_DISCLOSURE reused).",
+  "model_seed": "r27_0926_0302/20260926_052847_impl_diff_attempt1.diff",
+  "rtl_diff": "same file (RTL half)",
+  "open_decisions": [
+   "E4M3 C: scale >= 2^9 converts to NaN (alt: saturate 448)",
+   "all-(-0) group sum gives +0"
+  ],
+  "result": "STALLED in Stage 0 (no-progress stop fired after 3 identical attempts): 1077 pass / 9 mismatch (all fp4/mxf special tier)",
+  "llm_calls": 3,
+  "findings": [
+   "CONFIRMED judge defect: round-10 judges seeded group sums with +0; spec defines S as products summed (L1528, L1561-1565), Sail fp_internal_zero unsigned (L4934-4935), IEEE 754-2019 s6.3 -> all-(-0) sum is -0. Fixed in 7e51eca (also fpw rounds 7/8 path, 0 round 1-9 programs moved; new control zero_seed_pos).",
+   "No-progress stop worked: $33 instead of r26's $458"
+  ],
+  "model_diff_captured": "r29_0927_0017/r29_stage0_model_final.diff (26 files)"
+ },
+ {
+  "round": 10,
+  "id": "r30_0927_0113",
+  "kind": "CHIA loop run (model-seed r29 model + rtl-diff r27)",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-09-27T01:13+08:00",
+  "ended": "2026-09-27T01:45+08:00",
+  "wall_minutes": 31,
+  "llm_cost_usd": 5.92,
+  "submission_id": "titan-r30_0927_0113",
+  "model_seed": "r29_0927_0017/r29_stage0_model_final.diff",
+  "rtl_diff": "r27_0926_0302/20260926_052847_impl_diff_attempt1.diff (RTL half)",
+  "judges": "ce80531 + 7e51eca (signed-zero fix)",
+  "result": "INFRA FAILURE after Stage 0 passed (model seed already 1086/1086; one agent turn anyway): verilator_run_remote raised FileNotFoundError on a Ray worker .err log path after worker gRPC ports 10058-10060 hit 'Address already in use' at startup; cluster resources intact afterwards",
+  "llm_calls": 1,
+  "model_digest": "d9867d0148c8"
+ },
+ {
+  "round": 10,
+  "id": "r31_0927_0146",
+  "kind": "CHIA loop run (model-diff r29 model, skip Stage-0 agent; rtl-diff r27)",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-09-27T01:46+08:00",
+  "ended": "2026-09-27T08:54+08:00",
+  "wall_minutes": 427,
+  "llm_cost_usd": 12.75,
+  "submission_id": "titan-r31_0927_0146",
+  "model_diff": "r29_0927_0017/r29_stage0_model_final.diff",
+  "rtl_diff": "r27_0926_0302/20260926_052847_impl_diff_attempt1.diff",
+  "result": "CONVERGED end to end; all 61/61 IME v0.9.0 cells implemented. One RTL agent attempt.",
+  "llm_calls": 1,
+  "stages": {
+   "model_reseed": "1086/1086 (no agent)",
+   "resume_attempt0": "r27 RTL on round-10 suite: 798 pass / 288 trap",
+   "impl": "S1 attempt 1: 1086/1086",
+   "S2": "sample 150, 0 failures",
+   "gate": "directed 2247/2247; RVV 837/837, 0 single-run failures",
+   "S3": "64/64 lockstep"
+  },
+  "model_digest": "500f8f3501da",
+  "best_rtl_diff": "r31_0927_0146/best_rtl.diff"
  }
 ]
