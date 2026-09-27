@@ -38,7 +38,7 @@ MIN_AVAIL_GB = float(os.environ.get("TITAN_MIN_AVAIL_GB", "16"))
 MIN_WINDOW = int(os.environ.get("TITAN_MIN_WINDOW", "2"))
 
 #: 每支 cosim 估計吃掉的核心數（nodes.py 的 VERILATOR_THREADS）。
-CPUS_PER_SIM = int(os.environ.get("TITAN_CPUS_PER_SIM", "8"))
+CPUS_PER_SIM = int(os.environ.get("TITAN_CPUS_PER_SIM", "6"))
 
 
 def _self_uid():

@@ -675,6 +675,8 @@ HOSTLOAD_RECHECK_EVERY = int(
 #: 時仍走原本的 gate-debug 流程叫 LLM，所以這條捷徑不會跳過任何判官。
 #: 設 TITAN_RESUME_FAST_PATH=0 可關閉。
 RESUME_FAST_PATH = os.environ.get("TITAN_RESUME_FAST_PATH", "1") != "0"
+# r32: S3 sims that crash before any commit are relaunched this many times.
+STRESS_CRASH_RETRIES = int(os.environ.get("TITAN_STRESS_CRASH_RETRIES", "2"))
 
 
 def _run_regression(artifact, select: Optional[Sequence[str]] = None,
@@ -1881,6 +1883,19 @@ def _stress(artifact, pool_dir: str, deadline: float, dump: helpers.Dumper
                                               SIM_WORK_DIR,
                                               extension=EXTENSION))
         done += 1
+        # r32: a sim that crashes before committing anything (matched=0, no
+        # divergence record) is a launch failure, not a verdict -- the r32
+        # instance reran clean 3/3. Retry such a crash; a real divergence is
+        # never retried.
+        crash_retries = 0
+        while (not res.match and res.crashed and not res.matched
+               and res.first_divergence is None
+               and crash_retries < STRESS_CRASH_RETRIES):
+            crash_retries += 1
+            _event("stress_crash_retry", name=name, attempt=crash_retries)
+            res = get(nodes.cosim_run.chia_remote(artifact, elf, name, 0,
+                                                  SIM_WORK_DIR,
+                                                  extension=EXTENSION))
         if not res.match:
             get(db_node.pool_mark.chia_remote(pool_dir, name, "failed",
                                               extension=EXTENSION))
@@ -1889,7 +1904,8 @@ def _stress(artifact, pool_dir: str, deadline: float, dump: helpers.Dumper
                            res.failing_trace_gz)
             dump.json(f"stress_divergence_{name}.json",
                       {"first_divergence": res.first_divergence,
-                       "matched": res.matched, "crashed": res.crashed})
+                       "matched": res.matched, "crashed": res.crashed,
+                       "crash_retries": crash_retries})
             _event("stress_divergence", name=name, matched=res.matched)
             detail = (f"RTL and Spike model diverged after {res.matched} "
                       f"committed instructions: {res.first_divergence}")

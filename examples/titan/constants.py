@@ -152,7 +152,8 @@ BUILD_TIMEOUT_S = int(os.environ.get("TITAN_BUILD_TIMEOUT_S", "3600"))
 #: mismatch spike 10004 != DUT 10000" at bootrom instruction 2.  Thread count
 #: is not the source of the run-to-run flips; one thread is worse on both
 #: axes.
-VERILATOR_THREADS = int(os.environ.get("TITAN_VERILATOR_THREADS", "8"))
+# 2026-09-27: 8 -> 6 so the cluster stays within half the 96-thread host (2 sims x 6 per 12-CPU node).
+VERILATOR_THREADS = int(os.environ.get("TITAN_VERILATOR_THREADS", "6"))
 
 #: Pins every ``RANDOMIZE_*`` init word to constant zero.  firrtl2 emits the
 #: ``RANDOM`` macro ``ifndef``-guarded, so this command-line define wins and
