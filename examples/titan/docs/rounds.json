@@ -1201,5 +1201,47 @@
   },
   "model_digest": "500f8f3501da",
   "best_rtl_diff": "r31_0927_0146/best_rtl.diff"
+ },
+ {
+  "round": 10,
+  "id": "r32_0927_2330",
+  "kind": "verification-only rerun with enlarged S3",
+  "llm_model": "claude-opus-5-5 (expected not invoked)",
+  "started": "2026-09-27T23:30+08:00",
+  "ended": "2026-09-28T04:56+08:00",
+  "wall_minutes": 326,
+  "llm_cost_usd": 0.0,
+  "submission_id": "titan-r32_0927_2330",
+  "model_diff": "r31_0927_0146/20260927_031301_impl_diff_attempt1.diff",
+  "rtl_diff": "same file",
+  "settings": "TITAN_STRESS_CASES_PER_GEOM=1024, TITAN_STRESS_TEST_HOURS=4, TITAN_MAX_ITERS=3; cluster capped at 44 CPUs, VERILATOR_THREADS=6",
+  "infra_note": "Titan head raylet/dashboard agent died ~2026-09-27 11:23 (after r31); first r32 submit (18:33) failed, driver-mode attempt hung; titan-only restart 23:29 via tools/up.sh after SIGTERM of titan host pids (two stale GCS pids 1836502, 2418245 ignore SIGTERM; kill -9 blocked by permission, left for the user). CPU cap lowered to <=48 at user request.",
+  "result": "S3 stopped at program 6/1024 by an INFRA transient: stress_000560 sim died 1.54 s after launch (no commits, no mismatch, crashed=true); its verbose rerun completed (85,286 cycles, tohost pass); reproduced clean 3/3 plus neighbours 559/561 (titan_runs/out/work/r32diag). Gate passed: directed 2247/2247, RVV 837/837.",
+  "stages": {
+   "model_reseed": "1086/1086",
+   "resume_attempt0": "1086/1086 (fast path)",
+   "gate": "directed 2247/2247; RVV 837/837",
+   "S3": "5 matched, 1 divergence at 0 instructions"
+  },
+  "fix": "9842f00: S3 relaunches pre-commit crashes up to TITAN_STRESS_CRASH_RETRIES=2; real divergences never retried"
+ },
+ {
+  "round": 10,
+  "id": "r33_0928_0507",
+  "kind": "verification-only rerun with enlarged S3 (after S3 crash-retry fix)",
+  "llm_model": "claude-opus-5-5 (not invoked; fast path)",
+  "started": "2026-09-28T05:07+08:00",
+  "ended": "2026-09-28T11:44+08:00",
+  "wall_minutes": 397,
+  "llm_cost_usd": 0.0,
+  "submission_id": "titan-r33_0928_0507",
+  "model_diff": "r31_0927_0146/20260927_031301_impl_diff_attempt1.diff",
+  "rtl_diff": "same file",
+  "settings": "TITAN_STRESS_CASES_PER_GEOM=1024, TITAN_STRESS_TEST_HOURS=4; 44-CPU cap, VERILATOR_THREADS=6; code 9842f00",
+  "result": "CONVERGED (verification rerun of the round-10 tree, no agent turn)",
+  "stages": {
+   "gate": "directed 2247/2247; RVV 837/837 (1 single-run failure cleared by 7-rep unanimity)",
+   "S3": "1024/1024 lockstep, 0 crash retries"
+  }
  }
 ]
