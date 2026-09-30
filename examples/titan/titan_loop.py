@@ -64,6 +64,7 @@ import ime_stress
 import ime_tests
 import llm as llm_mod
 import nodes
+import timing_judge
 import tools as titan_tools
 from constants import (AGENT_LOG_DIR, AGENT_LOG_REL, AGENT_RUNS_PER_ITER,
                        CHIPYARD_PATH, COSIM_CONFIG, DEBUG_MAX_ITERS,
@@ -78,7 +79,10 @@ from constants import (AGENT_LOG_DIR, AGENT_LOG_REL, AGENT_RUNS_PER_ITER,
                        SIMLOG_TAIL_LINES, SPEC_DIR,
                        SPIKE_SRC_REL,
                        STRESS_TEST_CASES_PER_GEOM,
-                       STRESS_TEST_HOURS, TITAN_LOG_ROOT, VLEN)
+                       STRESS_TEST_HOURS, TITAN_LOG_ROOT, VLEN,
+                       TIMING_AREA_BASE_UM2, TIMING_AREA_MAX_GROWTH,
+                       TIMING_AREA_MIN_RATIO, TIMING_RUNS_PER_ITER,
+                       TIMING_TARGET_NS, TIMING_TOP)
 
 EXTENSION = "ime"
 
@@ -545,6 +549,47 @@ def agent_run_rvv(cfg: Dict[str, object], tests: str, rebuild: bool,
     body = helpers.format_regression_failure(seq, failing, log_path=path)
     return (f"(run_rvv: {which}, rebuild={bool(rebuild)}, "
             f"{len(failing)}/{len(ran)} failing)\n\n{body}")
+
+
+def agent_run_timing(cfg: Dict[str, object], tests: str, rebuild: bool,
+                     seq: int) -> str:
+    """What ``run_timing_start`` does.  Runs inside the tool actor.
+
+    Same build as ``run_directed`` (and shares its per-actor cache, so
+    ``rebuild=False`` right after a directed run judges that build), then
+    the same :func:`_timing_check` the loop's stage T calls -- a tool that
+    measured something adjacent would predict nothing."""
+    pg_opts = cfg["pg_opts"]
+    run_id, tag = cfg["run_id"], cfg["tag"]
+    tcfg = cfg.get("timing") or {}
+    if not tcfg:
+        return "The timing judge is not enabled in this run."
+    artifact = _AGENT_ARTIFACTS.get(tag)
+    if rebuild or artifact is None:
+        artifact = get(nodes.build_saturn.options(**pg_opts)
+                       .chia_remote(DIRECTED_CONFIG, extension=EXTENSION))
+        _AGENT_ARTIFACTS[tag] = artifact
+    leaf = f"agent_timing_{seq}"
+    if not artifact.success:
+        path = _publish_logs(run_id, leaf, pg_opts,
+                             build_stdout=getattr(artifact, "stdout", "") or "",
+                             build_stderr=getattr(artifact, "stderr", "") or "")
+        titan_tools.record_agent_run(cfg["events_path"], {
+            "event": "agent_timing", "tag": tag, "seq": seq,
+            "rebuild": bool(rebuild), "build": "failed"})
+        return helpers.format_build_failure(artifact, seq, log_path=path)
+    out = os.path.join(cfg["out_dir"], "timing", f"agent_{tag}_{int(time.time())}_{seq}")
+    res = _timing_check(artifact, out, tcfg)
+    v = res.get("verdict") or {}
+    path = _publish_logs(run_id, leaf, pg_opts,
+                         extra_files={"feedback.md": res.get("feedback") or ""})
+    titan_tools.record_agent_run(cfg["events_path"], {
+        "event": "agent_timing", "tag": tag, "seq": seq,
+        "rebuild": bool(rebuild), "build": "ok",
+        "pass": bool(v.get("pass")), "delay_ps": v.get("delay_ps"),
+        "area_um2": v.get("area_um2")})
+    return (f"(run_timing, rebuild={bool(rebuild)})\n\n"
+            f"{res.get('feedback') or ''}\nReport copy: {path}")
 
 
 def _read_failing(path: str) -> set:
@@ -1142,6 +1187,130 @@ def _repeat_block(stats: Dict[str, object]) -> str:
 GATE_DEBUG_ROUNDS = int(os.environ.get("TITAN_GATE_DEBUG_ROUNDS", "3"))
 
 
+#: Round 11: the timing judge's configuration for this run, or empty when it
+#: is off (the default -- then nothing below runs and the loop is the
+#: round-10 loop).  Set once at the top of :func:`run`; the agent's tool actor
+#: gets a copy through ``cfg["timing"]`` (a different process).
+_TIMING: Dict[str, object] = {}
+
+#: Every timing verdict this run produced, in order, for the summary.
+_TIMING_LOG: List[Dict[str, object]] = []
+
+
+def _timing_config(target_ns: float, top: str = TIMING_TOP,
+                   area_base=TIMING_AREA_BASE_UM2,
+                   area_max_growth: float = TIMING_AREA_MAX_GROWTH,
+                   area_min_ratio: float = TIMING_AREA_MIN_RATIO
+                   ) -> Dict[str, object]:
+    """The judge's parameters, or ``{}`` (off) for a target <= 0."""
+    if not target_ns or float(target_ns) <= 0:
+        return {}
+    return {"target_ns": float(target_ns), "top": top,
+            "area_base": area_base, "area_max_growth": area_max_growth,
+            "area_min_ratio": area_min_ratio}
+
+
+def _timing_area_rule(tcfg: Dict[str, object]) -> str:
+    base = tcfg.get("area_base")
+    if not base:
+        return "(no area guard configured this run; area is reported only)"
+    lo = float(base) * float(tcfg.get("area_min_ratio") or 0)
+    hi = float(base) * (1 + float(tcfg.get("area_max_growth") or 0))
+    return (f"the FU area stays between {lo:,.0f} and {hi:,.0f} um2 "
+            f"(round-10 FU: {float(base):,.0f} um2; at most "
+            f"+{float(tcfg.get('area_max_growth') or 0):.0%}, at least "
+            f"{float(tcfg.get('area_min_ratio') or 0):.0%} of it)")
+
+
+def _timing_standing(tcfg: Dict[str, object]) -> str:
+    """The round-11 prompt section every turn carries ('' when off)."""
+    if not tcfg:
+        return ""
+    return llm_mod.timing_prompt(float(tcfg["target_ns"]), str(tcfg["top"]),
+                                 _timing_area_rule(tcfg),
+                                 TIMING_RUNS_PER_ITER)
+
+
+def _timing_key(res: Dict[str, object]) -> str:
+    """Stall-tracker token: the same delay (to 0.1 ns) and area (to 0.1%)
+    three attempts running is no progress; any movement is progress."""
+    v = res.get("verdict") or {}
+    d = v.get("delay_ps")
+    a = v.get("area_um2")
+    return (f"<timing {'?' if d is None else f'{float(d) / 1000:.1f}'}ns "
+            f"area {'?' if a is None else f'{float(a) / 1000:.0f}'}k>")
+
+
+def _timing_check(artifact, out_dir: str, tcfg: Dict[str, object]
+                  ) -> Dict[str, object]:
+    """Judge ``artifact``'s generated Verilog.  Runs on the head
+    (``nodes.timing_judge``); returns the judge's result dict.
+
+    A harness failure (no generated source, dispatch error) is returned as
+    a FAILED verdict whose reason says so -- it can never pass, and the
+    message makes clear it is not the design's fault."""
+    top = str(tcfg["top"])
+    try:
+        files = timing_judge.closure_files(
+            list(getattr(artifact, "generated_src_files", None) or []), [top])
+        return get(nodes.timing_judge.chia_remote(
+            files, out_dir, top, float(tcfg["target_ns"]),
+            tcfg.get("area_base"), tcfg.get("area_max_growth"),
+            tcfg.get("area_min_ratio"), extension=EXTENSION))
+    except Exception as exc:                                # noqa: BLE001
+        reason = (f"timing judge harness failure: {type(exc).__name__}: "
+                  f"{str(exc)[:400]} -- not a verdict on the design")
+        verdict = {"pass": False, "timing_pass": False, "area_pass": False,
+                   "harness_error": True, "reasons": [reason],
+                   "target_ps": float(tcfg["target_ns"]) * 1000.0,
+                   "delay_ps": None, "area_um2": None}
+        return {"top": top, "verdict": verdict, "critical": {},
+                "feedback": f"## Timing judge (round 11): FAIL\n\n- {reason}\n"}
+
+
+def _timing_stage(dump: helpers.Dumper, label: str, attempt: int, artifact,
+                  run_id: str, pg_opts) -> Dict[str, object]:
+    """Stage T: judge this attempt's DIRECTED_CONFIG build, dump, publish."""
+    out = os.path.join(dump.out_dir, "timing", f"{label}_attempt{attempt}")
+    res = _timing_check(artifact, out, _TIMING)
+    v = res.get("verdict") or {}
+    rec = {"label": label, "attempt": attempt, "pass": bool(v.get("pass")),
+           "delay_ps": v.get("delay_ps"), "target_ps": v.get("target_ps"),
+           "area_um2": v.get("area_um2"), "area_growth": v.get("area_growth"),
+           "reasons": v.get("reasons"),
+           "critical": res.get("critical"), "stat": res.get("stat"),
+           "wall_s": (res.get("synth") or {}).get("wall_s"), "dir": out}
+    dump.json(f"{label}_timing_attempt{attempt}.json", rec)
+    _TIMING_LOG.append(rec)
+    _event("timing_iter", attempt=attempt, label=label,
+           passed=rec["pass"], delay_ps=rec["delay_ps"] or -1.0,
+           target_ps=rec["target_ps"] or -1.0,
+           area_um2=rec["area_um2"] or -1.0)
+    res["log_path"] = _publish_logs(
+        run_id, f"iter{attempt}/timing", pg_opts,
+        extra_files={"feedback.md": res.get("feedback") or "",
+                     "timing.json": json.dumps(rec, indent=1, default=str)})
+    return res
+
+
+def _timing_summary() -> Optional[Dict[str, object]]:
+    """The run-level record: the last verdict plus the trajectory."""
+    if not _TIMING and not _TIMING_LOG:
+        return None
+    last = _TIMING_LOG[-1] if _TIMING_LOG else {}
+    return {"target_ns": _TIMING.get("target_ns"), "top": _TIMING.get("top"),
+            "checks": len(_TIMING_LOG),
+            "last_pass": last.get("pass"),
+            "last_delay_ns": (None if last.get("delay_ps") is None
+                              else round(float(last["delay_ps"]) / 1000, 3)),
+            "last_area_um2": last.get("area_um2"),
+            "last_area_growth": last.get("area_growth"),
+            "best_delay_ns": min((round(float(r["delay_ps"]) / 1000, 3)
+                                  for r in _TIMING_LOG
+                                  if r.get("delay_ps") is not None),
+                                 default=None)}
+
+
 #: The cosim simulator the most recent successful ``_run_s2`` built, together
 #: with the digest of the tree it was elaborated from.
 #:
@@ -1346,13 +1515,15 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
                 llm, tools_list,
                 _orient(attempt, max_iters, run_id, label,
                         knowledge_path, first_note or "", pg_opts,
-                        regression))
+                        regression),
+                standing=_timing_standing(_TIMING))
         else:
             cli = llm_mod.debug(
                 llm, tools_list,
                 _orient(attempt, max_iters, run_id, label,
                         knowledge_path, message or "", pg_opts,
-                        regression))
+                        regression),
+                standing=_timing_standing(_TIMING))
         helpers.dump_llm(dump, f"{label}_llm_attempt{attempt}", cli)
 
         # The turn is over, but a run_directed job it started may not be.
@@ -1380,6 +1551,7 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
             if job.get("seq") in seen:
                 continue
             _event("agent_rvv" if job.get("kind") == "rvv"
+                   else "agent_timing" if job.get("kind") == "timing"
                    else "agent_directed",
                    attempt=attempt, seq=job.get("seq"),
                    tests=job.get("tests"), orphaned=True,
@@ -1504,6 +1676,26 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
                 return False, artifact
             message = frag
             continue
+
+        # Stage T (round 11, only when a timing target is set): the design
+        # is functionally clean on S1 and the S2 sample; now judge the
+        # Verilog of this very build.  After S1/S2 rather than before, so a
+        # functional failure is always reported first and the ~5 min
+        # synthesis is only paid for designs worth timing.
+        if _TIMING:
+            tres = _timing_stage(dump, label, attempt, artifact, run_id,
+                                 pg_opts)
+            if not (tres.get("verdict") or {}).get("pass"):
+                stalled = stall.observe(attempt, summary["counts"],
+                                        summary["failing"],
+                                        [_timing_key(tres)])
+                if stalled:
+                    _stall(stalled)
+                    return False, artifact
+                message = helpers.format_timing_failure(
+                    attempt + 1, tres.get("feedback") or "",
+                    log_path=tres.get("log_path"))
+                continue
 
         return True, artifact
     return False, artifact
@@ -2048,10 +2240,14 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
         # would gain from it.
         body = helpers.format_directed_failure(1, outcomes, logs,
                                                log_path=path)
-        scope = helpers.format_rtl_seed_scope(done, new, failing=True)
+        scope = (helpers.format_rtl_timing_scope(done, failing=True)
+                 if _TIMING else
+                 helpers.format_rtl_seed_scope(done, new, failing=True))
         return scope + "\n" + head + body, digest, None
 
-    head = helpers.format_rtl_seed_scope(done, new, failing=False) + "\n" + head
+    head = (helpers.format_rtl_timing_scope(done, failing=False) if _TIMING
+            else helpers.format_rtl_seed_scope(done, new, failing=False)
+            ) + "\n" + head
     body = (f"every directed test passed or skipped: {summary['counts']}. "
             f"Confirm that yourself before changing anything.\n\n"
             f"Their last S2 regression result was:\n")
@@ -2068,6 +2264,18 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
            failing=len(regression_failures or []))
     body += frag if frag is not None else "regression sample clean.\n"
     clean = artifact if regression_failures == [] else None
+    if clean is not None and _TIMING:
+        # Round 11: functionally clean is not enough to take the fast path
+        # to the gate -- the tree must also meet timing.  On a fail, the
+        # timing report is the first turn's evidence.
+        tres = _timing_stage(dump, "impl_resume", 0, artifact, run_id,
+                             pg_opts)
+        _event("rtl_resume_timing", attempt=0,
+               passed=bool((tres.get("verdict") or {}).get("pass")))
+        body += ("\nTheir timing-judge result was:\n\n"
+                 + (tres.get("feedback") or ""))
+        if not (tres.get("verdict") or {}).get("pass"):
+            clean = None
     return head + body, digest, clean
 
 
@@ -2179,8 +2387,14 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
         model: bool = True, model_diff: Optional[str] = None,
         model_seed: Optional[str] = None,
         rtl_diff: Optional[str] = None,
-        rtl_diff_note: Optional[str] = None) -> Dict[str, object]:
+        rtl_diff_note: Optional[str] = None,
+        timing_target_ns: float = TIMING_TARGET_NS) -> Dict[str, object]:
     out_dir = os.path.join(TITAN_LOG_ROOT, run_id)
+    # Round 11.  Empty (off) unless a target was given; set before _tools()
+    # so the agent's tool actor is built with -- or without -- run_timing.
+    _TIMING.clear()
+    _TIMING.update(_timing_config(timing_target_ns))
+    _TIMING_LOG.clear()
     dump = helpers.Dumper(out_dir)
     work_root = os.path.join(out_dir, "work")
     os.makedirs(work_root, exist_ok=True)
@@ -2234,20 +2448,25 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
                    "out_dir": out_dir, "events_path": events_path,
                    "failing_path": failing_path,
                    "rvv_failing_path": rvv_failing_path,
-                   "stock_spike": stock_spike}
+                   "stock_spike": stock_spike,
+                   "timing": dict(_TIMING)}
             run_tool = titan_tools.RunDirectedTool(
                 f"titan_run_{tag}_{run_id}",
                 functools.partial(agent_run_directed, cfg),
                 os.path.join(work_root, f"agent_budget_{tag}"),
                 max_runs=AGENT_RUNS_PER_ITER,
                 rvv_runner=functools.partial(agent_run_rvv, cfg),
-                task_options=head_local)
+                task_options=head_local,
+                timing_runner=(functools.partial(agent_run_timing, cfg)
+                               if _TIMING else None))
             tools_list.insert(4, run_tool)
         return (tools_list, status_path, finish, knowledge_path, run_tool,
                 events_path, failing_path, rvv_failing_path)
 
     result: Dict[str, object] = {"run_id": run_id, "vlen": vlen,
                                  "converged": False}
+    if _TIMING:
+        result["timing_target_ns"] = _TIMING["target_ns"]
     all_tools: List[object] = []
     _STALLED.clear()
     try:
@@ -2453,6 +2672,9 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
     finally:
         if _STALLED:
             result["stalled"] = dict(_STALLED)
+        tsum = _timing_summary()
+        if tsum is not None:
+            result["timing"] = tsum
         _event("run_end", **{k: v for k, v in result.items()
                              if isinstance(v, (int, float, str, bool))})
         for tool in all_tools:
@@ -2543,7 +2765,8 @@ def _confirm_summary() -> str:
 def _render_summary(run_id: str, result: Dict[str, object]) -> str:
     lines = [f"# Titan run {run_id}", ""]
     for key in ("vlen", "model", "model_digest", "rtl_source", "rtl_digest",
-                "s1_s2", "regression_confirm", "gate", "gate_failure",
+                "s1_s2", "regression_confirm", "timing_target_ns", "timing",
+                "gate", "gate_failure",
                 "stress_done",
                 "stress_failure", "stalled",
                 "converged"):
@@ -2586,6 +2809,15 @@ def main() -> int:
     parser.add_argument("--rtl-diff-note", metavar="FILE",
                         help="extra text appended to the first S1 prompt "
                              "(on top of what --rtl-diff's pre-run found).")
+    parser.add_argument("--timing-target", metavar="NS", type=float,
+                        default=TIMING_TARGET_NS,
+                        help="round 11: enable the timing judge (stage T "
+                             "after S1/S2 every attempt, the agent's "
+                             "run_timing tool, the timing prompt section) "
+                             "with this longest-path target in ns for "
+                             "TITAN_TIMING_TOP (default from "
+                             "TITAN_TIMING_TARGET_NS; 0 = off, the round-10 "
+                             "loop unchanged).")
     args = parser.parse_args()
 
     ray.init(address="auto", runtime_env=RUNTIME_ENV)
@@ -2594,7 +2826,8 @@ def main() -> int:
                  stress=not args.no_stress, model=not args.no_model,
                  model_diff=args.model_diff, model_seed=args.model_seed,
                  rtl_diff=args.rtl_diff,
-                 rtl_diff_note=args.rtl_diff_note)
+                 rtl_diff_note=args.rtl_diff_note,
+                 timing_target_ns=args.timing_target)
     print(f"converged={result['converged']}  {result}")
     return 0 if result["converged"] else 1
 

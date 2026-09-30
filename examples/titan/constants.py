@@ -721,6 +721,54 @@ IMPLEMENTED_INSNS = tuple(dict.fromkeys(
 NEW_INSNS = ROUND_TEN_INSNS
 
 
+#: Round eleven (2026-09-30): timing, not function.  Rounds 1-10 left the
+#: widening FP matrix datapath (MatrixFPMultiplyPipe: exact-sum 560-bit
+#: shift/negate/add, 1024-bit LZC, normalise, round, MXFP scale multiply,
+#: accumulate) as ONE unpipelined cycle -- 217 ns standalone (ppa7) against a
+#: ~31 ns longest path anywhere in baseline Saturn.  Round eleven asks the RTL
+#: agent to pipeline it (multi-cycle, the FU is an IterativeFunctionalUnit)
+#: with every functional judge unchanged: no new mnemonic, no new tier, no
+#: program changes (the directed suite regenerates CHANGED=0), Spike model
+#: reused via --model-diff.  The new judge is ``timing_judge.py``: the loop's
+#: own DIRECTED_CONFIG build's generated Verilog, the FU's module closure,
+#: yosys+abc flattened on sky130_fd_sc_hd tt_025C_1v80 (the ppa2..ppa7 flow),
+#: pass iff the longest path <= TIMING_TARGET_NS and the FU area stays inside
+#: the guard band below.
+#:
+#: Off unless a target is given (``--timing-target NS`` or
+#: ``TITAN_TIMING_TARGET_NS``): with 0 the loop is byte-for-byte the round-10
+#: loop.  ``TITAN_INSNS=eleven`` is accepted as an alias of ``all`` -- the
+#: round changes no program, so its scope IS the full suite.
+ROUND_ELEVEN_TIERS = ()
+ROUND_ELEVEN_INSNS = ()
+TIMING_TARGET_NS = float(os.environ.get("TITAN_TIMING_TARGET_NS", "0") or 0)
+#: The module the judge synthesises standalone (flattened: its whole
+#: submodule closure, so wrapping a stage in its own Chisel Module does not
+#: hide its delay).
+TIMING_TOP = os.environ.get("TITAN_TIMING_TOP", "MatrixFPMultiplyPipe")
+#: Area guard.  Base = the r31 (round-10 final) FU measured by this judge
+#: (flattened: 443,685.53 um2, 61,133 cells, 1,506 flops; longest path
+#: 319.45 ns; 2026-09-30, titan_runs/out/work/round11/r31_{a,b}).  Not the
+#: ppa7 706,225 um2, which is hierarchical -- flattening lets abc optimise
+#: across the hardfloat submodule boundaries.  Proposed target (flag value):
+#: 36 ns = 1.1 x Saturn's own FPFMAPipe measured the same way (32.90 ns).  Growth cap:
+#: pipeline registers are real area (a 560-bit sum + 1024-bit LZC stage
+#: boundary is ~2k flops ~ 45k um2 each), so the cap bounds, not forbids,
+#: them.  The floor is a relocation guard: an FU that lost a fifth of its
+#: area has moved its datapath somewhere this judge does not synthesise.
+TIMING_AREA_BASE_UM2 = float(os.environ.get("TITAN_TIMING_AREA_BASE_UM2",
+                                            "443685.53") or 0) or None
+TIMING_AREA_MAX_GROWTH = float(os.environ.get(
+    "TITAN_TIMING_AREA_MAX_GROWTH", "0.5"))
+TIMING_AREA_MIN_RATIO = float(os.environ.get(
+    "TITAN_TIMING_AREA_MIN_RATIO", "0.8"))
+#: Agent-side ``run_timing_start`` calls per turn (each is a build, if asked,
+#: plus a ~3-5 min single-threaded synthesis on the head).
+TIMING_RUNS_PER_ITER = int(os.environ.get("TITAN_TIMING_RUNS_PER_ITER", "3"))
+TIMING_SYNTH_TIMEOUT_S = int(os.environ.get("TITAN_TIMING_SYNTH_TIMEOUT_S",
+                                            "3600"))
+
+
 def _scope_insns() -> tuple:
     """Which instructions this run's directed suite and prompts cover.
 
@@ -759,6 +807,8 @@ def _scope_insns() -> tuple:
              "eight": ROUND_EIGHT_INSNS, "8": ROUND_EIGHT_INSNS,
              "nine": ROUND_NINE_TIERS, "9": ROUND_NINE_TIERS,
              "ten": ROUND_TEN_TIERS, "10": ROUND_TEN_TIERS,
+             # round eleven is a timing round: no new program, full scope
+             "eleven": ALL_SCOPE, "11": ALL_SCOPE,
              "all": ALL_SCOPE, "": ALL_SCOPE}
     if raw.lower() in named:
         return named[raw.lower()]

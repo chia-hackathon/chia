@@ -833,3 +833,48 @@ def format_rtl_seed_scope(done: Sequence[str], new: Sequence[str],
         f"Scope: the RTL in the tree already implements {_insn_list(done)} "
         f"and every directed test currently passes or skips. This round adds "
         f"{_insn_list(new)}; add it without regressing any of the above.\n")
+
+
+# ---------------------------------------------------------------------------
+# round 11: the timing judge's framing (pure; unit-tested)
+# ---------------------------------------------------------------------------
+
+def format_rtl_timing_scope(done: Sequence[str], failing: bool) -> str:
+    """``format_rtl_seed_scope`` for a timing round: no instruction is new.
+
+    Only used when the timing judge is on; the round-10 wording (``This
+    round adds ...``) would name round ten's mnemonics as new work and send
+    the agent looking for a missing feature that is not missing."""
+    if failing:
+        return (
+            f"Scope: the RTL in the tree implements {_insn_list(done)} and "
+            f"every cell of the Zvvm tables. This round adds NO instruction "
+            f"and NO test: it is a timing round. **The failures below are "
+            f"regressions of the seeded tree, not new work** -- fix them "
+            f"first; the timing goal is only graded on a functionally clean "
+            f"design.\n")
+    return (
+        f"Scope: the RTL in the tree implements {_insn_list(done)} and every "
+        f"cell of the Zvvm tables, and every directed test currently passes "
+        f"or skips. This round adds NO instruction and NO test: it is a "
+        f"timing round (see the timing section). Keep every one of those "
+        f"results exactly as it is.\n")
+
+
+def format_timing_failure(attempt: int, feedback: str,
+                          log_path: Optional[str] = None) -> str:
+    """The loop's message after an attempt that is functionally clean (S1
+    and the S2 sample) but fails the timing judge.  ``feedback`` is
+    ``timing_judge.format_feedback`` output."""
+    out = [f"# Iteration {attempt}: functionally clean, TIMING FAILS\n",
+           "Directed (S1) and the RVV regression sample (S2) both passed on "
+           "this tree -- keep them that way. The timing judge did not pass:\n",
+           feedback.rstrip() + "\n",
+           "Cut the reported path with pipeline/stage registers inside the "
+           "FU (see the timing section for the interface rules), then check "
+           "it yourself with `run_timing_start` -> `run_timing_wait` and the "
+           "functional judges with `run_directed_start('all')` before you "
+           "finish."]
+    if log_path:
+        out.append(f"\nFull timing report for this iteration: {log_path}")
+    return "\n".join(out) + "\n"

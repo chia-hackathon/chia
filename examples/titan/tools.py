@@ -34,7 +34,7 @@ from chia.base.tools.ChiaTool import ChiaTool
 import helpers
 from constants import (AGENT_RUNS_PER_ITER, RUN_DIRECTED_DRAIN_TIMEOUT_S,
                        RUN_DIRECTED_WAIT_CAP, RVV_AGENT_MAX_REPS,
-                       RVV_STATUS_NAMES)
+                       RVV_STATUS_NAMES, TIMING_RUNS_PER_ITER)
 
 
 class SpecTool(ChiaTool):
@@ -343,18 +343,28 @@ class RunDirectedTool(ChiaTool):
                      "wait": "run_directed_wait"},
         "rvv": {"prefix": "rv", "label": "run_rvv",
                 "start": "run_rvv_start", "wait": "run_rvv_wait"},
+        # Round 11.  Same one-job-at-a-time rule (a rebuild needs the one
+        # chipyard node), but its own, smaller budget: a synthesis is ~5
+        # minutes of a host core and must not crowd out functional runs.
+        "timing": {"prefix": "tm", "label": "run_timing",
+                   "start": "run_timing_start", "wait": "run_timing_wait"},
     }
 
     def __init__(self, name: str, runner: Callable, budget_path: str,
                  max_runs: int = AGENT_RUNS_PER_ITER,
                  rvv_runner: Optional[Callable] = None,
-                 task_options=None) -> None:
+                 task_options=None,
+                 timing_runner: Optional[Callable] = None,
+                 max_timing_runs: int = TIMING_RUNS_PER_ITER) -> None:
         super().__init__(name, task_options=task_options)
         self.runner = runner
         self.rvv_runner = rvv_runner
+        self.timing_runner = timing_runner
         self.budget_path = budget_path
+        self.timing_budget_path = budget_path + ".timing"
         self.jobs_path = budget_path + ".jobs.json"
         self.max_runs = max_runs
+        self.max_timing_runs = max_timing_runs
         self._pool = None
         self.mcp.add_tool(self.run_directed_start,
                           name=f"{name}_run_directed_start")
@@ -365,6 +375,14 @@ class RunDirectedTool(ChiaTool):
         if rvv_runner is not None:
             self.mcp.add_tool(self.run_rvv_start, name=f"{name}_run_rvv_start")
             self.mcp.add_tool(self.run_rvv_wait, name=f"{name}_run_rvv_wait")
+        if timing_runner is not None:
+            # Only registered when the round-11 timing judge is on, so the
+            # tool list -- and the agent's view of it -- is otherwise
+            # unchanged.
+            self.mcp.add_tool(self.run_timing_start,
+                              name=f"{name}_run_timing_start")
+            self.mcp.add_tool(self.run_timing_wait,
+                              name=f"{name}_run_timing_wait")
         super().__post_init__()
 
     # A ThreadPoolExecutor is not picklable and this object is re-pickled
@@ -462,6 +480,42 @@ class RunDirectedTool(ChiaTool):
         """
         return await self._wait("rvv", job_id, max_wait_s)
 
+    def run_timing_start(self, rebuild: bool = True) -> str:
+        """Start the round-11 TIMING JUDGE on your current tree. Returns at once.
+
+        Exactly the judge the loop runs after S1 and S2: the FU's generated
+        Verilog, synthesised standalone and flattened (yosys + abc,
+        sky130_fd_sc_hd tt_025C_1v80); passes iff the longest path is within
+        the round's target and the FU area is inside the guard band.
+
+        It does NOT wait. Call `run_timing_wait` (repeatedly) for the result:
+        the longest path, its logic depth, start/end points (flattened net
+        names -- the prefix is the instance path), gate mix and arrival
+        profile, and the FU area.
+
+        rebuild: True (default) elaborates your current tree first. Pass
+            False only right after a run_directed_start of the SAME tree --
+            it then judges that build's Verilog without rebuilding.
+
+        One job of any kind at a time (shared with run_directed_start /
+        run_rvv_start); its own budget of a few starts per turn. A build plus
+        synthesis takes several minutes.
+        """
+        return self._start("timing", "fu", rebuild)
+
+    async def run_timing_wait(self, job_id: str = "",
+                              max_wait_s: int = 90) -> str:
+        """Wait for a run_timing job and return the timing judge's report.
+
+        Blocks at most `max_wait_s` seconds (capped at
+        RUN_DIRECTED_WAIT_CAP); if the job is not done it says so and you
+        call it again. Waits are free.
+
+        job_id: the id run_timing_start gave you. Omit it for the most
+            recent job of any kind.
+        """
+        return await self._wait("timing", job_id, max_wait_s)
+
     async def run_directed_wait(self, job_id: str = "",
                                 max_wait_s: int = 90) -> str:
         """Wait for a run_directed job and return its result.
@@ -488,6 +542,9 @@ class RunDirectedTool(ChiaTool):
         lines = [f"runs started this turn: {used}/{self.max_runs} "
                  f"(one budget, shared by run_directed_start and "
                  f"run_rvv_start)"]
+        if self.timing_runner is not None:
+            lines.append(f"timing runs started this turn: "
+                         f"{self.timing_runs_used()}/{self.max_timing_runs}")
         if not jobs:
             lines.append("No jobs started this turn.")
         for job in sorted(jobs.values(), key=lambda j: j.get("seq", 0)):
@@ -518,17 +575,31 @@ class RunDirectedTool(ChiaTool):
                     f"chipyard node, so there is one job of either kind. "
                     f"Call {other['wait']}('{running['job_id']}') until it "
                     f"returns a result.")
-        used = self.runs_used()
-        if used >= self.max_runs:
-            return (f"The run budget for this turn is spent "
-                    f"({used}/{self.max_runs}); it is one pool shared by "
-                    f"run_directed_start and run_rvv_start. Make your "
-                    f"remaining edits on the evidence you already have and "
-                    f"call finish; the loop will build and test what you "
-                    f"leave behind.")
-        seq = used + 1
-        self._bump(used)
-        job_id = f"{names['prefix']}{seq}"
+        if kind == "timing":
+            used = self.timing_runs_used()
+            if used >= self.max_timing_runs:
+                return (f"The timing budget for this turn is spent "
+                        f"({used}/{self.max_timing_runs}). Make your "
+                        f"remaining edits on the evidence you have; the loop "
+                        f"runs the timing judge on what you leave behind "
+                        f"once S1 and S2 pass.")
+            seq = used + 1
+            self._bump(used, self.timing_budget_path)
+            job_id = f"{names['prefix']}{seq}"
+            limit = self.max_timing_runs
+        else:
+            used = self.runs_used()
+            if used >= self.max_runs:
+                return (f"The run budget for this turn is spent "
+                        f"({used}/{self.max_runs}); it is one pool shared by "
+                        f"run_directed_start and run_rvv_start. Make your "
+                        f"remaining edits on the evidence you already have "
+                        f"and call finish; the loop will build and test what "
+                        f"you leave behind.")
+            seq = used + 1
+            self._bump(used)
+            job_id = f"{names['prefix']}{seq}"
+            limit = self.max_runs
         jobs = self._read_jobs()
         reps = max(1, min(int(reps or 1), RVV_AGENT_MAX_REPS))
         jobs[job_id] = {"job_id": job_id, "seq": seq, "kind": kind,
@@ -541,8 +612,10 @@ class RunDirectedTool(ChiaTool):
         return (f"Started job {job_id} ({names['label']}, tests={tests}, "
                 f"rebuild={bool(rebuild)}"
                 + (f", reps={reps}" if reps > 1 else "")
-                + f"); {seq}/{self.max_runs} starts used "
-                f"this turn (shared budget).\nCall {names['wait']}"
+                + f"); {seq}/{limit} starts used "
+                + ("this turn (timing budget)." if kind == "timing" else
+                   "this turn (shared budget).")
+                + f"\nCall {names['wait']}"
                 f"('{job_id}') now, and keep calling it until it returns a "
                 f"result. Do not end your turn while it is unfinished: the "
                 f"loop grades the tree exactly as you leave it.")
@@ -587,7 +660,8 @@ class RunDirectedTool(ChiaTool):
               seq: int, reps: int = 1) -> None:
         label = self._KINDS[kind]["label"]
         try:
-            runner = self.rvv_runner if kind == "rvv" else self.runner
+            runner = (self.rvv_runner if kind == "rvv" else
+                      self.timing_runner if kind == "timing" else self.runner)
             if runner is None:
                 raise RuntimeError(f"no {label} runner is configured")
             reps = max(1, min(int(reps or 1), RVV_AGENT_MAX_REPS))
@@ -615,9 +689,11 @@ class RunDirectedTool(ChiaTool):
 
     def _render(self, job: dict) -> str:
         took = (job.get("finished") or time.time()) - job.get("started", 0)
+        limit = (self.max_timing_runs if job.get("kind") == "timing"
+                 else self.max_runs)
         return (f"{job.get('result') or '(no output)'}\n\n"
                 f"[{job['job_id']}: {self._label(job)} {job.get('seq')}/"
-                f"{self.max_runs} runs for this turn, {took:.0f}s]")
+                f"{limit} runs for this turn, {took:.0f}s]")
 
     # --- job table ----------------------------------------------------
     def _read_jobs(self) -> Dict[str, dict]:
@@ -665,10 +741,18 @@ class RunDirectedTool(ChiaTool):
         except (OSError, ValueError):
             return 0
 
-    def _bump(self, used: int) -> None:
+    def timing_runs_used(self) -> int:
         try:
-            os.makedirs(os.path.dirname(self.budget_path), exist_ok=True)
-            with open(self.budget_path, "w") as fh:
+            with open(self.timing_budget_path) as fh:
+                return int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            return 0
+
+    def _bump(self, used: int, path: Optional[str] = None) -> None:
+        path = path or self.budget_path
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
                 fh.write(str(used + 1))
         except OSError:
             pass
@@ -707,6 +791,8 @@ class RunDirectedTool(ChiaTool):
         self.drain()
         self._write_jobs({})
         self._bump(-1)
+        if self.timing_runner is not None:
+            self._bump(-1, self.timing_budget_path)
 
 
 def record_agent_run(events_path: str, payload: dict) -> None:

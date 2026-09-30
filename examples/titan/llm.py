@@ -269,17 +269,33 @@ def _run(llm, prompt: str, tools: Sequence[object]):
     raise RuntimeError("unreachable")
 
 
-def implement(llm, tools: Sequence[object], note: str = ""):
+def implement(llm, tools: Sequence[object], note: str = "",
+              standing: str = ""):
     """First turn: build the thing.
 
     *note* is appended when the run started from a resumed working tree
     (``--rtl-diff``): the standing task is unchanged, but the agent has to be
     told that a previous attempt is already applied, and what it scored.
+
+    *standing* (round 11: :func:`timing_prompt`) rides after the implement
+    task on every turn; empty -- the default -- leaves the prompt exactly as
+    it was.
     """
-    task = f"{_IMPLEMENT_TASK}\n\n{note}" if note else _IMPLEMENT_TASK
+    task = f"{_IMPLEMENT_TASK}\n\n{standing}" if standing else _IMPLEMENT_TASK
+    task = f"{task}\n\n{note}" if note else task
     return _run(llm, task, tools)
 
 
-def debug(llm, tools: Sequence[object], feedback: str):
+def debug(llm, tools: Sequence[object], feedback: str, standing: str = ""):
     """Subsequent turns: the standing debug rules plus this run's evidence."""
-    return _run(llm, f"{_DEBUGGER_PREAMBLE}\n\n{feedback}", tools)
+    pre = (f"{_DEBUGGER_PREAMBLE}\n\n{standing}" if standing
+           else _DEBUGGER_PREAMBLE)
+    return _run(llm, f"{pre}\n\n{feedback}", tools)
+
+
+def timing_prompt(target_ns: float, top: str, area_rule: str,
+                  runs: int) -> str:
+    """Round eleven's standing section (prompts/timing.md), rendered."""
+    return _load_prompt("timing.md", TIMING_TARGET_NS=f"{target_ns:g}",
+                        TIMING_TOP=top, SATURN_SRC_PATH=SATURN_SRC_PATH,
+                        TIMING_AREA_RULE=area_rule, TIMING_RUNS=str(runs))

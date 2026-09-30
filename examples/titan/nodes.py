@@ -364,3 +364,43 @@ def cosim_run(artifact: BuildArtifact, elf_content: bytes, elf_name: str,
     if extension: get_profiler().add_info({"extension": extension})
     return CosimNode().run(artifact, elf_content, elf_name, work_dir,
                            timeout_cycles=STRESS_TEST_MAX_CYCLES)
+
+
+# --- round 11: timing judge (head, not a container) ------------------------
+
+@ChiaFunction(resources={"head_local": 1}, num_cpus=1)
+def timing_judge(files, out_dir: str, top: str, target_ns: float,
+                 area_base=None, area_max_growth=None, area_min_ratio=None,
+                 extension: str = "") -> dict:
+    """Standalone flattened synthesis of ``top`` + the pass/fail verdict.
+
+    ``files`` is the FU's module closure as ``(filename, contents)`` pairs,
+    cut from the loop's own ``BuildArtifact.generated_src_files`` by the
+    driver (``timing_judge.closure_files``) -- so this judges exactly the
+    Verilog the directed programs just ran on, and needs no chipyard tree,
+    no container and no shared ``chipyard`` resource.
+
+    Runs on the head (``head_local``, a bare host worker: yosys / sv2v / the
+    sky130 liberty live under /share1/saves/max410011/opt, which no titan
+    container mounts).  One CPU: yosys and abc are single-threaded, and the
+    subprocess runs under ``nice -n 19``; the task is dispatched serially by
+    the loop, so the 44-CPU cluster cap is unaffected.  Every file -- the
+    RTL copy, sv2v output, abc temp dirs (TMPDIR), the liberty cache -- is
+    under ``out_dir`` on /share1; the RTL copy and sv2v output are deleted
+    afterwards, yosys.log / stat.txt / timing.json / feedback.md are kept.
+    """
+    import shutil
+    import timing_judge as tj
+    if extension: get_profiler().add_info({"extension": extension})
+    rtl_dir = os.path.join(out_dir, "rtl")
+    os.makedirs(rtl_dir, exist_ok=True)
+    for fn, txt in files:
+        with open(os.path.join(rtl_dir, os.path.basename(fn)), "w") as fh:
+            fh.write(txt)
+    try:
+        res = tj.judge(rtl_dir, out_dir, top=top, target_ns=target_ns,
+                       area_base=area_base, area_max_growth=area_max_growth,
+                       area_min_ratio=area_min_ratio)
+    finally:
+        shutil.rmtree(rtl_dir, ignore_errors=True)
+    return res
