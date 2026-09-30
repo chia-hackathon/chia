@@ -203,6 +203,31 @@ def _find_rate_limit(exc: BaseException) -> Optional[BaseException]:
     return None
 
 
+#: r34: host OOM (other users + the object store) made Ray's memory monitor
+#: kill the ClaudeCodeLLM.prompt task.  Wait a little and retry once.
+OOM_MAX_RETRIES = int(os.environ.get("TITAN_OOM_RETRIES", "1"))
+OOM_BACKOFF_S = int(os.environ.get("TITAN_OOM_BACKOFF_S", "120"))
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """True if *exc* (or anything in its cause chain) is Ray's
+    OutOfMemoryError, or a task-death message from the memory monitor."""
+    seen = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ == "OutOfMemoryError":
+            return True
+        if "memory monitor" in str(cur).lower() or \
+                "out of memory" in str(cur).lower():
+            return True
+        nxt = getattr(cur, "cause", None)
+        if not isinstance(nxt, BaseException):
+            nxt = cur.__cause__ or cur.__context__
+        cur = nxt
+    return False
+
+
 def _rate_limit_wait_seconds(err: BaseException) -> tuple:
     """(seconds to sleep, reset time as text).
 
@@ -245,12 +270,26 @@ def _run(llm, prompt: str, tools: Sequence[object]):
     ObjectRef from the failed one is spent.
     """
     tools = list(tools)
-    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+    oom_left = OOM_MAX_RETRIES
+    attempt = -1
+    while True:
+        attempt += 1
         try:
             return get(llm.prompt.options(resources={"llm": LLM_RESOURCE},
                                           **LLM_TASK_OPTS)
                        .chia_remote(llm, prompt, tools))
         except Exception as exc:                       # noqa: BLE001
+            if oom_left > 0 and _is_oom(exc):
+                oom_left -= 1
+                attempt -= 1               # does not use a rate-limit retry
+                _event("oom_retry", backoff_seconds=OOM_BACKOFF_S,
+                       error=str(exc)[:200])
+                print(f"[{_dt.datetime.now().isoformat(timespec='seconds')}]"
+                      f" Ray OutOfMemoryError on the LLM task; retrying the "
+                      f"same prompt once after {OOM_BACKOFF_S}s: "
+                      f"{str(exc)[:200]}", file=sys.stderr, flush=True)
+                _time.sleep(OOM_BACKOFF_S)
+                continue
             err = _find_rate_limit(exc)
             if err is None or attempt >= RATE_LIMIT_MAX_RETRIES:
                 raise
@@ -266,7 +305,6 @@ def _run(llm, prompt: str, tools: Sequence[object]):
             print(f"[{_dt.datetime.now().isoformat(timespec='seconds')}] "
                   f"rate-limit wait over, retrying", file=sys.stderr,
                   flush=True)
-    raise RuntimeError("unreachable")
 
 
 def implement(llm, tools: Sequence[object], note: str = "",

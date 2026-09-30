@@ -1243,6 +1243,36 @@ def _timing_key(res: Dict[str, object]) -> str:
 
 def _timing_check(artifact, out_dir: str, tcfg: Dict[str, object]
                   ) -> Dict[str, object]:
+    """:func:`_timing_check_once` with the r34 infra-failure policy: a
+    harness failure (yosys hang/timeout, abc handoff stall, lock timeout,
+    dispatch error) is retried once; a second one is returned flagged
+    ``verdict["harness_failure"]`` -- not a design verdict."""
+    return timing_with_retry(
+        lambda: _timing_check_once(artifact, out_dir, tcfg),
+        timing_judge.is_infra_failure)
+
+
+def timing_with_retry(run, is_infra, max_retries: int = 1
+                      ) -> Dict[str, object]:
+    """Pure retry policy (unit-tested).  ``run()`` -> result dict."""
+    res = run()
+    tries = 0
+    while is_infra(res) and tries < max_retries:
+        tries += 1
+        print(f"[timing] infra failure, retry {tries}/{max_retries}: "
+              f"{((res.get('verdict') or {}).get('reasons') or ['?'])[0]}",
+              flush=True)
+        res = run()
+    if is_infra(res):
+        v = res.setdefault("verdict", {})
+        v["harness_failure"] = True
+        v["infra_failure"] = True
+        v["retries"] = tries
+    return res
+
+
+def _timing_check_once(artifact, out_dir: str, tcfg: Dict[str, object]
+                       ) -> Dict[str, object]:
     """Judge ``artifact``'s generated Verilog.  Runs on the head
     (``nodes.timing_judge``); returns the judge's result dict.
 
@@ -1265,7 +1295,8 @@ def _timing_check(artifact, out_dir: str, tcfg: Dict[str, object]
                    "target_ps": float(tcfg["target_ns"]) * 1000.0,
                    "delay_ps": None, "area_um2": None}
         return {"top": top, "verdict": verdict, "critical": {},
-                "feedback": f"## Timing judge (round 11): FAIL\n\n- {reason}\n"}
+                "feedback": f"## Timing judge (round 11): HARNESS FAILURE, "
+                            f"not a verdict\n\n- {reason}\n"}
 
 
 def _timing_stage(dump: helpers.Dumper, label: str, attempt: int, artifact,
@@ -1685,6 +1716,13 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
         if _TIMING:
             tres = _timing_stage(dump, label, attempt, artifact, run_id,
                                  pg_opts)
+            if timing_judge.is_infra_failure(tres):
+                # Harness failed twice: not a verdict.  Tell the agent so,
+                # and keep it out of the no-progress stall key.
+                message = helpers.format_timing_harness_failure(
+                    attempt + 1, tres.get("feedback") or "",
+                    log_path=tres.get("log_path"))
+                continue
             if not (tres.get("verdict") or {}).get("pass"):
                 stalled = stall.observe(attempt, summary["counts"],
                                         summary["failing"],

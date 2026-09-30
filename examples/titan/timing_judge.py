@@ -287,6 +287,12 @@ def format_feedback(verdict: Dict[str, object],
                     crit: Dict[str, object], top: str,
                     report_path: str = "") -> str:
     """The message the RTL agent reads (and the loop dumps)."""
+    if verdict.get("infra_failure") or verdict.get("harness_error"):
+        rs = "; ".join(verdict.get("reasons") or [])
+        return (f"## Timing judge (round 11): HARNESS FAILURE, not a "
+                f"verdict\n\n- {rs}\n- Nothing about your design was "
+                f"measured; do not change the RTL because of this.  "
+                f"{('Report: ' + report_path) if report_path else ''}\n")
     ok = "PASS" if verdict.get("pass") else "FAIL"
     lines = [f"## Timing judge (round 11): {ok}", ""]
     t = verdict.get("target_ps", 0) / 1000
@@ -333,11 +339,173 @@ def _sv2v(files: Sequence[str], dest: str) -> List[str]:
                   if f.endswith(".v"))
 
 
+# ---- isolation / watchdog / serialisation (round 34 fix) -------------------
+#: r34: yosys's internal abc wrote output.blif and yosys never read it back
+#: when run as a child of a Ray worker (killed at 3600 s; the identical run
+#: from a shell takes ~6 min).  Exact trigger unproven, so yosys now runs
+#: fully detached from the worker's process state.
+TIMEOUT_S = int(os.environ.get("TITAN_TIMING_TIMEOUT_S", "900"))
+STALL_S = int(os.environ.get("TITAN_TIMING_STALL_S", "120"))
+LOCK_PATH = os.environ.get(
+    "TITAN_TIMING_LOCK",
+    "/share1/saves/max410011/titan_scratch/timing_judge.lock")
+LOCK_WAIT_S = int(os.environ.get("TITAN_TIMING_LOCK_WAIT_S", "3600"))
+#: Only these survive into yosys's environment (no RAY_*, OMP_*, ...).
+_ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL",
+             "LD_LIBRARY_PATH", "PPA2_LIB")
+REASON_STALL = "abc handoff stall"
+
+
+def clean_env(environ: Dict[str, str], tmp: str) -> Dict[str, str]:
+    """Scrubbed environment for yosys: whitelist + TMPDIR under ``tmp``."""
+    env = {k: v for k, v in environ.items()
+           if k in _ENV_KEEP or k.startswith("LC_")}
+    env.update(TMPDIR=tmp, TMP=tmp, TEMP=tmp)
+    # ROOT CAUSE of the r34 hang (bisected 2026-09-30): with TERM unset --
+    # as in a Ray worker started from ssh/nohup -- yosys-abc sits in
+    # pselect() on its stdin after the script and yosys blocks in read()
+    # on abc's stdout forever.  A real TERM (xterm) fixes it; TERM=dumb does not.
+    env["TERM"] = "xterm"
+    return env
+
+
+def _isolate() -> None:                      # runs in the child, pre-exec
+    import signal
+    for sig in range(1, signal.NSIG):
+        if sig in (signal.SIGKILL, signal.SIGSTOP):
+            continue
+        try:
+            signal.signal(sig, signal.SIG_DFL)
+        except (OSError, ValueError, RuntimeError):
+            pass
+    signal.pthread_sigmask(signal.SIG_SETMASK, [])
+    if os.environ.get("TITAN_TIMING_RAISE_NOFILE", "1") != "0":
+        # A Ray worker's soft RLIMIT_NOFILE can be 1024 (shell: 1048576);
+        # yosys/abc inherit it.  Raise it to the hard limit.
+        import resource
+        try:
+            _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        except (OSError, ValueError):
+            pass
+
+
+def stall_decision(blif_since: Optional[float], last_growth: float,
+                   now: float, stall_s: float = STALL_S) -> bool:
+    """Pure watchdog step.  ``blif_since`` is when abc's output.blif was
+    first seen (None: absent), ``last_growth`` when yosys.log last grew.
+    Stalled iff the blif has been there, and the log silent, for more than
+    ``stall_s`` -- the clock starts at the later of the two, because the log
+    is legitimately silent for the whole (~4 min) abc run *before* the blif
+    appears."""
+    return blif_since is not None and now - max(blif_since, last_growth) \
+        > stall_s
+
+
+def is_infra_failure(res: Optional[Dict[str, object]]) -> bool:
+    """True when a judge result is a harness failure, not a verdict."""
+    v = (res or {}).get("verdict") or {}
+    return bool(v.get("infra_failure") or v.get("harness_error"))
+
+
+class _Lock:
+    """Cluster-wide (one host: head_local) mutex on timing synthesis."""
+
+    def __init__(self, path: str, wait_s: float):
+        self.path, self.wait_s, self.fh, self.waited = (os.path.abspath(path), wait_s,
+                                                    None, 0.0)
+
+    def __enter__(self):
+        import fcntl
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fh = open(self.path, "a+")
+        t0 = time.time()
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() - t0 > self.wait_s:
+                    self.fh.close()
+                    raise TimeoutError(
+                        f"timing lock {self.path} busy for {self.wait_s:.0f}s")
+                time.sleep(3)
+        self.waited = round(time.time() - t0, 1)
+        return self
+
+    def __exit__(self, *a):
+        try:
+            self.fh.close()          # closing drops the flock
+        except OSError:
+            pass
+
+
+def _tail(path: str, n: int = 1500) -> str:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - n))
+            return fh.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def _run_yosys(ys: str, log: str, tmp: str, cwd: str, nice: int,
+               timeout_s: float, stall_s: float) -> Dict[str, object]:
+    """Run yosys detached; returns {"rc", "infra": reason|None}."""
+    import glob
+    import signal
+    try:
+        os.remove(log)
+    except OSError:
+        pass
+    proc = subprocess.Popen(
+        ["nice", "-n", str(nice), YOSYS, "-l", log, "-s", ys],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, env=clean_env(os.environ, tmp), cwd=cwd,
+        start_new_session=True, preexec_fn=_isolate)
+    t0 = last_growth = time.time()
+    prev, infra, blif_since = -1, None, None
+    while proc.poll() is None:
+        time.sleep(2)
+        now = time.time()
+        if now - t0 > timeout_s:
+            infra = f"timeout after {timeout_s:.0f}s"
+        else:
+            try:
+                size = os.path.getsize(log)
+            except OSError:
+                size = 0
+            blif = bool(glob.glob(os.path.join(tmp, "yosys-abc-*",
+                                               "output.blif")))
+            if size != prev:
+                last_growth, prev = now, size
+            if not blif:
+                blif_since = None
+            elif blif_since is None:
+                blif_since = now
+            if stall_decision(blif_since, last_growth, now, stall_s):
+                infra = REASON_STALL
+        if infra:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+            break
+    return {"rc": proc.returncode, "infra": infra}
+
+
 def synth(rtl_dir: str, top: str, out_dir: str, *, flatten: bool = True,
-          nice: int = 19, timeout_s: int = 3600) -> Dict[str, object]:
-    """sv2v + yosys; returns {"rc", "wall_s", "log", "stat"} paths.  All
+          nice: int = 19, timeout_s: Optional[float] = None,
+          stall_s: Optional[float] = None) -> Dict[str, object]:
+    """sv2v + yosys; returns {"rc", "wall_s", "log", "stat", "infra"}.  All
     temporaries (abc temp dirs, the liberty scl cache) go under
-    ``out_dir/tmp`` via TMPDIR and are removed afterwards."""
+    ``out_dir/tmp`` via TMPDIR and are removed afterwards.  ``infra`` is a
+    reason string when the harness (not the design) failed: timeout, abc
+    handoff stall, lock wait timeout -- else None."""
+    timeout_s = TIMEOUT_S if timeout_s is None else timeout_s
+    stall_s = STALL_S if stall_s is None else stall_s
     out_dir, rtl_dir = os.path.abspath(out_dir), os.path.abspath(rtl_dir)
     os.makedirs(out_dir, exist_ok=True)
     tmp = os.path.join(out_dir, "tmp")
@@ -359,21 +527,26 @@ def synth(rtl_dir: str, top: str, out_dir: str, *, flatten: bool = True,
         f.write("setundef -zero\nopt_clean -purge\n")
         f.write(f"tee -o {stat} stat -liberty {LIB} -top {top}\n")
     log = os.path.join(out_dir, "yosys.log")
-    env = dict(os.environ, TMPDIR=tmp, TMP=tmp, TEMP=tmp)
+    if os.path.exists(log):                    # keep a retry's first log
+        os.replace(log, os.path.join(out_dir, "yosys.prev.log"))
+    waited, infra, rc = 0.0, None, -9
     t0 = time.time()
-    with open(log, "w") as lf:
-        try:
-            rc = subprocess.call(["nice", "-n", str(nice), YOSYS, "-l",
-                                  "/dev/null", "-s", ys], stdout=lf,
-                                 stderr=subprocess.STDOUT, env=env,
-                                 cwd=out_dir, timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            rc = -9
+    try:
+        with _Lock(LOCK_PATH, LOCK_WAIT_S) as lk:
+            waited = lk.waited
+            t0 = time.time()
+            r = _run_yosys(ys, log, tmp, out_dir, nice, timeout_s, stall_s)
+            rc, infra = r["rc"], r["infra"]
+    except TimeoutError as exc:
+        infra = f"timing lock wait timeout: {exc}"
     wall = round(time.time() - t0, 1)
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.rmtree(os.path.join(out_dir, "sv2v"), ignore_errors=True)
-    return {"rc": rc, "wall_s": wall, "log": log, "stat": stat,
-            "n_rtl_files": len(files)}
+    if infra is None and rc is not None and rc < 0:
+        infra = f"yosys killed by signal {-rc}"
+    return {"rc": rc, "wall_s": wall, "lock_wait_s": waited, "log": log,
+            "stat": stat, "n_rtl_files": len(files), "infra": infra,
+            "log_tail": _tail(log) if infra else ""}
 
 
 def judge(rtl_dir: str, out_dir: str, *, top: str = "MatrixFPMultiplyPipe",
@@ -406,6 +579,13 @@ def judge(rtl_dir: str, out_dir: str, *, top: str = "MatrixFPMultiplyPipe",
                      area_min_ratio)
     if s["rc"] != 0:
         verdict["reasons"].insert(0, f"yosys rc={s['rc']} (see {s['log']})")
+    if s.get("infra"):
+        # A harness failure is not a timing FAIL: flag it so the loop can
+        # retry once and, failing that, tell the agent it is not a verdict.
+        verdict["infra_failure"] = True
+        verdict["infra_reason"] = s["infra"]
+        verdict["reasons"].insert(
+            0, f"HARNESS FAILURE (not a verdict on the design): {s['infra']}")
     res = {"top": top, "rtl_dir": rtl_dir, "flatten": flatten,
            "liberty": LIB, "period_ps": PERIOD_PS, "abc_script": ABC_SCRIPT,
            "synth": s, "stat": st, "critical": crit,

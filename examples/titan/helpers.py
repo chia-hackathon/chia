@@ -861,6 +861,21 @@ def format_rtl_timing_scope(done: Sequence[str], failing: bool) -> str:
         f"results exactly as it is.\n")
 
 
+def format_timing_harness_failure(attempt: int, feedback: str,
+                                  log_path: Optional[str] = None) -> str:
+    """Timing judge infrastructure failed twice: not a design verdict."""
+    out = [f"# Iteration {attempt}: functionally clean, timing judge "
+           f"HARNESS FAILURE (not a verdict)\n",
+           "Directed (S1) and the RVV regression sample (S2) passed. The "
+           "timing harness itself failed (twice), so nothing was measured. "
+           "Your RTL is not at fault: do not change it because of this. "
+           "Finish your turn with the tree as it is; the loop will re-run "
+           "the judge.\n", feedback.rstrip() + "\n"]
+    if log_path:
+        out.append(f"\nHarness log: {log_path}")
+    return "\n".join(out) + "\n"
+
+
 def format_timing_failure(attempt: int, feedback: str,
                           log_path: Optional[str] = None) -> str:
     """The loop's message after an attempt that is functionally clean (S1
