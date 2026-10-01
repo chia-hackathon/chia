@@ -1243,5 +1243,70 @@
    "gate": "directed 2247/2247; RVV 837/837 (1 single-run failure cleared by 7-rep unanimity)",
    "S3": "1024/1024 lockstep, 0 crash retries"
   }
+ },
+ {
+  "round": 11,
+  "id": "r34_0930_1146",
+  "kind": "CHIA loop run (model-diff + rtl-diff r31, timing judge on)",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-09-30T11:46+08:00",
+  "ended": "2026-09-30T17:51+08:00",
+  "wall_minutes": 365,
+  "llm_cost_usd": null,
+  "submission_id": "titan-r34_0930_1146",
+  "scope": "Pipeline MatrixFPMultiplyPipe (no functional change): stage T timing judge, target 36 ns abc path (flattened standalone FU), FU area 0.8x-1.5x of r31 (443,686 um2 flattened); r31 baseline 319.45 ns FAIL",
+  "code": "branch titan-r11, commit 3a338be",
+  "settings": "--timing-target 36, TITAN_LLM_TIMEOUT_SECONDS=5400, TITAN_MAX_ITERS=10",
+  "model_diff": "r31_0927_0146/20260927_031301_impl_diff_attempt1.diff",
+  "rtl_diff": "same file",
+  "result": "FAILED (infra): timing judge hung inside the Ray worker (yosys never read back abc output.blif; same synth completes in 6:47 from a shell, 319.45 ns) -> 2x 3600 s timeouts; then host OOM (other users' jobs + titan object store; 239-268/251 GB) killed the LLM task (Ray OutOfMemoryError) and the head raylet died 17:51. The RTL agent nonetheless built a 19-stage multi-cycle MatrixFPMultiplyPipe ('v4'): directed 1086/1086, RVV sample 18/18, local copy of the judge 25.98 ns, ~562k um2 (+26.6%) -- never confirmed by the real judge.",
+  "note": "LLM cost not recorded (job crashed before ledger); check agent_runs_rtl.jsonl",
+  "llm_cost_usd_estimate": "~87-90 (from transcript tokens: 142.9M cache-read, 0.75M cache-write, 0.43M output); not measured",
+  "rescue": "r34_0930_1146/rescue/r34_live_rtl.diff (live chipyard RTL incl. v4, md5 d28087bb of MatrixFPMultiplyPipe.scala) and rescue/iter1_backup/ (copied from llm container)"
+ },
+ {
+  "round": 11,
+  "id": "r35_0930_1944",
+  "kind": "CHIA loop run (model-diff r31, rtl-diff = rescued r34 v4 pipelined FU, timing judge on)",
+  "llm_model": "claude-opus-5-5 (not invoked; fast path)",
+  "started": "2026-09-30T19:44+08:00",
+  "ended": "2026-10-01T01:39+08:00",
+  "wall_minutes": 355,
+  "llm_cost_usd": 0.0,
+  "submission_id": "titan-r35_0930_1944",
+  "code": "branch titan-r11, commit d029255 (timing-judge hang fix: TERM=xterm + isolated yosys; infra-failure retry; OOM retry); cluster restarted with 8 GB object store/node",
+  "settings": "--timing-target 36, TITAN_LLM_TIMEOUT_SECONDS=5400, TITAN_MAX_ITERS=10, TITAN_REGRESSION_SAMPLE=150, default S3 (64 cases/geom)",
+  "model_diff": "r31_0927_0146/20260927_031301_impl_diff_attempt1.diff",
+  "rtl_diff": "r34_0930_1146/rescue/r34_live_rtl.diff",
+  "result": "CONVERGED (fast path: v4 RTL passed every judge on first check, no agent turn)",
+  "stages": {
+   "stage0": "model reseed directed 1086/1086",
+   "S1": "directed 1086/1086",
+   "S2": "RVV sample pass (0 failures after confirm)",
+   "T": "MatrixFPMultiplyPipe 25.978 ns <= 36 ns target (r31: 319.45 ns, 12.3x faster), area 561,908 um2 flattened (+26.6% vs r31 443,686; within 0.8-1.5x), logic depth 64, 4,997 flops, judge wall 126.5 s",
+   "gate": "directed 2247/2247; RVV 837/837 (0 single-run failures)",
+   "S3": "64/64 lockstep"
+  },
+  "ppa": "ppa8 (same flow as ppa7; sky130 hd tt, abc -D 10000, top SaturnShuttleUnit): total 4,160,822 um2 (+2.22% vs r31 4,070,451; +29.97% vs baseline 3,201,433); flops 39,983 (+3,874 vs r31); MatrixFPMultiplyPipe 798,093 um2 hier (+12.8%); FP FU path in-context 23.70 ns (r31 268.7), standalone 22.54 ns (r31 217.4); SoC longest abc path now Compactor_4 30.25 ns (as baseline 30.87)"
+ },
+ {
+  "round": 11,
+  "id": "r36_1001_0855",
+  "kind": "verification-only rerun of the round-11 tree with enlarged S3",
+  "llm_model": "claude-opus-5-5 (not invoked; fast path)",
+  "started": "2026-10-01T08:55+08:00",
+  "ended": "2026-10-01T16:23+08:00",
+  "wall_minutes": 448,
+  "llm_cost_usd": 0.0,
+  "submission_id": "titan-r36_1001_0855",
+  "model_diff": "r31_0927_0146/20260927_031301_impl_diff_attempt1.diff",
+  "rtl_diff": "r35_0930_1944/20260930_195245_rtl_resume.diff (= r34 rescued v4)",
+  "settings": "--timing-target 36, TITAN_STRESS_CASES_PER_GEOM=1024, TITAN_STRESS_TEST_HOURS=4, TITAN_REGRESSION_SAMPLE=150; code titan-r11 d029255",
+  "result": "CONVERGED (verification rerun, no agent turn)",
+  "stages": {
+   "T": "25.978 ns <= 36 ns, 561,908 um2 (+26.6% vs r31 FU), judge 130.6 s",
+   "gate": "directed 2247/2247; RVV 837/837 (0 single-run failures)",
+   "S3": "1024/1024 lockstep"
+  }
  }
 ]

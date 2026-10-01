@@ -153,11 +153,13 @@ agent 生出成本與編輯都不在帳上的 sub-agent。見本分支的第一�
 | `r21_round7.diff` | 第七輪（`vfwmmacc`/`vfqmmacc`）的模型 + RTL，由 r23 完整收斂驗證 |
 | `r24_round8_final.diff` | 第八輪，15 條指令設計（OFP8，模型 + RTL），r24 收斂、r25 以 1,024 支 S3 重驗 |
 | `r27_round9_final.diff` | 第九輪（整數 13/13 cell、unsigned/混號、W=1 FP16/BF16/OFP8 累加器；模型 + RTL），r27 收斂、r28 以 1,024 支 S3 重驗 |
-| `r31_round10_final.diff` | **第十輪，最終設計：IME v0.9.0 全部 61/61 cell**（OFP4 E2M1、16 個 MXFP；模型 + RTL），r31 收斂、r33 以 1,024 支 S3 重驗 |
+| `r31_round10_final.diff` | 第十輪：IME v0.9.0 全部 61/61 cell（OFP4 E2M1、16 個 MXFP；模型 + RTL），r31 收斂、r33 以 1,024 支 S3 重驗 |
+| `r35_round11_final.diff` | **第十一輪，最終設計**：`MatrixFPMultiplyPipe` 切成 19 級多 cycle 管線（功能不變，61/61 cell）；FU 路徑 319.45 → 25.98 ns（stage T 目標 36 ns），r35 收斂、r36 以 1,024 支 S3 重驗 |
+| `ppa8_round11.md` | 第十一輪整顆 SoC 合成（sky130 hd、yosys/abc）：面積 +2.22% vs r31，FP FU 路徑 268.7 → 23.7 ns，SoC 最長路徑回到 Compactor_4 30.25 ns |
 | `round3_design.md` | 全 15 條指令調查、第三輪批次決策、依賴的 SAIL 行號、編碼與實作 |
 | `r15_full_verify.json` | 最終驗證結果（directed 80/80、S2 full 837/0、排除清單） |
 | `ledger.md` | 前 19 次 run（到 r15）的時間 / 成本 / 結果，含逐列敘述（累計 46h11m、$837.13） |
-| `run_ledger.md` | **全部 run**（r1–r33）的時間 / 成本 / 結果，由 `titan_runs/tools/ledger.py` 產生 |
+| `run_ledger.md` | **全部 run**（r1–r36）的時間 / 成本 / 結果，由 `titan_runs/tools/ledger.py` 產生 |
 | `rounds.json` | 第六至十輪逐 run 的結構化紀錄（階段結果、成本、發現、更正） |
 | `report_data.md` | 全語料庫的逐項證據與根因分析 |
 | `ppa_method.md` / `ppa_results.json` | 結構性 RTL proxy 比較的方法與結果（非真實 PPA） |
