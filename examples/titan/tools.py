@@ -34,7 +34,8 @@ from chia.base.tools.ChiaTool import ChiaTool
 import helpers
 from constants import (AGENT_RUNS_PER_ITER, RUN_DIRECTED_DRAIN_TIMEOUT_S,
                        RUN_DIRECTED_WAIT_CAP, RVV_AGENT_MAX_REPS,
-                       RVV_STATUS_NAMES, TIMING_RUNS_PER_ITER)
+                       RVV_STATUS_NAMES, TIMING_RUNS_PER_ITER,
+                       PPA_CYCLE_RUNS_PER_ITER, PPA_RUNS_PER_ITER)
 
 
 class SpecTool(ChiaTool):
@@ -348,18 +349,36 @@ class RunDirectedTool(ChiaTool):
         # minutes of a host core and must not crowd out functional runs.
         "timing": {"prefix": "tm", "label": "run_timing",
                    "start": "run_timing_start", "wait": "run_timing_wait"},
+        # Round 12.  Same single-chipyard-node rule, each with its own small
+        # budget (a PPA run is ~5 minutes of a host core; the cycle suite is
+        # nine short simulations).  Stage P replaces stage T, so a run has
+        # either the timing tools or these.
+        "ppa": {"prefix": "pp", "label": "run_ppa",
+                "start": "run_ppa_start", "wait": "run_ppa_wait"},
+        "cycles": {"prefix": "cy", "label": "run_cycles",
+                   "start": "run_cycles_start", "wait": "run_cycles_wait"},
     }
+    #: kinds that have their own runner, budget file and per-turn cap
+    _BUDGETED = ("timing", "ppa", "cycles")
 
     def __init__(self, name: str, runner: Callable, budget_path: str,
                  max_runs: int = AGENT_RUNS_PER_ITER,
                  rvv_runner: Optional[Callable] = None,
                  task_options=None,
                  timing_runner: Optional[Callable] = None,
-                 max_timing_runs: int = TIMING_RUNS_PER_ITER) -> None:
+                 max_timing_runs: int = TIMING_RUNS_PER_ITER,
+                 ppa_runner: Optional[Callable] = None,
+                 cycles_runner: Optional[Callable] = None,
+                 max_ppa_runs: int = PPA_RUNS_PER_ITER,
+                 max_cycle_runs: int = PPA_CYCLE_RUNS_PER_ITER) -> None:
         super().__init__(name, task_options=task_options)
         self.runner = runner
         self.rvv_runner = rvv_runner
         self.timing_runner = timing_runner
+        self.ppa_runner = ppa_runner
+        self.cycles_runner = cycles_runner
+        self.max_ppa_runs = max_ppa_runs
+        self.max_cycle_runs = max_cycle_runs
         self.budget_path = budget_path
         self.timing_budget_path = budget_path + ".timing"
         self.jobs_path = budget_path + ".jobs.json"
@@ -383,6 +402,14 @@ class RunDirectedTool(ChiaTool):
                               name=f"{name}_run_timing_start")
             self.mcp.add_tool(self.run_timing_wait,
                               name=f"{name}_run_timing_wait")
+        if ppa_runner is not None:
+            self.mcp.add_tool(self.run_ppa_start, name=f"{name}_run_ppa_start")
+            self.mcp.add_tool(self.run_ppa_wait, name=f"{name}_run_ppa_wait")
+        if cycles_runner is not None:
+            self.mcp.add_tool(self.run_cycles_start,
+                              name=f"{name}_run_cycles_start")
+            self.mcp.add_tool(self.run_cycles_wait,
+                              name=f"{name}_run_cycles_wait")
         super().__post_init__()
 
     # A ThreadPoolExecutor is not picklable and this object is re-pickled
@@ -516,6 +543,68 @@ class RunDirectedTool(ChiaTool):
         """
         return await self._wait("timing", job_id, max_wait_s)
 
+    def run_ppa_start(self, rebuild: bool = True) -> str:
+        """Start the round-12 PPA JUDGE on your current tree. Returns at once.
+
+        Exactly stage P as the loop runs it after S1 and S2: the scope check
+        (only the two FU files and new files under exu/fp|int/ may change),
+        then synthesis of the FP FU and the INT FU flattened and of the FP FU
+        hierarchically for attribution (yosys + abc, sky130_fd_sc_hd
+        tt_025C_1v80). Passes iff the FP area, the longest paths, the INT
+        area and the netlist sanity checks are inside the round's targets.
+
+        It does NOT wait. Call `run_ppa_wait` (repeatedly) for the report:
+        metric table vs the starting tree / best clean tree / target, the
+        hierarchical submodule table, flops by register-name prefix, the
+        critical paths.
+
+        rebuild: True (default) elaborates your current tree first. Pass
+            False only right after a run_directed_start of the SAME tree.
+
+        One job of any kind at a time (shared with run_directed_start /
+        run_rvv_start / run_cycles_start); its own budget of a few starts per
+        turn. A build plus synthesis takes several minutes.
+        """
+        return self._start("ppa", "fu", rebuild)
+
+    async def run_ppa_wait(self, job_id: str = "",
+                           max_wait_s: int = 90) -> str:
+        """Wait for a run_ppa job and return the PPA judge's report.
+
+        Blocks at most `max_wait_s` seconds (capped at
+        RUN_DIRECTED_WAIT_CAP); if the job is not done it says so and you
+        call it again. Waits are free.
+
+        job_id: the id run_ppa_start gave you. Omit it for the most recent
+            job of any kind.
+        """
+        return await self._wait("ppa", job_id, max_wait_s)
+
+    def run_cycles_start(self, rebuild: bool = True) -> str:
+        """Start the round-12 CYCLE SUITE on your current tree. Returns at once.
+
+        Nine bare-metal programs (int8 vqmmacc, FP16 / bf16 vfwmmacc, OFP4
+        vf8wmmacc, MXFP8, MXINT8, vfmmacc FP32 / FP64, bf16 C) on the same
+        non-cosim Verilator build the directed tests use, each reporting the
+        rdcycle delta of its one IME instruction. The loop compares them
+        exactly with the starting tree: no benchmark may take more cycles.
+
+        It does NOT wait. Call `run_cycles_wait` (repeatedly) for the table.
+
+        rebuild: True (default) elaborates your current tree first. Pass
+            False only right after a run_directed_start of the SAME tree.
+        """
+        return self._start("cycles", "suite", rebuild)
+
+    async def run_cycles_wait(self, job_id: str = "",
+                              max_wait_s: int = 90) -> str:
+        """Wait for a run_cycles job and return the cycle table.
+
+        job_id: the id run_cycles_start gave you. Omit it for the most
+            recent job of any kind.
+        """
+        return await self._wait("cycles", job_id, max_wait_s)
+
     async def run_directed_wait(self, job_id: str = "",
                                 max_wait_s: int = 90) -> str:
         """Wait for a run_directed job and return its result.
@@ -545,6 +634,11 @@ class RunDirectedTool(ChiaTool):
         if self.timing_runner is not None:
             lines.append(f"timing runs started this turn: "
                          f"{self.timing_runs_used()}/{self.max_timing_runs}")
+        for kind in ("ppa", "cycles"):
+            if self._runner_of(kind) is not None:
+                lines.append(f"{kind} runs started this turn: "
+                             f"{self.runs_used_kind(kind)}/"
+                             f"{self._max_of(kind)}")
         if not jobs:
             lines.append("No jobs started this turn.")
         for job in sorted(jobs.values(), key=lambda j: j.get("seq", 0)):
@@ -587,6 +681,20 @@ class RunDirectedTool(ChiaTool):
             self._bump(used, self.timing_budget_path)
             job_id = f"{names['prefix']}{seq}"
             limit = self.max_timing_runs
+        elif kind in ("ppa", "cycles"):
+            if self._runner_of(kind) is None:
+                return f"{names['label']} is not enabled in this run."
+            used = self.runs_used_kind(kind)
+            limit = self._max_of(kind)
+            if used >= limit:
+                return (f"The {kind} budget for this turn is spent "
+                        f"({used}/{limit}). Make your remaining edits on the "
+                        f"evidence you have; the loop runs the PPA judge and "
+                        f"the cycle suite on what you leave behind once S1 "
+                        f"and S2 pass.")
+            seq = used + 1
+            self._bump(used, self._budget_path_of(kind))
+            job_id = f"{names['prefix']}{seq}"
         else:
             used = self.runs_used()
             if used >= self.max_runs:
@@ -613,7 +721,8 @@ class RunDirectedTool(ChiaTool):
                 f"rebuild={bool(rebuild)}"
                 + (f", reps={reps}" if reps > 1 else "")
                 + f"); {seq}/{limit} starts used "
-                + ("this turn (timing budget)." if kind == "timing" else
+                + (f"this turn ({kind} budget)."
+                   if kind in self._BUDGETED else
                    "this turn (shared budget).")
                 + f"\nCall {names['wait']}"
                 f"('{job_id}') now, and keep calling it until it returns a "
@@ -661,7 +770,8 @@ class RunDirectedTool(ChiaTool):
         label = self._KINDS[kind]["label"]
         try:
             runner = (self.rvv_runner if kind == "rvv" else
-                      self.timing_runner if kind == "timing" else self.runner)
+                      self._runner_of(kind) if kind in self._BUDGETED
+                      else self.runner)
             if runner is None:
                 raise RuntimeError(f"no {label} runner is configured")
             reps = max(1, min(int(reps or 1), RVV_AGENT_MAX_REPS))
@@ -689,8 +799,8 @@ class RunDirectedTool(ChiaTool):
 
     def _render(self, job: dict) -> str:
         took = (job.get("finished") or time.time()) - job.get("started", 0)
-        limit = (self.max_timing_runs if job.get("kind") == "timing"
-                 else self.max_runs)
+        limit = (self._max_of(job.get("kind"))
+                 if job.get("kind") in self._BUDGETED else self.max_runs)
         return (f"{job.get('result') or '(no output)'}\n\n"
                 f"[{job['job_id']}: {self._label(job)} {job.get('seq')}/"
                 f"{limit} runs for this turn, {took:.0f}s]")
@@ -748,6 +858,30 @@ class RunDirectedTool(ChiaTool):
         except (OSError, ValueError):
             return 0
 
+    # --- round-12 kinds: runner / budget file / cap, by kind ----------------
+    def _runner_of(self, kind: str):
+        return {"timing": getattr(self, "timing_runner", None),
+                "ppa": getattr(self, "ppa_runner", None),
+                "cycles": getattr(self, "cycles_runner", None)}.get(kind)
+
+    def _budget_path_of(self, kind: str) -> str:
+        return {"timing": self.timing_budget_path,
+                "ppa": self.budget_path + ".ppa",
+                "cycles": self.budget_path + ".cycles"}[kind]
+
+    def _max_of(self, kind: str) -> int:
+        return {"timing": self.max_timing_runs,
+                "ppa": getattr(self, "max_ppa_runs", PPA_RUNS_PER_ITER),
+                "cycles": getattr(self, "max_cycle_runs",
+                                  PPA_CYCLE_RUNS_PER_ITER)}[kind]
+
+    def runs_used_kind(self, kind: str) -> int:
+        try:
+            with open(self._budget_path_of(kind)) as fh:
+                return int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            return 0
+
     def _bump(self, used: int, path: Optional[str] = None) -> None:
         path = path or self.budget_path
         try:
@@ -793,6 +927,9 @@ class RunDirectedTool(ChiaTool):
         self._bump(-1)
         if self.timing_runner is not None:
             self._bump(-1, self.timing_budget_path)
+        for kind in ("ppa", "cycles"):
+            if self._runner_of(kind) is not None:
+                self._bump(-1, self._budget_path_of(kind))
 
 
 def record_agent_run(events_path: str, payload: dict) -> None:

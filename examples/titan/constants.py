@@ -769,6 +769,41 @@ TIMING_SYNTH_TIMEOUT_S = int(os.environ.get("TITAN_TIMING_SYNTH_TIMEOUT_S",
                                             "3600"))
 
 
+#: Round 12 (2026-10): PPA of the IME datapath FUs.  Nothing is added; the
+#: agent shrinks ``MatrixFPMultiplyPipe`` (and may touch
+#: ``MatrixMultiplyPipe``) without changing a result bit or a cycle count.
+#: The judge is ``ppa_judge.py`` ("stage P"): standalone flat synthesis of the
+#: two FUs (+ a hierarchical attribution run, + the full SoC at the Gate),
+#: ``ppa_scope.py`` (file allowlist / forbidden constructs / frozen model)
+#: and the ``ppa_cycles.py`` cycle suite.  All targets live in the JSON named
+#: by ``--ppa-config`` / ``TITAN_PPA_CONFIG`` (``ppa_judge.DEFAULT_CONFIG``);
+#: calibration fills in the numbers.  Off unless a config is given, exactly as
+#: the timing judge is off without ``--timing-target`` (the two are mutually
+#: exclusive: stage P replaces stage T).  ``TITAN_INSNS=twelve`` is an alias
+#: of ``all``.
+ROUND_TWELVE_TIERS = ()
+ROUND_TWELVE_INSNS = ()
+PPA_CONFIG_PATH = os.environ.get("TITAN_PPA_CONFIG", "")
+#: Agent-side ``run_ppa_start`` / ``run_cycles_start`` calls per turn (each is
+#: a build, if asked, plus ~5 min of single-threaded synthesis, or nine short
+#: simulations).
+PPA_RUNS_PER_ITER = int(os.environ.get("TITAN_PPA_RUNS_PER_ITER", "3"))
+PPA_CYCLE_RUNS_PER_ITER = int(os.environ.get("TITAN_PPA_CYCLE_RUNS_PER_ITER",
+                                             "3"))
+#: Round-12 launch policy (plan section 6 D7).  ``TITAN_MAX_ITERS`` (above)
+#: stays the knob that bounds the loop; these are what the plan approved and
+#: what ``ppa_judge`` carries as config defaults: 8 iterations, a $250 run
+#: cap (checked by the loop against the usage the LLM backend reports, when
+#: it reports any), stop after 3 judged attempts without area progress beyond
+#: the noise band.
+PPA_MAX_ITERS = 8
+PPA_COST_CAP_USD = 250.0
+PPA_NO_PROGRESS_STOP = 3
+#: Per-synthesis wall clocks: P-FP / P-INT / P-ATTR use TITAN_TIMING_TIMEOUT_S
+#: (900 s, timing_judge); the full-SoC Gate run needs ~13 min plus lock wait.
+PPA_SOC_TIMEOUT_S = int(os.environ.get("TITAN_PPA_SOC_TIMEOUT_S", "3600"))
+
+
 def _scope_insns() -> tuple:
     """Which instructions this run's directed suite and prompts cover.
 
@@ -809,6 +844,8 @@ def _scope_insns() -> tuple:
              "ten": ROUND_TEN_TIERS, "10": ROUND_TEN_TIERS,
              # round eleven is a timing round: no new program, full scope
              "eleven": ALL_SCOPE, "11": ALL_SCOPE,
+             # round twelve is a PPA round: no new program, full scope
+             "twelve": ALL_SCOPE, "12": ALL_SCOPE,
              "all": ALL_SCOPE, "": ALL_SCOPE}
     if raw.lower() in named:
         return named[raw.lower()]

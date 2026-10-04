@@ -498,19 +498,30 @@ def _run_yosys(ys: str, log: str, tmp: str, cwd: str, nice: int,
 
 def synth(rtl_dir: str, top: str, out_dir: str, *, flatten: bool = True,
           nice: int = 19, timeout_s: Optional[float] = None,
-          stall_s: Optional[float] = None) -> Dict[str, object]:
+          stall_s: Optional[float] = None,
+          extra_ys: Sequence[str] = (),
+          all_files: bool = False) -> Dict[str, object]:
     """sv2v + yosys; returns {"rc", "wall_s", "log", "stat", "infra"}.  All
     temporaries (abc temp dirs, the liberty scl cache) go under
     ``out_dir/tmp`` via TMPDIR and are removed afterwards.  ``infra`` is a
     reason string when the harness (not the design) failed: timeout, abc
-    handoff stall, lock wait timeout -- else None."""
+    handoff stall, lock wait timeout -- else None.
+
+    Round 12 (both default to the round-11 behaviour): ``extra_ys`` lines are
+    appended to the yosys script after ``stat`` (the PPA judge writes the
+    netlist there); ``all_files`` feeds sv2v every generated file instead of
+    the top's module closure (the full-SoC run: the SRAM-macro wrappers live
+    in ``*.mems.v`` files whose stem is not a module name, so a closure walk
+    would miss them -- ppa2_syn.collect does the same)."""
     timeout_s = TIMEOUT_S if timeout_s is None else timeout_s
     stall_s = STALL_S if stall_s is None else stall_s
     out_dir, rtl_dir = os.path.abspath(out_dir), os.path.abspath(rtl_dir)
     os.makedirs(out_dir, exist_ok=True)
     tmp = os.path.join(out_dir, "tmp")
     os.makedirs(tmp, exist_ok=True)
-    files = _sv2v(closure(rtl_dir, [top]), os.path.join(out_dir, "sv2v"))
+    srcs = (sorted(rtl_files(rtl_dir).values()) if all_files
+            else closure(rtl_dir, [top]))
+    files = _sv2v(srcs, os.path.join(out_dir, "sv2v"))
     macros = sorted(os.path.basename(f)[:-2] for f in files
                     if f.endswith("_ext.v"))
     ys = os.path.join(out_dir, "synth.ys")
@@ -526,6 +537,8 @@ def synth(rtl_dir: str, top: str, out_dir: str, *, flatten: bool = True,
         f.write(f"abc -liberty {LIB} -D {PERIOD_PS} -script \"{ABC_SCRIPT}\"\n")
         f.write("setundef -zero\nopt_clean -purge\n")
         f.write(f"tee -o {stat} stat -liberty {LIB} -top {top}\n")
+        for line in extra_ys:
+            f.write(line.rstrip("\n") + "\n")
     log = os.path.join(out_dir, "yosys.log")
     if os.path.exists(log):                    # keep a retry's first log
         os.replace(log, os.path.join(out_dir, "yosys.prev.log"))

@@ -893,3 +893,96 @@ def format_timing_failure(attempt: int, feedback: str,
     if log_path:
         out.append(f"\nFull timing report for this iteration: {log_path}")
     return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# round 12: the PPA judge's framing (pure; unit-tested)
+# ---------------------------------------------------------------------------
+
+def format_rtl_ppa_scope(done: Sequence[str], failing: bool) -> str:
+    """``format_rtl_seed_scope`` for the PPA round: no instruction is new."""
+    if failing:
+        return (
+            f"Scope: the RTL in the tree implements {_insn_list(done)} and "
+            f"every cell of the Zvvm tables. This round adds NO instruction "
+            f"and NO test: it is a PPA (area) round. **The failures below "
+            f"are regressions of the seeded tree, not new work** -- fix them "
+            f"first; the area goal is only graded on a functionally clean "
+            f"design.\n")
+    return (
+        f"Scope: the RTL in the tree implements {_insn_list(done)} and every "
+        f"cell of the Zvvm tables, and every directed test currently passes "
+        f"or skips. This round adds NO instruction and NO test: it is a PPA "
+        f"(area) round (see the PPA section). Keep every one of those "
+        f"results, and every cycle count, exactly as it is.\n")
+
+
+def format_ppa_harness_failure(attempt: int, feedback: str,
+                               log_path: Optional[str] = None) -> str:
+    """PPA judge infrastructure failed twice: not a design verdict."""
+    out = [f"# Iteration {attempt}: functionally clean, PPA judge HARNESS "
+           f"FAILURE (not a verdict)\n",
+           "Directed (S1) and the RVV regression sample (S2) passed. The "
+           "PPA harness itself failed (twice), so nothing was measured. "
+           "Your RTL is not at fault: do not change it because of this. "
+           "Finish your turn with the tree as it is; the loop will re-run "
+           "the judge.\n", feedback.rstrip() + "\n"]
+    if log_path:
+        out.append(f"\nHarness log: {log_path}")
+    return "\n".join(out) + "\n"
+
+
+def format_ppa_failure(attempt: int, feedback: str, cycles: str = "",
+                       log_path: Optional[str] = None,
+                       best_note: str = "") -> str:
+    """After an attempt that is functionally clean (S1 and the S2 sample) but
+    fails stage P (a binding PPA check or the cycle suite).  ``feedback`` is
+    ``ppa_judge.format_feedback`` output, ``cycles`` the cycle table."""
+    out = [f"# Iteration {attempt}: functionally clean, PPA FAILS\n",
+           "Directed (S1) and the RVV regression sample (S2) both passed on "
+           "this tree -- keep them that way. Stage P did not pass:\n",
+           feedback.rstrip() + "\n"]
+    if cycles:
+        out.append("### Cycle suite\n\n" + cycles.rstrip() + "\n")
+    if best_note:
+        out.append(best_note.rstrip() + "\n")
+    out.append("Reduce the FP unit's area as the report shows (see the PPA "
+               "section for the rules), then check it yourself with "
+               "`run_ppa_start` -> `run_ppa_wait`, `run_cycles_start` -> "
+               "`run_cycles_wait` and the functional judges with "
+               "`run_directed_start('all')` before you finish.")
+    if log_path:
+        out.append(f"\nFull PPA report for this iteration: {log_path}")
+    return "\n".join(out) + "\n"
+
+
+def format_ppa_clean(attempt: int, feedback: str, cycles: str = "",
+                     log_path: Optional[str] = None,
+                     best_note: str = "") -> str:
+    """After a fully clean attempt that has not reached the stretch goal."""
+    out = [f"# Iteration {attempt}: CLEAN (S1, S2 and stage P all pass), "
+           f"stretch goal not reached yet\n",
+           feedback.rstrip() + "\n"]
+    if cycles:
+        out.append("### Cycle suite\n\n" + cycles.rstrip() + "\n")
+    if best_note:
+        out.append(best_note.rstrip() + "\n")
+    out.append("This tree is a valid result and is kept as a candidate. You "
+               "may reduce the area further, with the same rules; an attempt "
+               "that is worse than the best clean tree is simply not used.")
+    if log_path:
+        out.append(f"\nFull PPA report for this iteration: {log_path}")
+    return "\n".join(out) + "\n"
+
+
+def format_ppa_best_note(best: Optional[Dict[str, object]],
+                         best_path: str = "") -> str:
+    """One paragraph naming the best clean iteration so far."""
+    if not best:
+        return "No fully clean iteration yet."
+    note = (f"Best clean iteration so far: attempt {best['attempt']}, FP "
+            f"area {float(best['a_fp_um2']):,.0f} um2.")
+    if best_path:
+        note += (f" Its diff is `{best_path}`; `git apply` it on a reverted "
+                 f"tree if you want to go back to it.")
+    return note

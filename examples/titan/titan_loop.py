@@ -64,6 +64,9 @@ import ime_stress
 import ime_tests
 import llm as llm_mod
 import nodes
+import ppa_cycles
+import ppa_judge
+import ppa_scope
 import timing_judge
 import tools as titan_tools
 from constants import (AGENT_LOG_DIR, AGENT_LOG_REL, AGENT_RUNS_PER_ITER,
@@ -82,7 +85,9 @@ from constants import (AGENT_LOG_DIR, AGENT_LOG_REL, AGENT_RUNS_PER_ITER,
                        STRESS_TEST_HOURS, TITAN_LOG_ROOT, VLEN,
                        TIMING_AREA_BASE_UM2, TIMING_AREA_MAX_GROWTH,
                        TIMING_AREA_MIN_RATIO, TIMING_RUNS_PER_ITER,
-                       TIMING_TARGET_NS, TIMING_TOP)
+                       TIMING_TARGET_NS, TIMING_TOP,
+                       PPA_CONFIG_PATH, PPA_CYCLE_RUNS_PER_ITER,
+                       PPA_RUNS_PER_ITER)
 
 EXTENSION = "ime"
 
@@ -590,6 +595,101 @@ def agent_run_timing(cfg: Dict[str, object], tests: str, rebuild: bool,
         "area_um2": v.get("area_um2")})
     return (f"(run_timing, rebuild={bool(rebuild)})\n\n"
             f"{res.get('feedback') or ''}\nReport copy: {path}")
+
+
+def agent_run_ppa(cfg: Dict[str, object], tests: str, rebuild: bool,
+                  seq: int) -> str:
+    """What ``run_ppa_start`` does.  Runs inside the tool actor.
+
+    The same build as ``run_directed`` (sharing its per-actor cache), then the
+    same scope check and :func:`_ppa_check` the loop's stage P runs -- a tool
+    that measured something adjacent would predict nothing."""
+    pg_opts = cfg["pg_opts"]
+    run_id, tag = cfg["run_id"], cfg["tag"]
+    pcfg = cfg.get("ppa") or {}
+    if not pcfg:
+        return "The PPA judge is not enabled in this run."
+    artifact = _AGENT_ARTIFACTS.get(tag)
+    if rebuild or artifact is None:
+        artifact = get(nodes.build_saturn.options(**pg_opts)
+                       .chia_remote(DIRECTED_CONFIG, extension=EXTENSION))
+        _AGENT_ARTIFACTS[tag] = artifact
+    leaf = f"agent_ppa_{seq}"
+    if not artifact.success:
+        path = _publish_logs(run_id, leaf, pg_opts,
+                             build_stdout=getattr(artifact, "stdout", "") or "",
+                             build_stderr=getattr(artifact, "stderr", "") or "")
+        titan_tools.record_agent_run(cfg["events_path"], {
+            "event": "agent_ppa", "tag": tag, "seq": seq,
+            "rebuild": bool(rebuild), "build": "failed"})
+        return helpers.format_build_failure(artifact, seq, log_path=path)
+    ref = _ppa_read_ref(cfg["out_dir"])
+    diff = get(nodes.collect_diff.options(**pg_opts)
+               .chia_remote(CHIPYARD_PATH, extension=EXTENSION))
+    sc = _ppa_scope(diff, ref, artifact, pcfg)
+    if sc is not None and not sc["ok"]:
+        titan_tools.record_agent_run(cfg["events_path"], {
+            "event": "agent_ppa", "tag": tag, "seq": seq,
+            "rebuild": bool(rebuild), "build": "ok", "scope_violation": True})
+        return (f"(run_ppa, rebuild={bool(rebuild)})\n\n"
+                + ppa_scope.format_scope_rejection(sc, seq))
+    out = os.path.join(cfg["out_dir"], "ppa",
+                       f"agent_{tag}_{int(time.time())}_{seq}")
+    res = _ppa_check(artifact, out, pcfg, "iter")
+    v = res.get("verdict") or {}
+    feedback = res.get("feedback") or ""
+    if not ppa_judge.is_infra_failure(res):
+        feedback = ppa_judge.format_feedback(
+            res, pcfg, _ppa_read_best(cfg["out_dir"]), report_path=out)
+    path = _publish_logs(run_id, leaf, pg_opts,
+                         extra_files={"feedback.md": feedback})
+    titan_tools.record_agent_run(cfg["events_path"], {
+        "event": "agent_ppa", "tag": tag, "seq": seq,
+        "rebuild": bool(rebuild), "build": "ok",
+        "pass": bool(v.get("pass")), "a_fp_um2": v.get("a_fp_um2"),
+        "fp_delay_ps": v.get("fp_delay_ps")})
+    return (f"(run_ppa, rebuild={bool(rebuild)})\n\n{feedback}\n"
+            f"Report copy: {path}")
+
+
+def agent_run_cycles(cfg: Dict[str, object], tests: str, rebuild: bool,
+                     seq: int) -> str:
+    """What ``run_cycles_start`` does.  Runs inside the tool actor: the same
+    :func:`_cycles_check` the loop's stage P calls."""
+    pg_opts = cfg["pg_opts"]
+    run_id, tag = cfg["run_id"], cfg["tag"]
+    pcfg = cfg.get("ppa") or {}
+    if not pcfg:
+        return "The PPA judge is not enabled in this run."
+    artifact = _AGENT_ARTIFACTS.get(tag)
+    if rebuild or artifact is None:
+        artifact = get(nodes.build_saturn.options(**pg_opts)
+                       .chia_remote(DIRECTED_CONFIG, extension=EXTENSION))
+        _AGENT_ARTIFACTS[tag] = artifact
+    leaf = f"agent_cycles_{seq}"
+    if not artifact.success:
+        path = _publish_logs(run_id, leaf, pg_opts,
+                             build_stdout=getattr(artifact, "stdout", "") or "",
+                             build_stderr=getattr(artifact, "stderr", "") or "")
+        titan_tools.record_agent_run(cfg["events_path"], {
+            "event": "agent_cycles", "tag": tag, "seq": seq,
+            "rebuild": bool(rebuild), "build": "failed"})
+        return helpers.format_build_failure(artifact, seq, log_path=path)
+    out = os.path.join(cfg["out_dir"], "ppa",
+                       f"agent_cycles_{tag}_{int(time.time())}_{seq}")
+    res = _cycles_check(artifact, out, pcfg, cfg["vlen"])
+    text = (ppa_cycles.format_table(res) if res.get("rows") else "")
+    for r in res.get("reasons") or []:
+        text += f"- {r}\n"
+    path = _publish_logs(run_id, leaf, pg_opts,
+                         extra_files={"cycles.md": text})
+    titan_tools.record_agent_run(cfg["events_path"], {
+        "event": "agent_cycles", "tag": tag, "seq": seq,
+        "rebuild": bool(rebuild), "build": "ok",
+        "pass": bool(res.get("pass"))})
+    return (f"(run_cycles, rebuild={bool(rebuild)}) "
+            f"{'PASS' if res.get('pass') else 'FAIL'}\n\n{text}\n"
+            f"Report copy: {path}")
 
 
 def _read_failing(path: str) -> set:
@@ -1342,6 +1442,404 @@ def _timing_summary() -> Optional[Dict[str, object]]:
                                  default=None)}
 
 
+# ---------------------------------------------------------------------------
+# Round 12: stage P (PPA judge).  Off unless --ppa-config is given.
+# ---------------------------------------------------------------------------
+
+#: The loaded ppa config of this run (``ppa_judge.load_config``), or empty
+#: when stage P is off.  Set once at the top of :func:`run`; the agent's tool
+#: actor gets a copy through ``cfg["ppa"]`` (a different process).
+_PPA: Dict[str, object] = {}
+
+#: Every stage-P record this run produced, in order, for the summary.
+_PPA_LOG: List[Dict[str, object]] = []
+
+#: Mutable state of the improvement loop: the ``ppa_judge.PpaTracker``, the
+#: reference diff for the scope check, the best clean iteration (its full
+#: diff, tree digest and build) and the accumulated LLM cost.
+_PPA_STATE: Dict[str, object] = {}
+
+
+def _ppa_reset(cfg: Optional[Dict[str, object]]) -> None:
+    _PPA.clear()
+    _PPA_LOG.clear()
+    _PPA_STATE.clear()
+    if cfg:
+        _PPA.update(cfg)
+        _PPA_STATE.update(tracker=ppa_judge.PpaTracker(cfg), cost=0.0,
+                          ref_diff=None, best_full_diff=None,
+                          best_tree_digest=None, best_artifact=None)
+
+
+def _ppa_standing() -> str:
+    """The round-12 prompt section every turn carries ('' when off)."""
+    if not _PPA:
+        return ""
+    return llm_mod.ppa_prompt(_PPA, PPA_RUNS_PER_ITER,
+                              PPA_CYCLE_RUNS_PER_ITER)
+
+
+def _standing() -> str:
+    """Whichever judge section (round 11 timing / round 12 PPA) is on."""
+    return _ppa_standing() if _PPA else _timing_standing(_TIMING)
+
+
+def _cli_cost(cli) -> float:
+    """USD an LLM turn cost, when the backend reports it (0 otherwise)."""
+    usage = getattr(cli, "usage", None)
+    if isinstance(usage, dict):
+        for key in ("total_cost_usd", "cost_usd", "total_cost"):
+            try:
+                if usage.get(key) is not None:
+                    return float(usage[key])
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def _ppa_ref_path(out_dir: str) -> str:
+    return os.path.join(out_dir, "ppa_ref.diff")
+
+
+def _ppa_best_path(out_dir: str) -> str:
+    return os.path.join(out_dir, "ppa_best.json")
+
+
+def _ppa_read_ref(out_dir: str) -> Optional[str]:
+    try:
+        with open(_ppa_ref_path(out_dir), encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _ppa_read_best(out_dir: str) -> Optional[Dict[str, object]]:
+    try:
+        with open(_ppa_best_path(out_dir), encoding="utf-8") as fh:
+            return json.load(fh) or None
+    except (OSError, ValueError):
+        return None
+
+
+def _ppa_key(pres: Dict[str, object]) -> str:
+    """Stall-tracker token for a *non-hunting* stage-P failure: the same FP
+    area (to 0.1%), delay and cycle verdict twice is no progress."""
+    v = (pres.get("ppa") or {}).get("verdict") or {}
+    a, d = v.get("a_fp_um2"), v.get("fp_delay_ps")
+    cyc = (pres.get("cycles") or {}).get("pass")
+    return (f"<ppa A_FP {'?' if a is None else f'{float(a) / 1000:.0f}'}k "
+            f"{'?' if d is None else f'{float(d) / 1000:.1f}'}ns "
+            f"cyc={cyc}>")
+
+
+def _ppa_check_once(artifact, out_dir: str, pcfg: Dict[str, object],
+                    mode: str = "iter") -> Dict[str, object]:
+    """Judge ``artifact``'s generated Verilog on the head
+    (``nodes.ppa_judge``).  A dispatch error is returned as a harness-error
+    verdict -- never a design verdict."""
+    try:
+        files = list(getattr(artifact, "generated_src_files", None) or [])
+        if mode == "iter":
+            files = timing_judge.closure_files(
+                files, [str(pcfg["fp_top"]), str(pcfg["int_top"])])
+        return get(nodes.ppa_judge.chia_remote(
+            files, out_dir, pcfg, mode, extension=EXTENSION))
+    except Exception as exc:                                # noqa: BLE001
+        reason = (f"PPA judge harness failure: {type(exc).__name__}: "
+                  f"{str(exc)[:400]} -- not a verdict on the design")
+        return {"verdict": {"pass": False, "harness_error": True,
+                            "infra_failure": True, "reasons": [reason],
+                            "a_fp_um2": None},
+                "fp": {}, "int": {}, "attr": None,
+                "feedback": f"## PPA judge (round 12): HARNESS FAILURE, not "
+                            f"a verdict\n\n- {reason}\n"}
+
+
+def _ppa_check(artifact, out_dir: str, pcfg: Dict[str, object],
+               mode: str = "iter") -> Dict[str, object]:
+    """:func:`_ppa_check_once` with the r34 infra-failure policy (retry once;
+    a second failure is flagged ``verdict["harness_failure"]``)."""
+    return timing_with_retry(
+        lambda: _ppa_check_once(artifact, out_dir, pcfg, mode),
+        ppa_judge.is_infra_failure)
+
+
+def _cycles_check_once(artifact, out_dir: str, pcfg: Dict[str, object],
+                       vlen: int) -> Dict[str, object]:
+    """Build and run the nine cycle programs on ``artifact`` (the loop's own
+    non-cosim DIRECTED_CONFIG build) and compare them with the reference."""
+    try:
+        progs = ppa_cycles.programs(vlen)
+        refs = {bench: nodes.build_ime_test.chia_remote(
+            asm, name, BUILD_WORK_DIR, extension=EXTENSION)
+            for bench, name, asm in progs}
+        names = {bench: name for bench, name, _ in progs}
+        elfs = {bench: get(r) for bench, r in refs.items()}
+        measured: Dict[str, Optional[int]] = {}
+        logs: Dict[str, str] = {}
+        unbuildable = sorted(b for b, e in elfs.items() if not e)
+
+        def run_some(benches):
+            runs = {b: nodes.verilator_run_remote.chia_remote(
+                artifact, elfs[b], names[b], SIM_WORK_DIR,
+                extension=EXTENSION) for b in benches if elfs.get(b)}
+            for b, r in runs.items():
+                run = get(r)
+                text = (run.log or "") + "\n" + (getattr(run, "out", "") or "")
+                logs[b] = text
+                got = ppa_cycles.parse_cycles(text).get(b)
+                if got is not None:
+                    measured[b] = got
+        run_some(sorted(elfs))
+        # a sim crash before the print is a flake as often as a bug: one retry
+        missing = [b for b in elfs if elfs[b] and b not in measured]
+        if missing:
+            run_some(missing)
+    except Exception as exc:                                # noqa: BLE001
+        return {"harness_error": True, "pass": False,
+                "reasons": [f"cycle suite harness failure: "
+                            f"{type(exc).__name__}: {str(exc)[:400]}"],
+                "rows": [], "reference_missing": False}
+    cyc = pcfg.get("cycles") or {}
+    res = ppa_cycles.compare(measured, cyc.get("reference"))
+    if unbuildable:
+        res["reasons"].append(f"cycle programs failed to assemble: "
+                              f"{unbuildable} (generator bug, not the DUT)")
+    res["logs_tail"] = {b: "\n".join(t.splitlines()[-12:])
+                        for b, t in logs.items() if b not in measured}
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "cycles.json"), "w") as fh:
+            json.dump(res, fh, indent=1, default=str)
+    except OSError:
+        pass
+    return res
+
+
+def _cycles_check(artifact, out_dir: str, pcfg: Dict[str, object],
+                  vlen: int) -> Dict[str, object]:
+    return timing_with_retry(
+        lambda: _cycles_check_once(artifact, out_dir, pcfg, vlen),
+        lambda r: bool((r or {}).get("harness_error")))
+
+
+def _ppa_scope(diff: Optional[str], ref: Optional[str],
+               artifact=None, pcfg: Optional[Dict[str, object]] = None
+               ) -> Optional[Dict[str, object]]:
+    """The scope / construct check, or None when there is nothing to compare
+    (attempt 0, or no reference diff)."""
+    if diff is None or not ref:
+        return None
+    res = ppa_scope.check_scope(diff, ref)
+    if artifact is not None and pcfg:
+        try:
+            files = timing_judge.closure_files(
+                list(getattr(artifact, "generated_src_files", None) or []),
+                [str(pcfg["fp_top"]), str(pcfg["int_top"])])
+            for hit in ppa_scope.closure_scan(files):
+                res["reasons"].append(
+                    f"generated Verilog {hit['file']} contains "
+                    f"{hit['match']!r} (forbidden construct survived "
+                    f"elaboration)")
+            res["ok"] = not res["reasons"]
+        except Exception:                                   # noqa: BLE001
+            pass
+    return res
+
+
+def _ppa_stage(dump: helpers.Dumper, label: str, attempt: int, artifact,
+               run_id: str, pg_opts, vlen: int,
+               diff: Optional[str] = None) -> Dict[str, object]:
+    """Stage P for one attempt: scope check -> P-FP/P-INT/P-ATTR -> cycle
+    suite.  Returns ``{"kind": "scope" | "infra" | "judged", ...}``.
+
+    ``scope``: a violation -- nothing was synthesised; ``infra``: the judge
+    harness failed twice -- not a verdict, excluded from progress; ``judged``:
+    ``clean`` says whether every binding check passed."""
+    pcfg = _PPA
+    out = os.path.join(dump.out_dir, "ppa", f"{label}_attempt{attempt}")
+    rec: Dict[str, object] = {"label": label, "attempt": attempt, "dir": out}
+    sc = _ppa_scope(diff, _PPA_STATE.get("ref_diff"), artifact, pcfg)
+    if sc is not None:
+        rec["scope"] = {k: sc[k] for k in ("ok", "touched", "new_files",
+                                           "model_frozen", "reasons")}
+        if not sc["ok"]:
+            rec.update(kind="scope", clean=False)
+            dump.json(f"{label}_ppa_attempt{attempt}.json", rec)
+            _PPA_LOG.append(rec)
+            _event("ppa_scope_violation", attempt=attempt, label=label,
+                   n=len(sc["reasons"]))
+            keys = sorted({v["path"] for v in sc["violations"]}
+                          | {h["path"] for h in sc["forbidden"]})
+            return {"kind": "scope", "scope": sc, "clean": False,
+                    "message": ppa_scope.format_scope_rejection(
+                        sc, attempt + 1),
+                    "stall_key": "<scope " + "|".join(keys) + ">"}
+    pres = _ppa_check(artifact, out, pcfg, "iter")
+    v = pres.get("verdict") or {}
+    if ppa_judge.is_infra_failure(pres):
+        rec.update(kind="infra", clean=False, reasons=v.get("reasons"))
+        dump.json(f"{label}_ppa_attempt{attempt}.json", rec)
+        _PPA_LOG.append(rec)
+        _event("ppa_iter", attempt=attempt, label=label, infra=True)
+        return {"kind": "infra", "clean": False, "ppa": pres,
+                "feedback": pres.get("feedback") or "", "log_path": None}
+    cyc = (_cycles_check(artifact, os.path.join(out, "cycles"), pcfg, vlen)
+           if (pcfg.get("cycles") or {}).get("enabled", True) else
+           {"pass": True, "rows": [], "reasons": [], "reference_missing": True,
+            "disabled": True})
+    cyc_ok = bool(cyc.get("pass")) and not cyc.get("harness_error")
+    clean = bool(v.get("pass")) and cyc_ok
+    tracker = _PPA_STATE.get("tracker")
+    best = tracker.best if tracker is not None else None
+    feedback = ppa_judge.format_feedback(pres, pcfg, best, report_path=out)
+    cycles_text = (ppa_cycles.format_table(cyc) if cyc.get("rows") else
+                   "\n".join(cyc.get("reasons") or []) + "\n")
+    rec.update(kind="judged", clean=clean, a_fp_um2=v.get("a_fp_um2"),
+               a_int_um2=v.get("a_int_um2"), fp_delay_ps=v.get("fp_delay_ps"),
+               int_delay_ps=v.get("int_delay_ps"),
+               flops=(pres.get("fp") or {}).get("flops"),
+               enable_flops=(pres.get("fp") or {}).get("enable_flops"),
+               leakage_nW=(pres.get("fp") or {}).get("leakage_nW"),
+               ppa_pass=bool(v.get("pass")), cycles_pass=cyc_ok,
+               cycles={r["bench"]: r["cycles"] for r in cyc.get("rows", [])},
+               reasons=(v.get("reasons") or []) + (cyc.get("reasons") or []),
+               wall_s=(((pres.get("fp") or {}).get("synth") or {})
+                       .get("wall_s")))
+    dump.json(f"{label}_ppa_attempt{attempt}.json", rec)
+    _PPA_LOG.append(rec)
+    _event("ppa_iter", attempt=attempt, label=label, clean=clean,
+           ppa_pass=rec["ppa_pass"], cycles_pass=cyc_ok,
+           a_fp_um2=rec["a_fp_um2"] or -1.0, a_int_um2=rec["a_int_um2"] or -1.0)
+    log_path = _publish_logs(
+        run_id, f"iter{attempt}/ppa", pg_opts,
+        extra_files={"feedback.md": feedback + "\n### Cycle suite\n\n"
+                     + cycles_text,
+                     "ppa.json": json.dumps(rec, indent=1, default=str)})
+    return {"kind": "judged", "clean": clean, "ppa": pres, "cycles": cyc,
+            "a_fp": v.get("a_fp_um2"), "feedback": feedback,
+            "cycles_text": cycles_text, "log_path": log_path, "rec": rec}
+
+
+def _ppa_record_best(dump: helpers.Dumper, run_id: str, pg_opts, label: str,
+                     attempt: int, diff: str, artifact,
+                     pres: Dict[str, object]) -> str:
+    """File the new best clean iteration: ``best_rtl.diff`` (RTL half, here
+    and where the agent's bash can read it), its full diff and tree digest for
+    :func:`_ppa_finalize`, and ``ppa_best.json`` for the agent's tool."""
+    best_rtl = _split_diff(diff)[1]
+    dump.text(f"{label}_ppa_best_rtl.diff", best_rtl)
+    with open(os.path.join(dump.out_dir, "best_rtl.diff"), "w",
+              encoding="utf-8") as fh:
+        fh.write(best_rtl)
+    _publish_logs(run_id, ".", pg_opts, extra_files={"best_rtl.diff": best_rtl})
+    _PPA_STATE.update(best_full_diff=diff, best_artifact=artifact,
+                      best_tree_digest=_tree_digest(pg_opts))
+    best = _PPA_STATE["tracker"].best
+    try:
+        with open(_ppa_best_path(dump.out_dir), "w", encoding="utf-8") as fh:
+            json.dump({"attempt": attempt, "a_fp_um2": best["a_fp_um2"]}, fh)
+    except OSError:
+        pass
+    _event("ppa_best", attempt=attempt, label=label,
+           a_fp_um2=best["a_fp_um2"] or -1.0)
+    return os.path.join(AGENT_LOG_DIR, run_id, "best_rtl.diff")
+
+
+def _ppa_finalize(ok: bool, artifact, dump: helpers.Dumper, pg_opts,
+                  run_id: str) -> Tuple[bool, object]:
+    """After the improvement loop: the tree the gate sees must be the best
+    clean one, not whatever the agent ended on.
+
+    No best clean iteration -> the loop's own verdict stands.  The tree already
+    is the best one (same digest) -> its build.  Otherwise: reset the tree,
+    re-apply the best attempt's full diff (model and RTL, exactly as graded)
+    and rebuild -- forward-only, through the nodes a resume already uses."""
+    tracker = _PPA_STATE.get("tracker")
+    best = tracker.best if tracker is not None else None
+    if best is None:
+        return ok, artifact
+    if _tree_digest(pg_opts) == _PPA_STATE.get("best_tree_digest"):
+        _event("ppa_final", attempt=best["attempt"], restored=False)
+        return True, _PPA_STATE.get("best_artifact") or artifact
+    get(nodes.reset_chipyard.options(**pg_opts)
+        .chia_remote(CHIPYARD_PATH, extension=EXTENSION))
+    err = get(nodes.apply_diff.options(**pg_opts)
+              .chia_remote(_PPA_STATE["best_full_diff"], extension=EXTENSION))
+    if err:
+        _event("ppa_restore_failed", attempt=best["attempt"])
+        _PPA_STATE["restore_error"] = err[:400]
+        return False, artifact
+    art = get(nodes.build_saturn.options(**pg_opts)
+              .chia_remote(DIRECTED_CONFIG, extension=EXTENSION))
+    dump.text("ppa_restore_build.stdout.txt", getattr(art, "stdout", "") or "")
+    if not art.success:
+        _event("ppa_restore_failed", attempt=best["attempt"], build=True)
+        _PPA_STATE["restore_error"] = "build of the restored best tree failed"
+        return False, art
+    _PPA_STATE["best_artifact"] = art
+    _event("ppa_final", attempt=best["attempt"], restored=True)
+    return True, art
+
+
+def _ppa_soc_gate(artifact, dump: helpers.Dumper, run_id: str, pg_opts
+                  ) -> Tuple[bool, Optional[str]]:
+    """P-SOC at the Gate.  Returns ``(ok, message)``; a harness failure sets
+    ``_PPA_STATE["soc_infra"]`` (the run stops without a verdict) and
+    returns ``(True, None)``."""
+    soc = _PPA.get("soc") or {}
+    if not soc.get("enabled", True):
+        return True, None
+    _event("section_start", name="ppa_soc")
+    out = os.path.join(dump.out_dir, "ppa", "gate_soc")
+    res = _ppa_check(artifact, out, _PPA, "soc")
+    v = res.get("verdict") or {}
+    dump.json("gate_ppa_soc.json", {k: res.get(k) for k in
+                                    ("meas", "verdict", "flow_stamp")})
+    _PPA_STATE["soc"] = {"pass": bool(v.get("pass")),
+                         "meas": res.get("meas"), "reasons": v.get("reasons")}
+    _event("section_end", name="ppa_soc", passed=bool(v.get("pass")))
+    if ppa_judge.is_infra_failure(res):
+        _PPA_STATE["soc_infra"] = True
+        return True, None
+    if v.get("pass"):
+        return True, None
+    path = _publish_logs(run_id, "gate_ppa_soc", pg_opts,
+                         extra_files={"feedback.md": res.get("feedback") or ""})
+    return False, (
+        "# Gate: the full-SoC PPA check FAILED\n\n"
+        "The directed sweep and the full RVV suite pass, but the whole-SoC "
+        "synthesis shows something outside the two FUs got bigger or slower "
+        "than the starting tree (or an IME module is over its delay cap). "
+        "Nothing outside `exu/fp/MatrixFPMultiplyPipe.scala`, "
+        "`exu/int/MatrixMultiplyPipe.scala` and new files under "
+        "`exu/fp|int/` may change.\n\n" + (res.get("feedback") or "")
+        + f"\nFull report: {path}\n")
+
+
+def _ppa_summary() -> Optional[Dict[str, object]]:
+    """The run-level record: best clean iteration plus the trajectory."""
+    if not _PPA and not _PPA_LOG:
+        return None
+    tracker = _PPA_STATE.get("tracker")
+    best = tracker.best if tracker is not None else None
+    judged = [r for r in _PPA_LOG if r.get("kind") == "judged"]
+    return {"a_target_um2": _PPA.get("a_target_um2"),
+            "a_stretch_um2": _PPA.get("a_stretch_um2"),
+            "attempts": len(_PPA_LOG), "judged": len(judged),
+            "scope_violations": sum(1 for r in _PPA_LOG
+                                    if r.get("kind") == "scope"),
+            "infra_failures": sum(1 for r in _PPA_LOG
+                                  if r.get("kind") == "infra"),
+            "best_attempt": best["attempt"] if best else None,
+            "best_a_fp_um2": best["a_fp_um2"] if best else None,
+            "trajectory_a_fp_um2": [r.get("a_fp_um2") for r in judged],
+            "cost_usd": round(float(_PPA_STATE.get("cost") or 0.0), 2),
+            "soc": _PPA_STATE.get("soc"),
+            "soc_infra": bool(_PPA_STATE.get("soc_infra")),
+            "restore_error": _PPA_STATE.get("restore_error")}
+
+
 #: The cosim simulator the most recent successful ``_run_s2`` built, together
 #: with the digest of the tree it was elaborated from.
 #:
@@ -1506,7 +2004,32 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
              run_tool=None, events_path: Optional[str] = None,
              failing_path: Optional[str] = None,
              rvv_failing_path: Optional[str] = None) -> Tuple[bool, object]:
-    """Edit -> build -> S1 -> S2, until both are green or we run out of turns.
+    """:func:`_iterate_loop`, then (round 12, PPA hunt only) the best-tree
+    guarantee: the improvement loop may end on a worse attempt than its best
+    clean one, and the gate must see the best."""
+    ok, artifact = _iterate_loop(
+        llm, tools_list, dump, status_path, finish_tool, label=label,
+        vlen=vlen, max_iters=max_iters, first_message=first_message,
+        pg_opts=pg_opts, first_note=first_note, run_id=run_id,
+        knowledge_path=knowledge_path, run_tool=run_tool,
+        events_path=events_path, failing_path=failing_path,
+        rvv_failing_path=rvv_failing_path)
+    if _PPA and label == "impl":
+        return _ppa_finalize(ok, artifact, dump, pg_opts, run_id)
+    return ok, artifact
+
+
+def _iterate_loop(llm, tools_list, dump: helpers.Dumper, status_path: str,
+                  finish_tool, *, label: str, vlen: int, max_iters: int,
+                  first_message: Optional[str], pg_opts,
+                  first_note: Optional[str] = None,
+                  run_id: str = "run", knowledge_path: Optional[str] = None,
+                  run_tool=None, events_path: Optional[str] = None,
+                  failing_path: Optional[str] = None,
+                  rvv_failing_path: Optional[str] = None
+                  ) -> Tuple[bool, object]:
+    """Edit -> build -> S1 -> S2 (-> stage T or P), until all are green or we
+    run out of turns.
 
     S2 is inside this loop rather than after it: a directed pass that broke
     plain RVV is not a pass, and re-entering with regression feedback is the
@@ -1522,6 +2045,11 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
     best = {"passed": -1, "attempt": 0}
     regression = ""
     stall = _StallTracker(label)
+    # Round 12: in the PPA hunt ``best_rtl.diff`` is the best *clean* PPA
+    # iteration (smallest A_FP); the functional high-water mark below is kept
+    # under another name so the two never overwrite each other.
+    ppa_hunt = bool(_PPA) and label == "impl"
+    best_name = "best_func_rtl.diff" if ppa_hunt else "best_rtl.diff"
     for attempt in range(1, max_iters + 1):
         _event("section_start", name=f"{label}:iter{attempt}")
         # No guard on `message`: the implement stage enters with none, and a
@@ -1547,15 +2075,18 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
                 _orient(attempt, max_iters, run_id, label,
                         knowledge_path, first_note or "", pg_opts,
                         regression),
-                standing=_timing_standing(_TIMING))
+                standing=_standing())
         else:
             cli = llm_mod.debug(
                 llm, tools_list,
                 _orient(attempt, max_iters, run_id, label,
                         knowledge_path, message or "", pg_opts,
                         regression),
-                standing=_timing_standing(_TIMING))
+                standing=_standing())
         helpers.dump_llm(dump, f"{label}_llm_attempt{attempt}", cli)
+        if _PPA:
+            _PPA_STATE["cost"] = float(_PPA_STATE.get("cost") or 0.0) \
+                + _cli_cost(cli)
 
         # The turn is over, but a run_directed job it started may not be.
         # In `-p` mode the session ends the moment the model stops calling
@@ -1583,6 +2114,8 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
                 continue
             _event("agent_rvv" if job.get("kind") == "rvv"
                    else "agent_timing" if job.get("kind") == "timing"
+                   else "agent_ppa" if job.get("kind") == "ppa"
+                   else "agent_cycles" if job.get("kind") == "cycles"
                    else "agent_directed",
                    attempt=attempt, seq=job.get("seq"),
                    tests=job.get("tests"), orphaned=True,
@@ -1653,16 +2186,16 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
         if passed > best["passed"]:
             best.update(passed=passed, attempt=attempt)
             best_rtl = _split_diff(diff)[1]
-            dump.text(f"{label}_best_rtl.diff", best_rtl)
-            with open(os.path.join(dump.out_dir, "best_rtl.diff"), "w",
+            dump.text(f"{label}_{best_name}", best_rtl)
+            with open(os.path.join(dump.out_dir, best_name), "w",
                       encoding="utf-8") as fh:
                 fh.write(best_rtl)
             _publish_logs(run_id, ".", pg_opts,
-                          extra_files={"best_rtl.diff": best_rtl})
+                          extra_files={best_name: best_rtl})
             _event("best_result", attempt=attempt, passed=passed, total=total)
             regression = ""
         elif passed <= best["passed"] - REGRESSION_ALERT_DELTA:
-            best_path = os.path.join(AGENT_LOG_DIR, run_id, "best_rtl.diff")
+            best_path = os.path.join(AGENT_LOG_DIR, run_id, best_name)
             _event("regression", attempt=attempt, passed=passed, total=total,
                    best=best["passed"], best_attempt=best["attempt"],
                    delta=best["passed"] - passed)
@@ -1735,7 +2268,77 @@ def _iterate(llm, tools_list, dump: helpers.Dumper, status_path: str,
                     log_path=tres.get("log_path"))
                 continue
 
+        # Stage P (round 12, only when a ppa config is given): scope check ->
+        # P-FP / P-INT / P-ATTR -> cycle suite, on this very build.  After
+        # S1/S2 for the same reason stage T is: functional failures first, the
+        # ~5 min synthesis only for designs worth measuring.
+        if _PPA:
+            pres = _ppa_stage(dump, label, attempt, artifact, run_id,
+                              pg_opts, vlen, diff=diff)
+            if pres["kind"] == "scope":
+                # a scope violation is not a verdict: nothing was measured
+                stalled = stall.observe(attempt, summary["counts"],
+                                        summary["failing"],
+                                        [pres["stall_key"]])
+                if stalled:
+                    _stall(stalled)
+                    return False, artifact
+                message = pres["message"]
+                continue
+            if pres["kind"] == "infra":
+                # harness failed twice: not a verdict, not progress
+                message = helpers.format_ppa_harness_failure(
+                    attempt + 1, pres.get("feedback") or "",
+                    log_path=pres.get("log_path"))
+                continue
+            if not ppa_hunt:
+                # gate debug re-entry: a clean tree is all that is asked
+                if pres["clean"]:
+                    return True, artifact
+                stalled = stall.observe(attempt, summary["counts"],
+                                        summary["failing"], [_ppa_key(pres)])
+                if stalled:
+                    _stall(stalled)
+                    return False, artifact
+                message = helpers.format_ppa_failure(
+                    attempt + 1, pres["feedback"], pres["cycles_text"],
+                    log_path=pres.get("log_path"))
+                continue
+            tracker = _PPA_STATE["tracker"]
+            obs = tracker.observe(attempt, pres["a_fp"], pres["clean"])
+            best_path = ""
+            if obs["new_best"]:
+                best_path = _ppa_record_best(dump, run_id, pg_opts, label,
+                                             attempt, diff, artifact, pres)
+            if pres["clean"] and obs["stretch"]:
+                _event("ppa_stop", reason="stretch", attempt=attempt)
+                return True, artifact
+            cap = float(_PPA.get("cost_cap_usd") or 0)
+            over_cost = bool(cap and float(_PPA_STATE.get("cost") or 0) >= cap)
+            if obs["stop_no_progress"] or over_cost:
+                reason = "cost_cap" if over_cost else "no_progress"
+                _event("ppa_stop", reason=reason, attempt=attempt,
+                       streak=obs["streak"])
+                _PPA_STATE["stop_reason"] = reason
+                print(f"[ppa] stopping: {reason} (attempt {attempt}, "
+                      f"best={tracker.best and tracker.best['attempt']})",
+                      flush=True)
+                return tracker.best is not None, artifact
+            note = helpers.format_ppa_best_note(
+                tracker.best, best_path or os.path.join(
+                    AGENT_LOG_DIR, run_id, "best_rtl.diff"))
+            fmt = helpers.format_ppa_clean if pres["clean"] \
+                else helpers.format_ppa_failure
+            message = fmt(attempt + 1, pres["feedback"], pres["cycles_text"],
+                          log_path=pres.get("log_path"), best_note=note)
+            continue
+
         return True, artifact
+    # out of iterations: in the PPA hunt a best clean iteration, if there is
+    # one, is a result (the wrapper restores it)
+    if ppa_hunt:
+        _PPA_STATE.setdefault("stop_reason", "max_iters")
+        return _PPA_STATE["tracker"].best is not None, artifact
     return False, artifact
 
 
@@ -1943,6 +2546,20 @@ def _gate(artifact, dump: helpers.Dumper, status_path: str, vlen: int,
     if pg_opts is None:
         return True, None
     return _gate_regression(dump, pg_opts, run_id, rvv_failing_path)
+
+
+def _gate_ppa(artifact, dump: helpers.Dumper, status_path: str, vlen: int,
+              pg_opts=None, run_id: str = "run",
+              rvv_failing_path: Optional[str] = None
+              ) -> Tuple[bool, Optional[str]]:
+    """:func:`_gate`, then (round 12) P-SOC: the full-SoC synthesis, only once
+    the directed sweep and the whole RVV suite are clean -- it is ~13 min and
+    17 GB.  Without stage P this is exactly ``_gate``."""
+    ok, msg = _gate(artifact, dump, status_path, vlen, pg_opts=pg_opts,
+                    run_id=run_id, rvv_failing_path=rvv_failing_path)
+    if ok and _PPA and pg_opts is not None:
+        return _ppa_soc_gate(artifact, dump, run_id, pg_opts)
+    return ok, msg
 
 
 # ---------------------------------------------------------------------------
@@ -2233,6 +2850,15 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
         raise RuntimeError(f"--rtl-diff {diff_path}: git apply failed:\n{err}")
     _event("rtl_resume", source=diff_path, digest=digest,
            files=len(_diff_files(rtl)))
+    if _PPA:
+        # The scope check's reference: the tree exactly as seeded (model +
+        # RTL), as collect_diff prints it -- not the diff file, whose text
+        # could differ in ways that are not edits.  The agent's tool reads it
+        # from the run directory (a different process).
+        ref = get(nodes.collect_diff.options(**pg_opts)
+                  .chia_remote(CHIPYARD_PATH, extension=EXTENSION)) or ""
+        _PPA_STATE["ref_diff"] = ref
+        dump.text("ppa_ref.diff", ref)
 
     # Attempt 0: the same build-and-judge every S1 iteration does, so the
     # feedback the agent opens on is real rather than remembered.
@@ -2278,12 +2904,15 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
         # would gain from it.
         body = helpers.format_directed_failure(1, outcomes, logs,
                                                log_path=path)
-        scope = (helpers.format_rtl_timing_scope(done, failing=True)
+        scope = (helpers.format_rtl_ppa_scope(done, failing=True) if _PPA
+                 else helpers.format_rtl_timing_scope(done, failing=True)
                  if _TIMING else
                  helpers.format_rtl_seed_scope(done, new, failing=True))
         return scope + "\n" + head + body, digest, None
 
-    head = (helpers.format_rtl_timing_scope(done, failing=False) if _TIMING
+    head = (helpers.format_rtl_ppa_scope(done, failing=False) if _PPA
+            else helpers.format_rtl_timing_scope(done, failing=False)
+            if _TIMING
             else helpers.format_rtl_seed_scope(done, new, failing=False)
             ) + "\n" + head
     body = (f"every directed test passed or skipped: {summary['counts']}. "
@@ -2313,6 +2942,25 @@ def _rtl_resume(dump: helpers.Dumper, status_path: str, vlen: int,
         body += ("\nTheir timing-judge result was:\n\n"
                  + (tres.get("feedback") or ""))
         if not (tres.get("verdict") or {}).get("pass"):
+            clean = None
+    if clean is not None and _PPA:
+        # Round 12: the seeded tree must also meet the PPA targets to take
+        # the fast path to the gate.  r35 is expected NOT to (area): the
+        # report -- with the cycle table, which also records the r35 cycle
+        # numbers -- is then the first turn's evidence, and the measured
+        # area is the progress baseline.
+        pres = _ppa_stage(dump, "impl_resume", 0, artifact, run_id, pg_opts,
+                          vlen, diff=None)
+        _event("rtl_resume_ppa", attempt=0, kind=pres["kind"],
+               clean=bool(pres.get("clean")))
+        if pres["kind"] == "judged":
+            _PPA_STATE["tracker"].observe(0, pres["a_fp"], pres["clean"])
+            body += ("\nTheir PPA-judge result was:\n\n" + pres["feedback"]
+                     + "\n### Cycle suite\n\n" + pres["cycles_text"])
+        else:
+            body += ("\nTheir PPA-judge result was:\n\n"
+                     + (pres.get("feedback") or "(harness failure)"))
+        if not pres.get("clean"):
             clean = None
     return head + body, digest, clean
 
@@ -2426,13 +3074,24 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
         model_seed: Optional[str] = None,
         rtl_diff: Optional[str] = None,
         rtl_diff_note: Optional[str] = None,
-        timing_target_ns: float = TIMING_TARGET_NS) -> Dict[str, object]:
+        timing_target_ns: float = TIMING_TARGET_NS,
+        ppa_config: str = PPA_CONFIG_PATH) -> Dict[str, object]:
     out_dir = os.path.join(TITAN_LOG_ROOT, run_id)
     # Round 11.  Empty (off) unless a target was given; set before _tools()
     # so the agent's tool actor is built with -- or without -- run_timing.
     _TIMING.clear()
     _TIMING.update(_timing_config(timing_target_ns))
     _TIMING_LOG.clear()
+    # Round 12.  Stage P replaces stage T; empty (off) unless a config is
+    # given.  Needs --rtl-diff: the scope check compares against the seeded
+    # tree, and "fast path" semantics assume a resumed r35.
+    _ppa_reset(ppa_judge.load_config(ppa_config) if ppa_config else None)
+    if _PPA and _TIMING:
+        raise ValueError("--ppa-config and --timing-target are mutually "
+                         "exclusive: stage P replaces stage T")
+    if _PPA and not rtl_diff:
+        raise ValueError("--ppa-config needs --rtl-diff (the scope check is "
+                         "relative to the seeded tree)")
     dump = helpers.Dumper(out_dir)
     work_root = os.path.join(out_dir, "work")
     os.makedirs(work_root, exist_ok=True)
@@ -2487,7 +3146,7 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
                    "failing_path": failing_path,
                    "rvv_failing_path": rvv_failing_path,
                    "stock_spike": stock_spike,
-                   "timing": dict(_TIMING)}
+                   "timing": dict(_TIMING), "ppa": dict(_PPA)}
             run_tool = titan_tools.RunDirectedTool(
                 f"titan_run_{tag}_{run_id}",
                 functools.partial(agent_run_directed, cfg),
@@ -2496,7 +3155,14 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
                 rvv_runner=functools.partial(agent_run_rvv, cfg),
                 task_options=head_local,
                 timing_runner=(functools.partial(agent_run_timing, cfg)
-                               if _TIMING else None))
+                               if _TIMING else None),
+                ppa_runner=(functools.partial(agent_run_ppa, cfg)
+                            if _PPA else None),
+                cycles_runner=(functools.partial(agent_run_cycles, cfg)
+                               if _PPA else None),
+                max_ppa_runs=int(_PPA.get("runs_per_turn")
+                                 or PPA_RUNS_PER_ITER),
+                max_cycle_runs=PPA_CYCLE_RUNS_PER_ITER)
             tools_list.insert(4, run_tool)
         return (tools_list, status_path, finish, knowledge_path, run_tool,
                 events_path, failing_path, rvv_failing_path)
@@ -2505,6 +3171,8 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
                                  "converged": False}
     if _TIMING:
         result["timing_target_ns"] = _TIMING["target_ns"]
+    if _PPA:
+        result["ppa_target_um2"] = _PPA["a_target_um2"]
     all_tools: List[object] = []
     _STALLED.clear()
     try:
@@ -2606,7 +3274,10 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
             ok, artifact = True, resume_clean
         else:
             ok, artifact = _iterate(llm, rtl_tools, dump, status_path, finish,
-                                    label="impl", vlen=vlen, max_iters=MAX_ITERS,
+                                    label="impl", vlen=vlen,
+                                    max_iters=(min(MAX_ITERS,
+                                                   int(_PPA["max_iters"]))
+                                               if _PPA else MAX_ITERS),
                                     first_message=None, pg_opts=pg_opts,
                                     first_note=first_note, run_id=run_id,
                                     knowledge_path=knowledge_path,
@@ -2618,11 +3289,14 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
         if not ok:
             return result
 
-        gate_ok, gate_message = _gate(artifact, dump, status_path, vlen,
-                                      pg_opts=pg_opts, run_id=run_id,
-                                      rvv_failing_path=rvv_failing_path)
+        gate_ok, gate_message = _gate_ppa(artifact, dump, status_path, vlen,
+                                          pg_opts=pg_opts, run_id=run_id,
+                                          rvv_failing_path=rvv_failing_path)
         result["gate"] = gate_ok
         result["regression_confirm"] = _confirm_summary()
+        if _PPA_STATE.get("soc_infra"):
+            result["ppa_soc_harness_failure"] = True
+            return result
         gate_rounds = 0
         while not gate_ok:
             # Two ways to get here.  Without a message: the cheap tier passed
@@ -2668,11 +3342,14 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
             # ``_LAST_COSIM`` when the tree has not moved since, and emits its
             # ``gate_regression`` event on every pass, so each re-check shows
             # up in the trace.
-            gate_ok, gate_message = _gate(artifact, dump, status_path, vlen,
-                                          pg_opts=pg_opts, run_id=run_id,
-                                          rvv_failing_path=rvv_failing_path)
+            gate_ok, gate_message = _gate_ppa(
+                artifact, dump, status_path, vlen, pg_opts=pg_opts,
+                run_id=run_id, rvv_failing_path=rvv_failing_path)
             result["gate"] = gate_ok
             result["regression_confirm"] = _confirm_summary()
+            if _PPA_STATE.get("soc_infra"):
+                result["ppa_soc_harness_failure"] = True
+                return result
 
         if stress:
             if spike_artifact is None:
@@ -2713,6 +3390,9 @@ def run(run_id: str, vlen: int = VLEN, stress: bool = True,
         tsum = _timing_summary()
         if tsum is not None:
             result["timing"] = tsum
+        psum = _ppa_summary()
+        if psum is not None:
+            result["ppa"] = psum
         _event("run_end", **{k: v for k, v in result.items()
                              if isinstance(v, (int, float, str, bool))})
         for tool in all_tools:
@@ -2804,6 +3484,7 @@ def _render_summary(run_id: str, result: Dict[str, object]) -> str:
     lines = [f"# Titan run {run_id}", ""]
     for key in ("vlen", "model", "model_digest", "rtl_source", "rtl_digest",
                 "s1_s2", "regression_confirm", "timing_target_ns", "timing",
+                "ppa_target_um2", "ppa", "ppa_soc_harness_failure",
                 "gate", "gate_failure",
                 "stress_done",
                 "stress_failure", "stalled",
@@ -2856,6 +3537,16 @@ def main() -> int:
                              "TITAN_TIMING_TOP (default from "
                              "TITAN_TIMING_TARGET_NS; 0 = off, the round-10 "
                              "loop unchanged).")
+    parser.add_argument("--ppa-config", metavar="JSON", default=PPA_CONFIG_PATH,
+                        help="round 12: enable the PPA judge (stage P after "
+                             "S1/S2 every attempt: scope check, FP/INT "
+                             "synthesis, cycle suite; P-SOC at the gate; the "
+                             "run_ppa / run_cycles tools; the PPA prompt "
+                             "section) with the targets in this JSON "
+                             "(ppa_judge.DEFAULT_CONFIG; default from "
+                             "TITAN_PPA_CONFIG). Replaces stage T: not "
+                             "combinable with --timing-target; requires "
+                             "--rtl-diff.")
     args = parser.parse_args()
 
     ray.init(address="auto", runtime_env=RUNTIME_ENV)
@@ -2865,7 +3556,8 @@ def main() -> int:
                  model_diff=args.model_diff, model_seed=args.model_seed,
                  rtl_diff=args.rtl_diff,
                  rtl_diff_note=args.rtl_diff_note,
-                 timing_target_ns=args.timing_target)
+                 timing_target_ns=args.timing_target,
+                 ppa_config=args.ppa_config)
     print(f"converged={result['converged']}  {result}")
     return 0 if result["converged"] else 1
 

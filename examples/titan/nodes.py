@@ -404,3 +404,35 @@ def timing_judge(files, out_dir: str, top: str, target_ns: float,
     finally:
         shutil.rmtree(rtl_dir, ignore_errors=True)
     return res
+
+
+# --- round 12: PPA judge (head, not a container) ---------------------------
+
+@ChiaFunction(resources={"head_local": 1}, num_cpus=1)
+def ppa_judge(files, out_dir: str, cfg: dict, mode: str = "iter",
+              extension: str = "") -> dict:
+    """Stage P: standalone synthesis of the IME FUs (``mode="iter"``: P-FP,
+    P-INT, P-ATTR) or of the whole SoC (``mode="soc"``, Gate only).
+
+    ``files`` are ``(filename, contents)`` pairs cut from the loop's own
+    ``BuildArtifact.generated_src_files`` by the driver -- the union of the
+    two FUs' module closures for ``iter``, every generated file for ``soc``
+    -- so this judges exactly the Verilog the directed programs ran on.  Same
+    placement and isolation as :func:`timing_judge` (head, one CPU, nice 19,
+    everything under ``out_dir`` on /share1; the RTL copy and sv2v output are
+    removed afterwards).  ``cfg`` is the loaded ppa config dict.
+    """
+    import shutil
+    import ppa_judge as pj
+    if extension: get_profiler().add_info({"extension": extension})
+    rtl_dir = os.path.join(out_dir, "rtl")
+    os.makedirs(rtl_dir, exist_ok=True)
+    for fn, txt in files:
+        with open(os.path.join(rtl_dir, os.path.basename(fn)), "w") as fh:
+            fh.write(txt)
+    try:
+        if mode == "soc":
+            return pj.judge_soc(rtl_dir, out_dir, cfg)
+        return pj.judge_iter(rtl_dir, out_dir, cfg)
+    finally:
+        shutil.rmtree(rtl_dir, ignore_errors=True)

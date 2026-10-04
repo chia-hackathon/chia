@@ -337,3 +337,32 @@ def timing_prompt(target_ns: float, top: str, area_rule: str,
     return _load_prompt("timing.md", TIMING_TARGET_NS=f"{target_ns:g}",
                         TIMING_TOP=top, SATURN_SRC_PATH=SATURN_SRC_PATH,
                         TIMING_AREA_RULE=area_rule, TIMING_RUNS=str(runs))
+
+
+def ppa_prompt(cfg: dict, runs: int, cycle_runs: int) -> str:
+    """Round twelve's standing section (prompts/ppa.md), rendered from the
+    loaded ppa config (``ppa_judge.load_config``)."""
+    r35i = cfg.get("r35_int_area_um2")
+    if r35i:
+        int_rule = (f"`{cfg['int_top']}` flat area <= "
+                    f"{float(r35i) * float(cfg['int_area_max_ratio']):,.0f} um2 "
+                    f"({float(cfg['int_area_max_ratio']):.2f} x the starting "
+                    f"tree's {float(r35i):,.0f})")
+    else:
+        int_rule = (f"`{cfg['int_top']}` flat area is reported; this run "
+                    f"sets no cap on it (do not let it grow needlessly)")
+    sigma = cfg.get("noise_area_sigma_um2")
+    noise = (f"{float(cfg['noise_area_frac']):.1%} of the area"
+             + (f", or twice the measured sigma of {float(sigma):,.0f} um2 "
+                f"if larger" if sigma else ""))
+    return _load_prompt(
+        "ppa.md", PPA_TOP_FP=str(cfg["fp_top"]), PPA_TOP_INT=str(cfg["int_top"]),
+        SATURN_SRC_PATH=SATURN_SRC_PATH,
+        PPA_R35_FP_AREA=f"{float(cfg['r35_fp_area_um2']):,.0f}",
+        PPA_A_TARGET=f"{float(cfg['a_target_um2']):,.0f}",
+        PPA_A_STRETCH=f"{float(cfg['a_stretch_um2']):,.0f}",
+        PPA_FP_DELAY=f"{float(cfg['fp_delay_max_ns']):g}",
+        PPA_INT_DELAY=f"{float(cfg['int_delay_max_ns']):g}",
+        PPA_INT_AREA_RULE=int_rule, PPA_NOISE_NOTE=noise,
+        PPA_NO_PROGRESS=str(int(cfg["no_progress_stop"])),
+        PPA_RUNS=str(runs), PPA_CYCLE_RUNS=str(cycle_runs))
