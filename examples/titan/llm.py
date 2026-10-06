@@ -363,6 +363,7 @@ def ppa_prompt(cfg: dict, runs: int, cycle_runs: int) -> str:
         PPA_A_STRETCH=f"{float(cfg['a_stretch_um2']):,.0f}",
         PPA_FP_DELAY=f"{float(cfg['fp_delay_max_ns']):g}",
         PPA_INT_DELAY=f"{float(cfg['int_delay_max_ns']):g}",
+        PPA_INT_STRETCH=f"{float(cfg.get('int_delay_stretch_ns') or 27.0):g}",
         PPA_INT_AREA_RULE=int_rule, PPA_NOISE_NOTE=noise,
         PPA_NO_PROGRESS=str(int(cfg["no_progress_stop"])),
         PPA_RUNS=str(runs), PPA_CYCLE_RUNS=str(cycle_runs))

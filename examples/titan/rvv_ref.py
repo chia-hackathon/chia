@@ -6354,9 +6354,10 @@ def _ieee_round(v, fmt: FpFormat, rounder=None) -> int:
     return (rounder or (lambda x, f: fpf_round(x, f, FP_FRM)))(val, fmt)
 
 
-def _ieee_add(x, y):
+def _ieee_add(x, y, frm=0):
     """Exact internal sum of two internal values (spec 1843-1849), with the
-    IEEE 754 6.3 zero-sign rule under RNE: x + (-x) = +0, (-0) + (-0) = -0."""
+    IEEE 754 6.3 zero-sign rule: x + (-x) = +0 (-0 under frm = RDN),
+    (-0) + (-0) = -0, (+0) + (-0) = +0 (-0 under RDN)."""
     if x[0] == "nan" or y[0] == "nan":
         return ("nan",)
     if x[0] == "inf" and y[0] == "inf":
@@ -6368,7 +6369,9 @@ def _ieee_add(x, y):
     tot = (-x[2] if x[1] else x[2]) + (-y[2] if y[1] else y[2])
     if tot == 0:
         both_neg = x[1] and y[1] and x[2] == 0 and y[2] == 0
-        return ("num", 1 if both_neg else 0, Fraction(0))
+        both_pos = (not x[1]) and (not y[1])
+        neg = both_neg or (frm == 2 and not both_pos)
+        return ("num", 1 if neg else 0, Fraction(0))
     return ("num", 1 if tot < 0 else 0, abs(tot))
 
 
@@ -6745,16 +6748,18 @@ def _r10_mul(x, y):
     return ("num", x[1] ^ y[1], x[2] * y[2])
 
 
-def _r10_scale(byte: int, fmt_c: FpFormat, bad=frozenset()) -> int:
+def _r10_scale(byte: int, fmt_c: FpFormat, bad=frozenset(), frm: int = 0
+               ) -> int:
     if byte == MX_E8M0_NAN and "e8m0_nan" not in bad:
         return fpf_default_nan(fmt_c)
     bias = MX_E8M0_BIAS - 1 if "scale_bias" in bad else MX_E8M0_BIAS
-    return _ieee_round(("num", 0, _pow2(byte - bias)), fmt_c)
+    return _ieee_round(("num", 0, _pow2(byte - bias)), fmt_c,
+                       rounder=_frm_rounder(frm))
 
 
 def mxf_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
                        fmt_c: FpFormat, scales_a=None, scales_b=None,
-                       bs: int = 0, *, bad=frozenset()):
+                       bs: int = 0, *, bad=frozenset(), frm: int = 0):
     """Round ten's authority: Sail fp_scaled_gemm (5277-5370) -- or, with
     ``scales_a is None``, Sail fp_gemm (5232-5268) -- at FP_DISCLOSURE.
 
@@ -6781,7 +6786,11 @@ def mxf_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
         blocks = mx_block_count(k_eff, block_size)
     else:
         block_size, blocks = k_eff, 1
-    rnd = lambda v: _ieee_round(v, fmt_c)
+    if frm and fmt_c.name not in FP_FORMATS_BY_NAME:
+        raise OCPSpecUnavailable(
+            f"frm={frm} is only modelled for IEEE accumulators "
+            f"(OFP8_DISCLOSURE frm = rne-only); fmt_C is {fmt_c.name}")
+    rnd = lambda v: _ieee_round(v, fmt_c, rounder=_frm_rounder(frm))
     out = [[c[i][j] for j in range(geom.n_max)] for i in range(geom.m)]
     for j in range(geom.n):
         for i in range(geom.m):
@@ -6800,8 +6809,8 @@ def mxf_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
                             break
                         blk = ("num", 0, _pow2(ba + bb - 2 * MX_E8M0_BIAS))
                     else:
-                        sa = _r10_scale(ba, fmt_c, bad)
-                        sb = _r10_scale(bb, fmt_c, bad)
+                        sa = _r10_scale(ba, fmt_c, bad, frm)
+                        sb = _r10_scale(bb, fmt_c, bad, frm)
                         blk_bits = rnd(_r10_mul(_ieee_val(sa, fmt_c),
                                                 _ieee_val(sb, fmt_c)))
                         if fpf_is_nan(blk_bits, fmt_c):
@@ -6834,10 +6843,10 @@ def mxf_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
                             if "per_op" in bad:
                                 p = _ieee_val(rnd(p), fmt_c)
                                 s_int = p if s_int is None else _ieee_val(
-                                    rnd(_ieee_add(s_int, p)), fmt_c)
+                                    rnd(_ieee_add(s_int, p, frm)), fmt_c)
                             else:
                                 s_int = (p if s_int is None
-                                         else _ieee_add(s_int, p))
+                                         else _ieee_add(s_int, p, frm))
                         if "rnd_xct" in bad:
                             s_val = s_int                   # rnd=xct
                         else:
@@ -6848,7 +6857,7 @@ def mxf_reference_gemm(geom, a, b, c, fmt_a: FpFormat, fmt_b: FpFormat,
                                 s_val = prod           # exact scaling
                             else:
                                 s_val = _ieee_val(rnd(prod), fmt_c)
-                        acc = rnd(_ieee_add(_ieee_val(acc, fmt_c), s_val))
+                        acc = rnd(_ieee_add(_ieee_val(acc, fmt_c), s_val, frm))
             out[i][j] = fpf_default_nan(fmt_c) if nan_out else acc
     return out
 
@@ -7219,6 +7228,484 @@ def _r10_perop_witness(names, w):
                 return ((bx, by_val[q]) + (0,) * (w - 2),
                         (by, one_b | sb_b) + (0,) * (w - 2))
     return None
+
+
+# --- non-RNE rounding (round twelve J2) ----------------------------------------
+#
+# Until round twelve every IME program ran at frm = RNE (rvv_ref.fpf_round
+# raises for anything else), so nothing at all observed the directed modes the
+# disclosure promises (rnd = frm): an RTL that rounds a shared rounder with
+# RNE, or treats a block scale as an exact power of two, passed everything.
+# The functions below are written from IEEE 754 4.3 / Sail fp_round_to_frm,
+# not from the RTL.  Modes: 0 RNE, 1 RTZ, 2 RDN, 3 RUP, 4 RMM (frm encoding).
+
+FRM_NAMES = {0: "rne", 1: "rtz", 2: "rdn", 3: "rup", 4: "rmm"}
+
+
+def fpf_round_frm(value: "Fraction", fmt: FpFormat, frm: int) -> int:
+    """Round the exact *value* into the IEEE-shaped *fmt* under rounding mode
+    *frm* (0 RNE, 1 RTZ, 2 RDN, 3 RUP, 4 RMM).  A signed zero input is the
+    caller's business (it never reaches here); a nonzero value that rounds to
+    zero keeps its sign."""
+    if fmt.name not in FP_FORMATS_BY_NAME:
+        raise OCPSpecUnavailable(f"frm rounding is modelled for IEEE "
+                                 f"formats only, not {fmt.name}")
+    if frm not in FRM_NAMES:
+        raise ValueError(f"frm={frm} is not a rounding mode")
+    ebits, prec, bias = fmt.ebits, fmt.prec, fmt.bias
+    all_ones = (1 << ebits) - 1
+    neg = value < 0
+    mag = -value if neg else value
+    sbit = (1 if neg else 0) << (fmt.width - 1)
+    if mag == 0:
+        return sbit
+    e = max(_floor_log2(mag), 1 - bias)
+    scaled = mag / _pow2(e - (prec - 1))
+    q, r = divmod(scaled.numerator, scaled.denominator)
+    den = scaled.denominator
+    inexact = r != 0
+    if frm == 0:
+        up = 2 * r > den or (2 * r == den and (q & 1) == 1)
+    elif frm == 1:
+        up = False
+    elif frm == 2:
+        up = neg and inexact
+    elif frm == 3:
+        up = (not neg) and inexact
+    else:                                              # RMM
+        up = 2 * r >= den
+    if up:
+        q += 1
+    if q >> prec:
+        q >>= 1
+        e += 1
+    biased = 0 if q >> (prec - 1) == 0 else e + bias
+    if biased >= all_ones:                             # overflow
+        to_max = (frm == 1 or (frm == 2 and not neg) or (frm == 3 and neg))
+        if to_max:
+            return sbit | ((all_ones - 1) << (prec - 1)) | ((1 << (prec - 1)) - 1)
+        return sbit | (all_ones << (prec - 1))
+    return sbit | (biased << (prec - 1)) | (q & ((1 << (prec - 1)) - 1))
+
+
+def _frm_rounder(frm: int):
+    """``rounder`` argument of :func:`_ieee_round` for *frm* (None = RNE)."""
+    if not frm:
+        return None
+    return lambda value, fmt: fpf_round_frm(value, fmt, frm)
+
+
+def fpf_round_frm_selftest() -> None:
+    """frm = RNE agrees with fpf_round; the directed modes on hand-picked
+    values of binary16 (1 + 2^-11 is the RNE tie below 1 + 2^-10)."""
+    import random as _r
+    rng = _r.Random(12)
+    for fmt in (fp_format("binary16"), fp_format("bfloat16"),
+                fp_format("binary32"), fp_format("binary64")):
+        for _ in range(400):
+            v = Fraction(rng.getrandbits(70) + 1, 1 << rng.randrange(0, 90))
+            v *= _pow2(rng.randrange(-40, 40))
+            if rng.random() < 0.5:
+                v = -v
+            if rng.random() < 0.15:
+                v *= _pow2(rng.randrange(-200, 200))
+            assert fpf_round_frm(v, fmt, 0) == fpf_round(v, fmt, 0), (fmt.name, v)
+    h = fp_format("binary16")
+    one = 0x3C00
+    tie = Fraction(1) + Fraction(1, 1 << 11)
+    assert fpf_round_frm(tie, h, 0) == one
+    assert fpf_round_frm(tie, h, 1) == one
+    assert fpf_round_frm(tie, h, 2) == one
+    assert fpf_round_frm(tie, h, 3) == one + 1
+    assert fpf_round_frm(tie, h, 4) == one + 1
+    assert fpf_round_frm(-tie, h, 2) == (one + 1) | 0x8000
+    assert fpf_round_frm(-tie, h, 3) == one | 0x8000
+    big = Fraction(1 << 20)
+    assert fpf_round_frm(big, h, 0) == 0x7C00
+    assert fpf_round_frm(big, h, 1) == 0x7BFF
+    assert fpf_round_frm(big, h, 2) == 0x7BFF
+    assert fpf_round_frm(big, h, 3) == 0x7C00
+    assert fpf_round_frm(-big, h, 2) == 0xFC00
+    assert fpf_round_frm(-big, h, 3) == 0xFBFF
+    tiny = Fraction(1, 1 << 30)
+    assert fpf_round_frm(tiny, h, 0) == 0
+    assert fpf_round_frm(tiny, h, 3) == 1
+    assert fpf_round_frm(-tiny, h, 2) == 0x8001
+    assert fpf_round_frm(-tiny, h, 3) == 0x8000
+
+
+def mxf_frm_pool(fmt_c: FpFormat):
+    """Scale exponents (unbiased) that put block scales and scaled products
+    at the edges of fmt_C's range: (big, mid, small) pools.  A pair of big
+    scales overflows fmt_C (RTZ / RDN: largest finite, RNE / RUP / RMM: Inf);
+    big x mid is finite but pushes blk x S_r over the top; a pair of small
+    scales underflows into / below the subnormals (RUP: smallest subnormal).
+    Exponents are clamped to the E8M0 range [-127, 127]."""
+    bias = fmt_c.bias
+    emin = 1 - bias
+    cl = lambda x: max(-127, min(127, x))
+    big = [cl(bias), cl(bias - 1), cl(bias // 2 + 2), cl(bias // 2 + 1)]
+    mid = [-3, -1, 0, 1, 3]
+    small = [cl(emin // 2 - 1), cl(emin // 2 - 3), cl((emin - fmt_c.prec) // 2),
+             cl((emin - fmt_c.prec) // 2 - 1)]
+    return big, mid, small
+
+
+def mxf_frm_case(geom: "TileGeometry", row, bs: int, rng: random.Random):
+    """A random-operand MXFP case whose scales sit at the range edges of
+    fmt_C (mxf_frm_pool): block rows cycle big / mid / small, columns
+    mid / small / big, so every (row, column) pair class occurs on a tile."""
+    a, b, c = fpw_case(geom, row, rng)
+    big, mid, small = mxf_frm_pool(row[2])
+
+    def pick(side, m, s):
+        pools = (big, mid, small) if side == "a" else (mid, small, big)
+        pool = pools[(m + s) % 3]
+        return MX_E8M0_BIAS + rng.choice(pool)
+    sa, sb = mxf_scale_arrays(geom, bs, pick)
+    return a, b, c, sa, sb
+
+
+# --- round twelve J2b: non-RNE coverage of the MXINT conversion and of the
+# unscaled widening FP path ---------------------------------------------------
+#
+# J2 covered the MXFP programs and vfmmacc.vv at the directed rounding modes.
+# Two paths still saw frm = RNE only:
+#   * MXINT (vfwimmacc / vfqimmacc / vf8wimmacc, vm = 0): Sail int_scaled_gemm
+#     converts every block's exact integer dot with int_to_fp (rounded under
+#     frm into fmt_C -- only binary16 / bfloat16 can be inexact for Int8 / Int4
+#     inputs, but their conversion also overflows), then the same
+#     blk_scale * x and C + y roundings as MXFP;
+#   * the unscaled widening forms (vfwmmacc / vfqmmacc / vf8wmmacc, vm = 1):
+#     Sail fp_gemm, S = exact sum of the W products, S_r = round_frm(S),
+#     C <- round_frm(C + S_r) (G = 1, psm = 0, rnd = frm).
+# An OFP8 accumulator is RNE-only (OFP8_DISCLOSURE["frm"]) and is excluded by
+# construction: every function here raises for a non-IEEE fmt_C.
+
+
+def mxi_frm_reference_gemm(a, b, c, scales_a, scales_b, geom, *, bs: int = 0,
+                           altfmt: int = 0, frm: int = 0):
+    """Sail ``int_scaled_gemm`` (5373-5410) at rounding mode *frm*.
+
+    Same loop nest and argument conventions as
+    :func:`int_scaled_gemm_reference` (which stays the RNE authority and is
+    what *this* function must equal at frm = RNE -- check_round_twelve_mxi),
+    with every ``fp_*`` operation rounded by :func:`fpf_round_frm`:
+
+        blk_scale = fp_mul(conv(sA), conv(sB))           (rm = frm)
+        x         = int_to_fp(int_block_dot)             (rm = frm)
+        scaled    = fp_mul(blk_scale, x)                 (rm = frm)
+        acc       = fp_add(acc, scaled)                  (rm = frm)
+
+    IEEE accumulators only.
+    """
+    _ewidth, fname = mx_legal_cell(geom.w, geom.sew, altfmt)
+    fmt_c = fp_format(fname)
+    if fmt_c.name not in FP_FORMATS_BY_NAME:
+        raise OCPSpecUnavailable(f"frm is modelled for IEEE accumulators only, "
+                                 f"not {fmt_c.name}")
+    mx_check_legality(geom.w, geom.lmul, geom.sew, geom.lam, bs)
+    block_size = mx_block_size(bs)
+    blocks = mx_block_count(geom.k_eff, block_size)
+    rnd = lambda v: _ieee_round(v, fmt_c, rounder=_frm_rounder(frm))
+    out = [row[:] for row in c]
+    for j in range(geom.n):
+        for i in range(geom.m):
+            acc = out[i][j]
+            nan_out = False
+            for s in range(blocks):
+                sa = _r10_scale(scales_a[i][s], fmt_c, frozenset(), frm)
+                sb = _r10_scale(scales_b[j][s], fmt_c, frozenset(), frm)
+                blk_bits = rnd(_r10_mul(_ieee_val(sa, fmt_c),
+                                        _ieee_val(sb, fmt_c)))
+                if fpf_is_nan(blk_bits, fmt_c):
+                    nan_out = True                      # Sail 5392: break
+                    break
+                k_lo, k_hi = mx_block_interval(s, block_size, geom.k_eff)
+                dot = mx_int_block_dot(a, b, i, j, k_lo, k_hi)
+                x_bits = rnd(("num", 1 if dot < 0 else 0, Fraction(abs(dot))))
+                scaled = rnd(_r10_mul(_ieee_val(blk_bits, fmt_c),
+                                      _ieee_val(x_bits, fmt_c)))
+                acc = rnd(_ieee_add(_ieee_val(acc, fmt_c),
+                                    _ieee_val(scaled, fmt_c), frm))
+            out[i][j] = fpf_default_nan(fmt_c) if nan_out else acc
+    return out
+
+
+def _is_rounding_tie(value: int, prec: int) -> bool:
+    """Is the positive integer *value* exactly halfway between two adjacent
+    *prec*-bit significands?"""
+    if value < (1 << prec):
+        return False
+    shift = value.bit_length() - prec
+    return (value & ((1 << shift) - 1)) == (1 << (shift - 1))
+
+
+def _row_with_block_sums(k_eff: int, block_size: int, targets, lim: int,
+                         rng: random.Random):
+    """A row of *k_eff* ints in [-lim, lim-1] whose per-block sums are
+    *targets* (clamped to what the block can hold)."""
+    row = []
+    for s, t in enumerate(targets):
+        lo, hi = s * block_size, min((s + 1) * block_size, k_eff)
+        n = hi - lo
+        t = max(-lim * n, min((lim - 1) * n, t))
+        vals = [rng.randint(-lim, lim - 1) for _ in range(n)]
+        left = t - sum(vals)
+        while left:
+            for idx in rng.sample(range(n), n):
+                step = max(-lim - vals[idx], min(lim - 1 - vals[idx], left))
+                vals[idx] += step
+                left -= step
+                if not left:
+                    break
+        assert sum(vals) == t, (sum(vals), t, n, lim)
+        row += vals
+    return row
+
+
+def mxi_frm_case(geom: "TileGeometry", altfmt: int, bs: int,
+                 rng: random.Random):
+    """``(a, b, c, scales_a, scales_b)`` for one MXINT program at a directed
+    rounding mode.
+
+    A rows cycle (i % 4): dense random / block-sum-targeted at a rounding tie
+    of fmt_C (B column "ones" or "max") / saturated (-lim) / small values.
+    B columns cycle (j % 4): dense random / all ones / all lim-1 / sparse.
+    Dense x dense dots are inexact in binary16 / bfloat16 with ties now and
+    then; the targeted rows make the dot of a block exactly half way between
+    two fmt_C values against the "ones" / "max" columns (so RNE, RMM, RTZ,
+    RDN and RUP all differ there); saturated x saturated overflows binary16
+    (RTZ / RDN: max finite, the others Inf).  Scale exponents sit at the range
+    edges of fmt_C (mxf_frm_pool), so blk * x and C + y overflow / underflow
+    as well.  C is drawn from the fmt_C operand pool plus +-max and the
+    smallest subnormal.
+    """
+    ewidth, fname = mx_legal_cell(geom.w, geom.sew, altfmt)
+    fmt_c = fp_format(fname)
+    if fmt_c.name not in FP_FORMATS_BY_NAME:
+        raise OCPSpecUnavailable(f"frm is modelled for IEEE accumulators "
+                                 f"only, not {fmt_c.name}")
+    lim = 1 << (ewidth - 1)
+    block_size = mx_block_size(bs)
+    blocks = mx_block_count(geom.k_eff, block_size)
+    prec = fmt_c.prec
+
+    def tie_sum(bval: int):
+        """A block sum S with bval * S a tie in fmt_C (None if impossible)."""
+        cap = (lim - 1) * min(block_size, geom.k_eff)
+        cands = [s for s in range(-cap, cap + 1)
+                 if s and _is_rounding_tie(abs(bval * s), prec)]
+        return rng.choice(cands) if cands else None
+
+    bcol_const = {1: 1, 2: lim - 1}
+    b = []
+    for j in range(geom.n):
+        cls = j % 4
+        if cls in bcol_const:
+            b.append([bcol_const[cls]] * geom.k_eff)
+        elif cls == 0:
+            b.append([rng.randint(-lim, lim - 1) for _ in range(geom.k_eff)])
+        else:
+            b.append([rng.choice((0, 0, 1, -1, lim - 1, -lim))
+                      for _ in range(geom.k_eff)])
+    a = []
+    for i in range(geom.m):
+        cls = i % 4
+        if cls == 0:
+            a.append([rng.randint(-lim, lim - 1) for _ in range(geom.k_eff)])
+        elif cls == 1:
+            # against B column 2 (all lim-1) the dot of a block is (lim-1) * S
+            targets = [tie_sum(lim - 1) for _ in range(blocks)]
+            a.append(_row_with_block_sums(
+                geom.k_eff, block_size,
+                [t if t is not None else 0 for t in targets], lim, rng))
+        elif cls == 2:
+            a.append([-lim] * geom.k_eff)
+        else:
+            a.append([rng.randint(-3, 3) for _ in range(geom.k_eff)])
+    big, mid, small = mxf_frm_pool(fmt_c)
+
+    def pick(side, m, s):
+        # the tie witnesses (A row class 1 x B column class 2) run at blk = 1
+        if (side == "a" and m % 4 == 1) or (side == "b" and m % 4 == 2):
+            return MX_E8M0_BIAS
+        pools = (big, mid, small) if side == "a" else (mid, small, big)
+        return MX_E8M0_BIAS + rng.choice(pools[(m + s) % 3])
+    sa, sb = mxf_scale_arrays(geom, bs, pick)
+    pc = fpw_operand_pool(fmt_c, rng, 24)
+    pc += [fpf_max_finite(fmt_c), fpf_max_finite(fmt_c) | (1 << (fmt_c.width - 1)),
+           fpf_min_subnormal(fmt_c)]
+    c = [[rng.choice(pc) for _ in range(geom.n_max)] for _ in range(geom.m)]
+    for i in range(1, geom.m, 4):          # witnesses start from +0.0
+        for j in range(2, geom.n, 4):
+            c[i][j] = 0
+    return a, b, c, sa, sb
+
+
+def _rand_finite(fmt: FpFormat, rng: random.Random, lo: int, hi: int) -> int:
+    """A finite non-NaN element of *fmt* with biased exponent in [lo, hi]."""
+    sign = rng.randrange(2) << (fmt.width - 1)
+    while True:
+        e = rng.randint(lo, hi)
+        frac = rng.randrange(1 << (fmt.prec - 1))
+        bits = sign | (e << (fmt.prec - 1)) | frac
+        if fpf_unpack(bits, fmt)[0] == "num":
+            return bits
+
+
+def fpw_frm_case(geom: "TileGeometry", row, rng: random.Random):
+    """``(a, b, c)`` for an unscaled widening program at a directed rounding
+    mode.
+
+    The products of one W-group are summed exactly, so what the rounding
+    mode can see is decided by the dynamic range of the operands.  A rows
+    cycle (i % 4): moderate (fpw_operand_pool) / huge (top exponents) /
+    tiny (subnormals and the smallest normals) / wide-and-paired (random
+    exponent over the whole range, a[k+1] = a[k] inside each pair).  B columns
+    cycle (j % 4): moderate / huge / tiny / cancelling (b[k+1] = -b[k], a low
+    mantissa bit flipped on every second pair, so a paired row against it
+    sums to a tiny exact residue of two enormous products).  Huge x huge
+    overflows fmt_C, tiny x tiny underflows into its subnormals (RUP: the
+    smallest one), moderate x anything is the ordinary inexact case and
+    wide-paired x cancelling is deep cancellation across the whole width of
+    the exact accumulator.  C is drawn from fmt_C's operand pool plus +-max
+    and the smallest subnormal.
+    """
+    fmt_a, fmt_b, fmt_c = row
+    pa, pb = (fpw_operand_pool(fmt_a, rng, 24), fpw_operand_pool(fmt_b, rng, 24))
+    pc = fpw_operand_pool(fmt_c, rng, 24)
+
+    def huge(fmt):
+        return _rand_finite(fmt, rng, max(1, fmt.emax - 2), fmt.emax)
+
+    def tiny(fmt):
+        return _rand_finite(fmt, rng, 0, 1)
+
+    def wide(fmt):
+        return _rand_finite(fmt, rng, 1, fmt.emax)
+    a = []
+    for i in range(geom.m):
+        cls = i % 4
+        if cls == 0:
+            a.append([rng.choice(pa) for _ in range(geom.k_eff)])
+        elif cls == 1:
+            a.append([huge(fmt_a) for _ in range(geom.k_eff)])
+        elif cls == 2:
+            a.append([tiny(fmt_a) for _ in range(geom.k_eff)])
+        else:
+            row_a = []
+            for k in range(0, geom.k_eff, 2):
+                x = wide(fmt_a)
+                row_a += [x, x]
+            a.append(row_a[:geom.k_eff])
+    b = []
+    for j in range(geom.n):
+        cls = j % 4
+        if cls == 0:
+            b.append([rng.choice(pb) for _ in range(geom.k_eff)])
+        elif cls == 1:
+            b.append([huge(fmt_b) for _ in range(geom.k_eff)])
+        elif cls == 2:
+            b.append([tiny(fmt_b) for _ in range(geom.k_eff)])
+        else:
+            row_b = []
+            for k in range(0, geom.k_eff, 2):
+                y = wide(fmt_b)
+                sign = 1 << (fmt_b.width - 1)
+                y2 = y ^ sign                          # exact -y
+                if rng.random() < 0.7:
+                    y2 ^= 1                            # flip the low mantissa
+                    if fpf_unpack(y2, fmt_b)[0] != "num":
+                        y2 = y ^ sign
+                row_b += [y, y2]
+            b.append(row_b[:geom.k_eff])
+    pc += [fpf_max_finite(fmt_c), fpf_max_finite(fmt_c) | (1 << (fmt_c.width - 1)),
+           fpf_min_subnormal(fmt_c)]
+    c = [[rng.choice(pc) for _ in range(geom.n_max)] for _ in range(geom.m)]
+    return a, b, c
+
+
+def check_round_twelve_frm_j2b() -> None:
+    """J2b self-checks: the new references against the old ones at RNE, the
+    case builders against their own intent."""
+    rng = random.Random(1212)
+    # 1. mxi_frm_reference_gemm == int_scaled_gemm_reference at frm = RNE.
+    import ime_tests as _it
+    n_checked = 0
+    for geom, bs in list(_it._mx_geometries(256, "many")) + \
+            list(_it._mx_geometries(256, "one")):
+        if not _it._mx_emittable(geom):
+            continue
+        for altfmt in mx_altfmts(geom.w, geom.sew):
+            a, b, c = _it._mx_operands(geom, altfmt, bs, rng)
+            sa, sb = _it._mx_scale_arrays(
+                geom, mx_block_count(geom.k_eff, mx_block_size(bs)),
+                lambda m, s: MX_E8M0_BIAS + rng.randrange(-8, 9),
+                lambda m, s: MX_E8M0_BIAS + rng.randrange(-8, 9))
+            want = int_scaled_gemm_reference(a, b, c, sa, sb, geom, bs=bs,
+                                             altfmt=altfmt)
+            got = mxi_frm_reference_gemm(a, b, c, sa, sb, geom, bs=bs,
+                                         altfmt=altfmt, frm=0)
+            assert got == want, (geom.describe(), bs, altfmt)
+            n_checked += 1
+    assert n_checked >= 8, n_checked
+    # 2. unscaled: mxf_reference_gemm(scales=None, frm=0) == fpw_reference_gemm
+    #    on the cells of rounds 7 / 8 (the authority their goldens come from).
+    for (w, sew) in sorted(FPW_ROUND_SEVEN_CELLS + FPW_ROUND_EIGHT_CELLS):
+        geoms = [g for g in fpw_legal_configs(256, full_vl_only=True)
+                 if (g.w, g.sew) == (w, sew) and g.emul_c != 16]
+        geom = geoms[-1]
+        for key, row in fpw_rows(w, sew).items():
+            for maker in (fpw_case, fpw_frm_case):
+                a, b, c = maker(geom, row, rng)
+                want = fpw_reference_gemm(geom, a, b, c, *row)
+                got = mxf_reference_gemm(geom, a, b, c, *row)
+                assert got == want, (w, sew, key, maker.__name__)
+    # 2b. the W=1 narrow cell: fpn_reference_gemm (round nine's authority)
+    #     == mxf_reference_gemm at RNE, and the directed modes differ.
+    geoms = [g for g in fpn_legal_configs(256, full_vl_only=True)
+             if (g.w, g.sew) == (1, 16) and g.emul_c != 16]
+    geom = fpn_special_geometry(geoms)
+    for key, row in fpw_rows(1, 16).items():
+        for maker in (fpn_case, fpw_frm_case):
+            a, b, c = maker(geom, row, rng)
+            assert fpn_reference_gemm(geom, a, b, c, *row) == \
+                mxf_reference_gemm(geom, a, b, c, *row), (key, maker.__name__)
+        a, b, c = fpw_frm_case(geom, row, rng)
+        ref = {f: mxf_reference_gemm(geom, a, b, c, *row, frm=f)
+               for f in (0, 1, 2, 3)}
+        for f in (1, 2, 3):
+            assert ref[f] != ref[0], ("fn", key, f)
+    # 3. every directed mode differs from RNE somewhere on the new cases
+    #    (a tier on which two modes agree everywhere would test nothing).
+    import ime_tests as _it
+    for (w, sew) in sorted(MX_CELLS):
+        geoms = [(g, bs) for g, bs in _it._mx_geometries(256, "many")
+                 if (g.w, g.sew) == (w, sew) and _it._mx_emittable(g)]
+        geom, bs = geoms[0]
+        for altfmt in mx_altfmts(w, sew):
+            a, b, c, sa, sb = mxi_frm_case(geom, altfmt, bs, rng)
+            ref = {f: mxi_frm_reference_gemm(a, b, c, sa, sb, geom, bs=bs,
+                                             altfmt=altfmt, frm=f)
+                   for f in (0, 1, 2, 3, 4)}
+            for f in (1, 2, 3):
+                assert ref[f] != ref[0], ("mxi", w, sew, altfmt, f)
+            if (w, sew) == (2, 16):       # Int8 -> fp16 / bf16: ties exist
+                assert ref[4] != ref[0], ("mxi rmm", w, sew, altfmt)
+    for (w, sew) in sorted(FPW_ROUND_SEVEN_CELLS + FPW_ROUND_EIGHT_CELLS
+                           + FPW_ROUND_TEN_CELLS):
+        geoms = [g for g in fpw_legal_configs(256, full_vl_only=True)
+                 if (g.w, g.sew) == (w, sew) and g.emul_c != 16]
+        geom = _it.fpw_special_geometry(geoms)
+        for key, row in fpw_rows(w, sew).items():
+            if row[2].name not in FP_FORMATS_BY_NAME:
+                continue
+            a, b, c = fpw_frm_case(geom, row, rng)
+            ref = {f: mxf_reference_gemm(geom, a, b, c, *row, frm=f)
+                   for f in (0, 1, 2, 3, 4)}
+            for f in (1, 2, 3):
+                assert ref[f] != ref[0], ("fw", w, sew, key, f)
 
 
 def r10_rounding_case(geom: "TileGeometry", row, bs=None):
@@ -7821,7 +8308,9 @@ def main() -> int:
                   check_round_ten_sail_equivalence,
                   check_round_ten_special_values,
                   check_round_ten_blind_spots,
-                  check_round_ten_negative_controls):
+                  check_round_ten_negative_controls,
+                  fpf_round_frm_selftest,
+                  check_round_twelve_frm_j2b):
         check()
         print(f"  ok  {check.__name__}")
 

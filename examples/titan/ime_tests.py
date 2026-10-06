@@ -56,6 +56,7 @@ The exit status is kept as a redundant second channel.
 """
 from __future__ import annotations
 
+import os
 import argparse
 import random
 import re
@@ -365,7 +366,7 @@ def _ime_path(geom: TileGeometry, alloc: VectorAlloc, *,
     return out
 
 
-def _rvv_path(geom: TileGeometry) -> List[str]:
+def _rvv_path(geom: TileGeometry, frm: int = 0) -> List[str]:
     """The same GEMM in RVV 1.0, fully unrolled.
 
     Unrolled on purpose: straight-line code has no loop bounds or induction
@@ -377,7 +378,7 @@ def _rvv_path(geom: TileGeometry) -> List[str]:
     for the integer multiply-accumulate.
     """
     if geom.kind == "fp":
-        return _fp_ref_path(geom)
+        return _fp_ref_path(geom, frm)
     if geom.w != 1:
         return _rvv_path_widening(geom)
     sfx = _SEW_SUFFIX[geom.sew]
@@ -503,7 +504,7 @@ def _rvv_path_widening(geom: TileGeometry) -> List[str]:
     return out
 
 
-def _fp_ref_path(geom: TileGeometry) -> List[str]:
+def _fp_ref_path(geom: TileGeometry, frm: int = 0) -> List[str]:
     """The same GEMM in scalar rv64f / rv64d, fully unrolled.
 
     Round four's reference is *not* an RVV reference, and that is the point.
@@ -561,7 +562,8 @@ def _fp_ref_path(geom: TileGeometry) -> List[str]:
     out: List[str] = [
         "", f"    # ---- scalar rv64{fsfx} reference path "
             f"(G=1, psm=0, rnd=frm) ----",
-        "    csrwi frm, 0             # RNE, for both paths",
+        f"    csrwi frm, {frm}             # "
+        f"{rvv_ref.FRM_NAMES[frm].upper()}, for both paths",
         "    la    a2, mat_a",
         "    la    a3, mat_b",
         "    la    a4, c_init",
@@ -835,7 +837,7 @@ def _epilogue(geom: TileGeometry) -> List[str]:
 
 
 def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
-              name: str = "ime_directed") -> str:
+              name: str = "ime_directed", frm: int = 0) -> str:
     """Assemble one self-checking paired program for *geom* and *case*.
 
     The harness links htif_nano.specs, which supplies _start and tohost and
@@ -901,8 +903,13 @@ def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
             f"    li    t0, {MSTATUS_FS_INITIAL}",
             "    csrs  mstatus, t0        # enable floating-point state",
         ]
+        if frm:
+            # round twelve (J2): the directed rounding mode governs the IME
+            # path (which runs first) as well as the scalar reference.
+            head += [f"    fsrmi {frm}                  # frm = "
+                     f"{rvv_ref.FRM_NAMES[frm].upper()}, both paths"]
 
-    body = _ime_path(geom, alloc) + _rvv_path(geom) + _compare(geom)
+    body = _ime_path(geom, alloc) + _rvv_path(geom, frm) + _compare(geom)
 
     data = [
         "", "    .data", "    .balign 8",
@@ -1486,6 +1493,7 @@ class MxPlan:
     scales_b: List[List[int]]
     tier: str            # "mx" / "mxs" / "mxn" -- names the prefix and intent
     tag: str             # what this particular program is for, in one phrase
+    frm: int = 0         # rounding mode (round twelve J2b: 0 RNE .. 4 RMM)
 
     @property
     def fmt(self) -> str:
@@ -1498,7 +1506,8 @@ class MxPlan:
                                       rvv_ref.mx_block_size(self.bs))
 
     def describe(self) -> str:
-        return mx_describe(self.geom, self.altfmt, self.bs)
+        frm = (f" frm={rvv_ref.FRM_NAMES[self.frm]}" if self.frm else "")
+        return mx_describe(self.geom, self.altfmt, self.bs) + frm
 
 
 #: What the reference path does for one C tile element.
@@ -1558,9 +1567,17 @@ def mx_element_plan(plan: MxPlan):
     _ebits, prec, _bias, _emax = rvv_ref.fp_fields(width, fmt)
     block_size = rvv_ref.mx_block_size(bs)
     blocks = plan.blocks
-    ref = rvv_ref.int_scaled_gemm_reference(
-        plan.a, plan.b, plan.c, plan.scales_a, plan.scales_b, geom,
-        bs=bs, altfmt=altfmt)
+    if plan.frm:
+        # Round twelve (J2b): the directed rounding modes.  Every active
+        # element is a literal from rvv_ref (the closed form below is an
+        # RNE-exact construction and says nothing about frm).
+        ref = rvv_ref.mxi_frm_reference_gemm(
+            plan.a, plan.b, plan.c, plan.scales_a, plan.scales_b, geom,
+            bs=bs, altfmt=altfmt, frm=plan.frm)
+    else:
+        ref = rvv_ref.int_scaled_gemm_reference(
+            plan.a, plan.b, plan.c, plan.scales_a, plan.scales_b, geom,
+            bs=bs, altfmt=altfmt)
 
     out = {}
     for i in range(geom.m):
@@ -1569,6 +1586,9 @@ def mx_element_plan(plan: MxPlan):
             if j >= geom.n:
                 assert want == plan.c[i][j], (i, j)   # vta=0, spec 1811-1813
                 out[(i, j)] = (MX_MODE_COPY, 0, 0, 0)
+                continue
+            if plan.frm:
+                out[(i, j)] = (MX_MODE_LITERAL, 0, 0, want)
                 continue
             exps = set()
             for s in range(blocks):
@@ -2071,7 +2091,16 @@ def emit_mx_test(plan: MxPlan, name: str = "ime_mx") -> str:
     ]
     # No mstatus.FS: the reference path is integer throughout.  That is the
     # point of the exactness construction, not an oversight -- see
-    # _mx_convert_path.
+    # _mx_convert_path.  (Round twelve J2b: a directed rounding mode needs the
+    # frm CSR, hence FS, and only those programs get these lines.)
+    if plan.frm:
+        head += [
+            f"    li    t0, {MSTATUS_FS_INITIAL}",
+            "    csrs  mstatus, t0        # enable scalar FP state (frm CSR)",
+            f"    fsrmi {plan.frm}                  # frm = "
+            f"{rvv_ref.FRM_NAMES[plan.frm].upper()}, read by the IME "
+            f"(spec 1495)",
+        ]
 
     body = (_mx_ime_path(geom, alloc, altfmt=plan.altfmt, bs=plan.bs)
             + _mx_dot_path(geom, elements)
@@ -3163,6 +3192,7 @@ class FpwPlan:
     b: Matrix
     c: Matrix
     tag: str = ""
+    frm: int = 0                # rounding mode (round twelve J2b: 0 RNE .. 4 RMM)
 
     @property
     def row(self):
@@ -3183,8 +3213,9 @@ class FpwPlan:
     def describe(self) -> str:
         fa, fb, fc = self.row
         mixed = "" if fa.name == fb.name else " MIXED"
+        frm = (f" frm={rvv_ref.FRM_NAMES[self.frm]}" if self.frm else "")
         return (f"{self.geom.describe()} {fa.name}x{fb.name}->{fc.name} "
-                f"altfmt={self.altfmt} tier={self.tier}{mixed}")
+                f"altfmt={self.altfmt} tier={self.tier}{mixed}{frm}")
 
 
 def _fpw_configure(geom: TileGeometry, *, lmul: int, vl: int, key,
@@ -3472,6 +3503,18 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
                 f"E5M2 0x{d['default_nan']['e5m2']:02x}, frm={d['frm']}.",
             ]
         head.append("#")
+    if plan.frm:
+        head += [
+            f"# Round twelve (J2b): frm = {rvv_ref.FRM_NAMES[plan.frm].upper()}"
+            f" for the IME and for nothing else (no scalar reference runs).",
+            "# Operand classes (rvv_ref.fpw_frm_case): moderate / huge / tiny /",
+            "# wide-paired A rows x moderate / huge / tiny / cancelling B",
+            "# columns -- overflow, underflow to the subnormals, deep",
+            "# cancellation over the whole exact accumulator.  The expected",
+            "# image is rvv_ref.mxf_reference_gemm(frm=) (Sail fp_gemm,",
+            "# IEEE 754 4.3); an OFP8 accumulator is RNE-only and not here.",
+            "#",
+        ]
     if plan.tier == "special" and \
             (geom.w, geom.sew) in rvv_ref.FPW_ROUND_TEN_CELLS:
         head += [
@@ -3529,8 +3572,9 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
         "    csrs  mstatus, t0        # enable vector state",
         f"    li    t0, {MSTATUS_FS_INITIAL}",
         "    csrs  mstatus, t0        # enable scalar FP state",
-        "    fsrmi 0                  # frm = RNE (spec 1495); not trusted "
-        "from reset",
+        (f"    fsrmi {plan.frm}                  # frm = "
+         f"{rvv_ref.FRM_NAMES[plan.frm].upper()} (spec 1495); not trusted "
+         "from reset"),
     ]
 
     body = _fpw_ime_path(geom, alloc, plan.key)
@@ -3567,7 +3611,13 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
                 else rvv_ref.mxf_reference_gemm
                 if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_TEN_CELLS
                 else rvv_ref.fpw_reference_gemm)
-        tile = gemm(geom, plan.a, plan.b, plan.c, fmt_a, fmt_b, fmt_c)
+        if plan.frm:
+            # Round twelve (J2b): Sail fp_gemm at rnd = frm, IEEE C only.
+            tile = rvv_ref.mxf_reference_gemm(geom, plan.a, plan.b, plan.c,
+                                              fmt_a, fmt_b, fmt_c,
+                                              frm=plan.frm)
+        else:
+            tile = gemm(geom, plan.a, plan.b, plan.c, fmt_a, fmt_b, fmt_c)
         golden = rvv_ref.fpw_golden_bytes(geom, tile, fmt_c)
         assert len(golden) == geom.m * geom.n_max * (width // 8)
         # Emitted at the accumulator width rather than as raw bytes so that a
@@ -4062,6 +4112,7 @@ class MxfPlan:
     scales_a: List[List[int]]
     scales_b: List[List[int]]
     tag: str = ""
+    frm: int = 0                # rounding mode (round twelve: 0 RNE .. 4 RMM)
 
     @property
     def row(self):
@@ -4075,10 +4126,11 @@ class MxfPlan:
     def describe(self) -> str:
         fa, fb, fc = self.row
         mixed = "" if fa.name == fb.name else " MIXED"
+        frm = (f" frm={rvv_ref.FRM_NAMES[self.frm]}" if self.frm else "")
         return (f"{self.geom.describe()} {fa.name}x{fb.name}->{fc.name} "
                 f"altfmt={self.key[2]} bs={self.bs} "
                 f"BLK={rvv_ref.mx_block_size(self.bs)} tier={self.tier}"
-                f"{mixed}")
+                f"{mixed}{frm}")
 
 
 def _mxf_configure(geom: TileGeometry, *, lmul: int, vl: int, key, bs: int,
@@ -4268,8 +4320,9 @@ def emit_mxf_test(plan: MxfPlan, name: str = "ime_mxf") -> str:
         "    csrs  mstatus, t0        # enable vector state",
         f"    li    t0, {MSTATUS_FS_INITIAL}",
         "    csrs  mstatus, t0        # enable scalar FP state",
-        "    fsrmi 0                  # frm = RNE (spec 1495); not trusted "
-        "from reset",
+        (f"    fsrmi {plan.frm}                  # frm = "
+         f"{rvv_ref.FRM_NAMES[plan.frm].upper()} (spec 1495); not trusted "
+         "from reset"),
     ]
     body = _mxf_ime_path(plan, alloc)
     if plan.tier == "exact":
@@ -4303,7 +4356,7 @@ def emit_mxf_test(plan: MxfPlan, name: str = "ime_mxf") -> str:
     if plan.tier in ("golden", "special"):
         tile = rvv_ref.mxf_reference_gemm(
             geom, plan.a, plan.b, plan.c, fmt_a, fmt_b, fmt_c,
-            plan.scales_a, plan.scales_b, plan.bs)
+            plan.scales_a, plan.scales_b, plan.bs, frm=plan.frm)
         golden = rvv_ref.fpw_golden_bytes(geom, tile, fmt_c)
         words = [int.from_bytes(bytes(golden[i:i + width // 8]), "little")
                  for i in range(0, len(golden), width // 8)]
@@ -4407,6 +4460,252 @@ def mxf_directed_tiers(vlen: int, seed: int = 0):
                         f"m{sg.lmul}_n{sg.n}_{key[0]}{key[1]}{key[2]}")
                 out.append((name, emit_mxf_test(plan, name), sg))
     return out
+
+
+def fp_frm_directed_tiers(vlen: int, seed: int = 0):
+    """Round twelve (J2): vfmmacc.vv (SEW 32 / 64) at the directed rounding
+    modes.  The reference is the scalar F/D unit at the same frm (fmul +
+    fadd, G=1 psm=0 rnd=frm), so no Python rounding model is involved."""
+    rng = random.Random(seed + 12600)
+    out = []
+    for frm in (1, 2, 3, 4):
+        for geom in rvv_ref.ime_legal_configs(
+                vlen, sews=[x for x in (32, 64) if x in rvv_ref.FP_FORMATS],
+                lmuls=(1, 2, 4, 8), full_vl_only=True, ws=(1,),
+                tloads=("op",), kinds=("fp",), checks=("pair",)):
+            if geom.emul_c == 16:
+                continue
+            try:
+                VectorAlloc.allocate(geom)
+            except ValueError:
+                continue
+            name = (f"ime_f_frm{frm}_sew{geom.sew}_lam{geom.lam}_"
+                    f"lmul{geom.lmul}_n{geom.n}")
+            out.append((name, emit_test(geom, rvv_ref.random_case(geom, rng),
+                                        name, frm=frm), geom))
+    return out
+
+
+def mxf_frm_directed_tiers(vlen: int, seed: int = 0):
+    """Round twelve (J2): MXFP programs at the directed rounding modes.
+
+    Every earlier program ran at frm = RNE, so nothing observed rnd = frm for
+    the block-scale product (blk = fp_mul(sA, sB)), the scaled product
+    (fp_mul(blk, S_r)) or the accumulator add.  Per MX cell, bs and encoding
+    row with an IEEE fmt_C (the OFP8 accumulator is RNE-only, OFP8_DISCLOSURE):
+    the special geometry, scales at the range edges of fmt_C
+    (rvv_ref.mxf_frm_case), frm in {RTZ, RDN, RUP, RMM} (bs=1: RTZ and RUP).
+    The expected tile is rvv_ref.mxf_reference_gemm(..., frm=): Sail
+    fp_round_to_frm, IEEE 754 4.3 -- never the RTL.
+    """
+    rng = random.Random(seed + 12500)
+    out = []
+    for (w, sew) in rvv_ref.MXF_CELLS:
+        rows = [(k, r) for k, r in rvv_ref.fpw_rows(w, sew).items()
+                if r[2].name in rvv_ref.FP_FORMATS_BY_NAME]
+        if not rows:
+            continue
+        for bs in (0, 1):
+            geoms = [g for g in rvv_ref.mxf_legal_configs(
+                         vlen, full_vl_only=True)
+                     if (g.w, g.sew) == (w, sew) and _mxf_allocatable(g)
+                     and bs in rvv_ref.mxf_legal_bs(g)]
+            if not geoms:
+                continue
+            sg = rvv_ref.mxf_special_geometry(geoms)
+            for key, row in rows:
+                for frm in ((1, 2, 3, 4) if bs == 0 else (1, 3)):
+                    plan = MxfPlan(sg, key, bs, "special", *rvv_ref.mxf_frm_case(
+                        sg, row, bs, rng), tag=f"directed rounding mode "
+                        f"{rvv_ref.FRM_NAMES[frm]}, scales at the range edges",
+                        frm=frm)
+                    name = (f"ime_mxf_frm{frm}_w{w}_sew{sew}_bs{bs}_l{sg.lam}_"
+                            f"m{sg.lmul}_n{sg.n}_{key[0]}{key[1]}{key[2]}")
+                    out.append((name, emit_mxf_test(plan, name), sg))
+    return out
+
+
+def mxi_frm_directed_tiers(vlen: int, seed: int = 0,
+                           full_vl_only: bool = True):
+    """Round twelve (J2b): MXINT programs (vfwimmacc / vfqimmacc / vf8wimmacc)
+    at the directed rounding modes.
+
+    The MXINT conversion int_to_fp(block dot) and the blk * x / C + y
+    roundings that follow it saw frm = RNE only before.  One program per
+    (encoding cell, accumulator altfmt, frm in RTZ / RDN / RUP / RMM), on the
+    largest multi-block geometry of the cell (S1); the Gate tier adds the
+    cell's second multi-block geometry.  The expected tile is
+    rvv_ref.mxi_frm_reference_gemm (Sail int_scaled_gemm at rnd = frm); every
+    active element is a literal from it (the exact closed form of the RNE
+    tiers says nothing about frm).  All accumulators are IEEE (binary16,
+    bfloat16, binary32, binary64): an MXINT instruction has no OFP8 C.
+    """
+    rng = random.Random(seed + 12700)
+    by_cell = {}
+    for geom, bs in _mx_geometries(vlen, "many"):
+        if _mx_emittable(geom):
+            by_cell.setdefault((geom.w, geom.sew), []).append((geom, bs))
+    out = []
+    for cell in sorted(by_cell):
+        cands = sorted(by_cell[cell],
+                       key=lambda gb: (-gb[0].m * gb[0].n, gb[1], gb[0].lam))
+        variants = cands[:1] if full_vl_only else cands[:2]
+        for geom, bs in variants:
+            for altfmt in rvv_ref.mx_altfmts(*cell):
+                for frm in (1, 2, 3, 4):
+                    a, b, c, sa, sb = rvv_ref.mxi_frm_case(geom, altfmt, bs, rng)
+                    plan = MxPlan(geom, altfmt, bs, a, b, c, sa, sb, "mxi",
+                                  "directed rounding mode "
+                                  f"{rvv_ref.FRM_NAMES[frm]}: int_to_fp ties and "
+                                  "overflow, scales at the range edges",
+                                  frm=frm)
+                    name = (f"ime_mxi_frm{frm}_w{geom.w}_sew{geom.sew}_"
+                            f"af{altfmt}_bs{bs}_l{geom.lam}_m{geom.lmul}_"
+                            f"n{geom.n}")
+                    out.append((name, emit_mx_test(plan, name), geom))
+    return out
+
+
+def fpw_frm_directed_tiers(vlen: int, seed: int = 0,
+                           full_vl_only: bool = True):
+    """Round twelve (J2b): the unscaled widening forms (vfwmmacc / vfqmmacc /
+    vf8wmmacc) at the directed rounding modes.
+
+    Every IEEE-accumulator row of every resolved cell (the two OFP8-C rows of
+    (W=2, SEW=8) are RNE-only by OFP8_DISCLOSURE and excluded).  Per cell
+    max(rows, 4) programs: row t % rows at frm RTZ / RDN / RUP / RMM in turn,
+    so every row is seen at a directed mode and every cell at all four.  One
+    geometry per cell (S1: fpw_special_geometry); the Gate tier adds the same
+    sweep on a second geometry with the modes rotated by one.  The operand
+    classes (rvv_ref.fpw_frm_case) span the whole dynamic range, so each
+    program also carries deep cancellation across the exact accumulator --
+    what the narrow-accumulator mutant (M2) cannot survive.  The expected
+    image is rvv_ref.mxf_reference_gemm(frm=) with no scales: Sail fp_gemm,
+    G = 1, psm = 0, rnd = frm.
+    """
+    rng = random.Random(seed + 12800)
+    modes = (1, 2, 3, 4)
+    out = []
+    for (w, sew) in rvv_ref.fpw_resolved_cells():
+        geoms = [g for g in rvv_ref.fpw_legal_configs(vlen, full_vl_only=True)
+                 if (g.w, g.sew) == (w, sew) and g.emul_c != 16
+                 and _allocatable_here(g)]
+        rows = [(k, r) for k, r in rvv_ref.fpw_rows(w, sew).items()
+                if r[2].name in rvv_ref.FP_FORMATS_BY_NAME]
+        if not geoms or not rows:
+            continue
+        sg = fpw_special_geometry(geoms)
+        variants = [(sg, 0)]
+        if not full_vl_only:
+            alt = [g for g in geoms if g is not sg]
+            if alt:
+                variants.append((alt[-1], 1))
+        for geom, off in variants:
+            for t in range(max(len(rows), 4)):
+                key, row = rows[t % len(rows)]
+                frm = modes[(t + off) % 4]
+                case = rvv_ref.fpw_frm_case(geom, row, rng)
+                mixed = row[0].name != row[1].name
+                plan = FpwPlan(geom, key, "golden", *case,
+                               tag=("mixed-format row" if mixed
+                                    else "same-format row"), frm=frm)
+                name = (f"ime_fw_frm{frm}_w{w}_sew{sew}_l{geom.lam}_"
+                        f"m{geom.lmul}_{plan.altfmt_a}{plan.altfmt_b}"
+                        f"{plan.altfmt}")
+                out.append((name, emit_fpw_test(plan, name), geom))
+    return out
+
+
+def fpn_frm_directed_tiers(vlen: int, seed: int = 0,
+                           full_vl_only: bool = True):
+    """Round twelve (J2b): vfmmacc.vv at SEW 16 (binary16 / bfloat16
+    accumulators, the W=1 narrow cell) at the directed rounding modes.
+
+    The six encoding rows of (W=1, SEW=16), each at RTZ / RDN / RUP / RMM
+    (24 programs; three rows have a bfloat16 C, the path that is rounded
+    through binary32 and narrowed again), on the cell's special geometry
+    (M >= 8).  The Gate tier adds the same rows on a second geometry at one
+    rotated mode each.  The SEW=8 cell has an OFP8 accumulator (RNE-only,
+    OFP8_DISCLOSURE) and is not here.  Expected image:
+    rvv_ref.mxf_reference_gemm(frm=) at W=1 (Sail fp_gemm, G = 1, psm = 0,
+    rnd = frm), which equals fpn_reference_gemm at RNE (checked by
+    rvv_ref.check_round_twelve_frm_j2b).
+    """
+    rng = random.Random(seed + 12900)
+    modes = (1, 2, 3, 4)
+    w, sew = 1, 16
+    geoms = [g for g in rvv_ref.fpn_legal_configs(vlen, full_vl_only=True)
+             if (g.w, g.sew) == (w, sew) and g.emul_c != 16
+             and _allocatable_here(g)]
+    rows = [(k, r) for k, r in rvv_ref.fpw_rows(w, sew).items()
+            if r[2].name in rvv_ref.FP_FORMATS_BY_NAME]
+    out = []
+    if not geoms:
+        return out
+    sg = rvv_ref.fpn_special_geometry(geoms)
+    variants = [(sg, 0, modes)]
+    if not full_vl_only:
+        alt = [g for g in geoms if g is not sg and g.m >= 4]
+        if alt:
+            variants.append((alt[-1], 1, None))
+    for geom, off, ms in variants:
+        for t, (key, row) in enumerate(rows):
+            for frm in (ms if ms else (modes[(t + off) % 4],)):
+                case = rvv_ref.fpw_frm_case(geom, row, rng)
+                mixed = row[0].name != row[1].name
+                plan = FpwPlan(geom, key, "golden", *case,
+                               tag=("narrow W=1, " + ("mixed-format row"
+                                                      if mixed
+                                                      else "same-format row")),
+                               frm=frm)
+                name = (f"ime_fn_frm{frm}_sew{sew}_l{geom.lam}_m{geom.lmul}_"
+                        f"n{geom.n}_{plan.altfmt_a}{plan.altfmt_b}"
+                        f"{plan.altfmt}")
+                out.append((name, emit_fpw_test(plan, name), geom))
+    return out
+
+
+def check_round_twelve_j2b_emission() -> None:
+    """Round twelve J2b tiers: counts, names, the frm word in every program,
+    all four directed modes per cell, no OFP8 accumulator, MXINT programs
+    literal throughout, Gate tier a strict superset of S1."""
+    import re
+    s1 = {"mxi": mxi_frm_directed_tiers(256, 0, True),
+          "fw": fpw_frm_directed_tiers(256, 0, True),
+          "fn": fpn_frm_directed_tiers(256, 0, True)}
+    gate = {"mxi": mxi_frm_directed_tiers(256, 0, False),
+            "fw": fpw_frm_directed_tiers(256, 0, False),
+            "fn": fpn_frm_directed_tiers(256, 0, False)}
+    assert {k: len(v) for k, v in s1.items()} == \
+        {"mxi": 28, "fw": 36, "fn": 24}, {k: len(v) for k, v in s1.items()}
+    for k in s1:
+        names = [n for n, _a, _g in gate[k]]
+        assert len(set(names)) == len(names) > len(s1[k]), k
+        assert {n for n, _a, _g in s1[k]} <= set(names), k
+        modes_by_cell = {}
+        for name, asm, geom in gate[k]:
+            frm = int(re.match(r"ime_\w+?_frm(\d)_", name).group(1))
+            assert frm in (1, 2, 3, 4), name
+            assert f"    fsrmi {frm} " in asm, name
+            assert f"frm={rvv_ref.FRM_NAMES[frm]}" in asm, name
+            assert not re.search(r"->e[45]m[23]\b", asm.split("\n")[0]), name
+            modes_by_cell.setdefault((geom.w, geom.sew), set()).add(frm)
+            if k == "mxi":
+                assert "mstatus" in asm and ".Lmxcvt_lit" in asm
+                m = re.search(r"ref_mode:\n((?:\s+\.byte .*\n)+)", asm)
+                modes = {int(x, 16) for x in re.findall(r"0x[0-9a-fA-F]+", m.group(1))}
+                assert modes <= {MX_MODE_LITERAL, MX_MODE_COPY}, (name, modes)
+        for cell, ms in modes_by_cell.items():
+            if k in ("mxi", "fw"):
+                assert ms == {1, 2, 3, 4}, (k, cell, ms)
+    assert not any("_w2_sew8_" in n or "_w1_sew8_" in n
+                   for k in gate for n, _a, _g in gate[k]), \
+        "an OFP8-accumulator cell is in a directed-rounding tier"
+    # the first J2b program is the first appended one: byte-identity of
+    # everything earlier is checked against the .bak-j2b copy by J2b's driver.
+    names_all = [n for n, _a, _g in directed_suite(256, 0)]
+    assert names_all[-88:] == [n for k in ("mxi", "fw", "fn")
+                               for n, _a, _g in s1[k]]
 
 
 def check_round_ten_emission() -> None:
@@ -4681,6 +4980,21 @@ def directed_suite(vlen: int, seed: int = 0,
         out += ofp4_directed_tiers(vlen, seed)
     if MXF_TOKEN in insns:
         out += mxf_directed_tiers(vlen, seed)
+        # Round twelve (J2): the directed rounding modes (appended last).
+        out += mxf_frm_directed_tiers(vlen, seed)
+        out += fp_frm_directed_tiers(vlen, seed)
+        # Round twelve (J2b): MXINT conversion + unscaled widening FP at the
+        # directed modes (appended after J2's tiers).
+        # TITAN_MXI_FRM=0 drops the MXINT directed-rounding tier (it needs the
+        # frontend to give the microscaled integer forms frm, see
+        # mxi_frm_directed_tiers).
+        if any(m in insns for m in round_six) and \
+                os.environ.get("TITAN_MXI_FRM", "1") != "0":
+            out += mxi_frm_directed_tiers(vlen, seed, full_vl_only)
+        if any(m in insns for m in round_seven):
+            out += fpw_frm_directed_tiers(vlen, seed, full_vl_only)
+        if FPN_TOKEN in insns:
+            out += fpn_frm_directed_tiers(vlen, seed, full_vl_only)
     return out
 
 
@@ -6246,6 +6560,7 @@ def main() -> int:
                   check_mxn_emission,
                   check_mxl_emission,
                   check_mx_verdict_contract,
+                  check_round_twelve_j2b_emission,
                   check_round_seven_emission,
                   check_round_seven_golden_matches_model,
                   check_round_seven_declared_scope,

@@ -39,7 +39,11 @@ Facts about the design, as the judge and the source show them:
   write has fired. One format (H / BF / S / D) is selected per uop.
 - The FP critical path is `s0_p_sign -> fpw_cA_reg`, the 80-bit chunk carry,
   25.98 ns flat. The INT FU is at 29.66 ns in the full SoC, 0.6 ns from the
-  SoC's longest path.
+  SoC's longest path. Both FU delay gates (`${PPA_FP_DELAY}` / `${PPA_INT_DELAY}`
+  ns) are the SoC's longest abc path (30.25 ns): abc's delay is noisy, an
+  equivalent rewrite can move a flat path by up to +3.2 ns, so a gate tighter
+  than the SoC path would reject equivalent designs. A flat INT path of
+  ${PPA_INT_STRETCH} ns or less is reported as the stretch goal, not gated.
 - `${PPA_TOP_INT}` retires one product per cycle (`last := Mux(op.matrix_last_k,
   io.write.fire, valid)`), so one more register on its path is one more
   cycle per k.

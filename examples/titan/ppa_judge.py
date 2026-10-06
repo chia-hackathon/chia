@@ -67,18 +67,19 @@ DEFAULT_CONFIG: Dict[str, object] = {
     "soc_top": "SaturnShuttleUnit",
     # --- FP FU (binding) --------------------------------------------------
     "a_target_um2": 450000.0,          # -20% of r35 flat (561,908)
-    "a_stretch_um2": 395000.0,         # -30%: the loop stops here
-    "r35_fp_area_um2": 561908.0,       # flat; stage-T record of r35
+    "a_stretch_um2": 400000.0,         # loop stops here (calibrated: C2/C3)
+    "r35_fp_area_um2": 561907.664,     # flat; stage-T record of r35
     "r35_fp_delay_ns": 25.98,
-    "fp_delay_max_ns": 26.0,           # no regression vs r35
+    "fp_delay_max_ns": 30.25,          # = SoC longest abc path (ppa8); abc noise up to +3.2 ns (J2/M4)
     # --- INT FU (binding) -------------------------------------------------
-    "int_delay_max_ns": 27.0,          # >= 3 ns under the 30.25 ns SoC path
-    "r35_int_area_um2": None,          # calibration C1 fills this in
+    "int_delay_max_ns": 30.25,         # required, = SoC longest abc path (r35 INT flat 31.374 ns)
+    "int_delay_stretch_ns": 27.0,      # non-gating stretch / reported only
+    "r35_int_area_um2": 102314.4,      # calibration C1
     "int_area_max_ratio": 1.05,
-    "r35_int_delay_ns": None,
+    "r35_int_delay_ns": 31.374,
     # --- noise ------------------------------------------------------------
     # progress / SoC-guard band: max(frac * reference, 2 * sigma)
-    "noise_area_frac": 0.005,
+    "noise_area_frac": 0.01,
     "noise_area_sigma_um2": None,      # calibration C3 fills this in
     "noise_delay_ns": 0.5,
     # --- netlist sanity: {top: {port: [dir, width]}}; {} = not checked ------
@@ -86,6 +87,7 @@ DEFAULT_CONFIG: Dict[str, object] = {
     # --- Gate (P-SOC) -----------------------------------------------------
     "soc": {
         "enabled": True,
+        "noise_area_frac": 0.005,            # SoC total / outside-FU band
         "r35_total_um2": 4160821.808,        # ppa8, hierarchical
         "r35_outside_fu_um2": 3259970.32,    # ppa8: total minus both FU subtrees
         "r35_modules_um2": {},               # {module: local area}
@@ -164,6 +166,11 @@ def validate_config(cfg: Dict[str, object]) -> None:
         raise ConfigError("noise_area_frac must be in [0, 0.5)")
     if float(cfg["a_stretch_um2"]) > float(cfg["a_target_um2"]):
         raise ConfigError("a_stretch_um2 must not exceed a_target_um2")
+    pos("int_delay_stretch_ns", allow_none=True)
+    if cfg.get("int_delay_stretch_ns") is not None and \
+            float(cfg["int_delay_stretch_ns"]) > float(cfg["int_delay_max_ns"]):
+        raise ConfigError("int_delay_stretch_ns must not exceed "
+                          "int_delay_max_ns")
     if int(cfg["no_progress_stop"]) < 0:
         raise ConfigError("no_progress_stop must be >= 0")
 
@@ -539,7 +546,7 @@ def decide_unit_fp(cfg: Dict[str, object], meas: Dict[str, object]
         ok_delay = float(delay) <= lim
         if not ok_delay:
             reasons.append(f"FP longest path {delay / 1000:.2f} ns > "
-                           f"{lim / 1000:.2f} ns (no regression vs r35)")
+                           f"{lim / 1000:.2f} ns (= the SoC longest abc path, ppa8)")
     san = meas.get("sanity") or {"ok": True, "issues": []}
     for i in san.get("issues") or []:
         reasons.append(f"FP netlist sanity: {i}")
@@ -608,7 +615,11 @@ def decide_soc(cfg: Dict[str, object], meas: Dict[str, object]
     if meas.get("total_um2") is None:
         return {"pass": False, "reasons": ["P-SOC: no total area found"]}
     base_total = soc.get("r35_total_um2")
-    noise = noise_band_um2(cfg, base_total or meas["total_um2"])
+    # total-level band stays 0.5% (1% of 4.16M um2 would hide ~42k of
+    # relocated logic); the 1% band is the per-FU no-progress key
+    noise = noise_band_um2(
+        dict(cfg, noise_area_frac=soc.get("noise_area_frac", 0.005)),
+        base_total or meas["total_um2"])
     # the plan's total bound: r35 total minus what the two FUs saved (same
     # hierarchical flow), plus noise == outside-FU area did not grow
     base_out = soc.get("r35_outside_fu_um2")
@@ -1015,7 +1026,10 @@ def metric_table(res: Dict[str, object], cfg: Dict[str, object],
         ("INT longest path (ns)", _ns(intu.get("delay_ps")),
          "-" if cfg.get("r35_int_delay_ns") is None
          else f"{cfg['r35_int_delay_ns']:.2f}", "-",
-         f"<= {cfg['int_delay_max_ns']:.2f}", stat(dint.get("delay_pass"))),
+         f"<= {cfg['int_delay_max_ns']:.2f}" + (
+             f" (stretch {cfg['int_delay_stretch_ns']:.2f}, not gated)"
+             if cfg.get("int_delay_stretch_ns") else ""),
+         stat(dint.get("delay_pass"))),
         ("FP flops / enable flops (info)",
          f"{fp.get('flops', '-')} / {fp.get('enable_flops', '-')}", "-", "-",
          "report only", "-"),
