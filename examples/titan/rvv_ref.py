@@ -8251,6 +8251,976 @@ def check_round_ten_blind_spots() -> None:
                           fp_format("binary64"))
 
 
+# --- round twelve r37 review: directed data for the tiers the independent
+# review of run r37 asked for (REVIEW.md section 4, items 1-5) ----------------
+#
+# Everything here is a *generator of operands* plus a reference that follows
+# the IME Sail (fp_gemm / fp_scaled_gemm, G = 1, psm = 0, rnd = frm) and IEEE
+# 754 -- the expected tile is always mxf_reference_gemm(frm=) /
+# mxi_frm_reference_gemm; no RTL behaviour and no scalar FPU is consulted.
+# The generators retry (deterministically, own seeds) until the reference's
+# *trace* shows the events the review listed, and the self-checks below
+# re-assert that for every program the tiers emit.
+
+R37_MODES = (0, 1, 2, 3, 4)
+
+
+def r37_normal(fmt: FpFormat, e: int, frac: int = 0, neg: int = 0) -> int:
+    """(-1)^neg * (1 + frac / 2^(prec-1)) * 2^e, e inside the normal range."""
+    assert 1 - fmt.bias <= e <= fmt.bias, (fmt.name, e)
+    assert 0 <= frac < (1 << (fmt.prec - 1))
+    return (neg << (fmt.width - 1)) | ((e + fmt.bias) << (fmt.prec - 1)) | frac
+
+
+def r37_sub(fmt: FpFormat, frac: int, neg: int = 0) -> int:
+    """A subnormal (frac in 1 .. 2^(prec-1) - 1) or zero (frac 0)."""
+    assert 0 <= frac < (1 << (fmt.prec - 1))
+    return (neg << (fmt.width - 1)) | frac
+
+
+def r37_inf(fmt: FpFormat, neg: int = 0) -> int:
+    return (neg << (fmt.width - 1)) | (fmt.emax << (fmt.prec - 1))
+
+
+def r37_nan(fmt: FpFormat, kind: str, neg: int = 0) -> int:
+    """qNaN / sNaN patterns; ``q0`` is the default NaN, ``q1`` carries a
+    payload, ``s0`` / ``s1`` are signalling (quiet bit clear)."""
+    top = fmt.emax << (fmt.prec - 1)
+    quiet = 1 << (fmt.prec - 2)
+    low = {"q0": quiet, "q1": quiet | 1 | (1 << (fmt.prec - 4)),
+           "s0": 1, "s1": (1 << (fmt.prec - 3)) | 1}[kind]
+    return (neg << (fmt.width - 1)) | top | low
+
+
+def r37_classes(fmt: FpFormat, rng: random.Random):
+    """name -> a callable giving a random element of that value class."""
+    P, B = fmt.prec, fmt.bias
+    emin = 1 - B
+    fbits = P - 1
+    msub_e = emin - fbits                      # exponent of the smallest subnormal
+    rf = lambda: rng.randrange(1 << fbits)
+    sg = lambda: rng.randrange(2)
+    hi_half = (B + 1) // 2                     # hi x hi' overflows
+    lo_half = msub_e // 2                      # lo x lo' lands at the minSub edge
+
+    def zero():
+        return r37_sub(fmt, 0, sg())
+
+    def inf():
+        return r37_inf(fmt, sg())
+
+    def nan():
+        return r37_nan(fmt, rng.choice(("q0", "q1", "s0", "s1")), sg())
+
+    def mx():
+        return fpf_max_finite(fmt) ^ (sg() << (fmt.width - 1)) \
+            if rng.random() < 0.6 else \
+            r37_normal(fmt, B, rf() | (1 << (fbits - 1)), sg())
+
+    def hi():
+        return r37_normal(fmt, rng.choice((hi_half, hi_half - 1, hi_half + 1,
+                                           B - 1, B - 2)), rf(), sg())
+
+    def lo():
+        return r37_normal(fmt, max(emin, rng.choice((lo_half, lo_half + 1,
+                                                     lo_half - 1, lo_half + 2,
+                                                     lo_half - 2))),
+                          rf() if rng.random() < 0.7 else 0, sg())
+
+    def sub():
+        r = rng.random()
+        if r < 0.15:
+            return r37_sub(fmt, 1, sg())                      # minSub
+        if r < 0.3:
+            return r37_sub(fmt, (1 << fbits) - 1, sg())       # maxSub
+        t = rng.randrange(0, fbits)
+        return r37_sub(fmt, (1 << t) | (rng.randrange(1 << t) if t else 0), sg())
+
+    def tiny():                              # normals just above the subnormals
+        return r37_normal(fmt, emin + rng.randrange(0, 3), rf(), sg())
+
+    def norm():
+        e = rng.randrange(-4, 5)
+        return r37_normal(fmt, e, rf() if rng.random() < 0.6 else 0, sg())
+
+    return {"zero": zero, "inf": inf, "nan": nan, "max": mx, "hi": hi,
+            "lo": lo, "sub": sub, "tiny": tiny, "norm": norm}
+
+
+#: Class weights per style.  special: NaN / Inf / zero heavy (but a NaN stays
+#: rare enough that most cells survive to show later k); arith: finite
+#: extremes; sub: subnormals and the underflow edge; hi: the overflow edge.
+R37_WEIGHTS = {
+    "special": {"nan": .035, "inf": .10, "zero": .12, "max": .08, "hi": .13,
+                "lo": .13, "sub": .12, "tiny": .05, "norm": .165},
+    "arith":   {"inf": .015, "zero": .06, "max": .11, "hi": .20, "lo": .20,
+                "sub": .15, "tiny": .06, "norm": .205},
+    "sub":     {"inf": .01, "zero": .04, "max": .03, "hi": .04, "lo": .28,
+                "sub": .35, "tiny": .10, "norm": .17},
+    "hi":      {"zero": .03, "max": .30, "hi": .30, "lo": .03, "sub": .02,
+                "norm": .32},
+}
+
+
+def r37_draw(fmt: FpFormat, style: str, rng: random.Random, classes=None):
+    classes = classes or r37_classes(fmt, rng)
+    w = R37_WEIGHTS[style]
+    names = sorted(w)
+    cls = rng.choices(names, weights=[w[n] for n in names])[0]
+    return classes[cls]()
+
+
+def r37_c_draw(fmt: FpFormat, style: str, rng: random.Random, classes):
+    """Accumulator start values: edges of the format plus ordinary values."""
+    r = rng.random()
+    fbits = fmt.prec - 1
+    sgn = rng.randrange(2) << (fmt.width - 1)
+    if r < 0.15:
+        return rng.choice((0, 1 << (fmt.width - 1)))
+    if r < 0.30:
+        return fpf_max_finite(fmt) ^ sgn
+    if r < 0.40:
+        return r37_sub(fmt, 1, sgn >> (fmt.width - 1))
+    if r < 0.48 and style == "special":
+        return rng.choice((r37_inf(fmt, rng.randrange(2)),
+                           r37_nan(fmt, "q0"), r37_nan(fmt, "s0", 1)))
+    if r < 0.62 and style == "hi":
+        return r37_normal(fmt, fmt.bias - rng.randrange(0, 3),
+                          rng.randrange(1 << fbits), sgn >> (fmt.width - 1))
+    return classes[rng.choice(("norm", "sub", "lo", "hi", "tiny"))]()
+
+
+# ---- reference trace --------------------------------------------------------
+
+def _r37_sig_nan(bits: int, fmt: FpFormat) -> bool:
+    return fpf_is_nan(bits, fmt) and not (bits >> (fmt.prec - 2)) & 1
+
+
+def r37_w1_trace(geom, a, b, c, fmt_a, fmt_b, fmt_c, frm: int):
+    """``(tile, events)``: Sail fp_gemm at W = 1 / G = 1 / psm = 0 / rnd = frm
+    (the same loop as mxf_reference_gemm, written out again so that every
+    rounding point can report what it saw).  ``tile`` must equal
+    mxf_reference_gemm's (r37_selfcheck asserts it)."""
+    fmt = fmt_c
+    msv = _pow2(1 - fmt.bias - (fmt.prec - 1))          # smallest subnormal
+    maxf = _ieee_val(fpf_max_finite(fmt), fmt)[2]
+    ev = set()
+    rnd = lambda v: _ieee_round(v, fmt, rounder=_frm_rounder(frm))
+    out = [[c[i][j] for j in range(geom.n_max)] for i in range(geom.m)]
+    sbit = 1 << (fmt.width - 1)
+    for j in range(geom.n):
+        for i in range(geom.m):
+            acc = c[i][j]
+            for k in range(geom.k_eff):
+                xa, xb = a[i][k], b[j][k]
+                for bits, f in ((xa, fmt_a), (xb, fmt_b)):
+                    if fpf_is_nan(bits, f):
+                        ev.add("snan_in" if _r37_sig_nan(bits, f) else "qnan_in")
+                    elif fpf_is_inf(bits, f):
+                        ev.add("inf_in")
+                p = _ieee_mul(xa, fmt_a, xb, fmt_b)
+                if p[0] == "nan" and not (fpf_is_nan(xa, fmt_a) or
+                                          fpf_is_nan(xb, fmt_b)):
+                    ev.add("inf_x_zero")
+                if p[0] == "inf":
+                    ev.add("prod_inf")
+                if p[0] == "num" and p[2] != 0:
+                    sub = lambda bits, f: (
+                        (bits & ((1 << (f.prec - 1)) - 1)) != 0
+                        and ((bits >> (f.prec - 1)) & f.emax) == 0)
+                    if sub(xa, fmt_a) and sub(xb, fmt_b):
+                        ev.add("sub_x_sub")
+                    mag = p[2]
+                    sb = rnd(p)
+                    kind = _ieee_val(sb, fmt)
+                    if mag > maxf:
+                        ev.add("prod_ovf_inf" if kind[0] == "inf"
+                               else "prod_ovf_max")
+                    if mag < msv:
+                        if kind[0] == "num" and kind[2] == 0:
+                            ev.add("uf_zero")
+                        else:
+                            ev.add("uf_minsub")
+                    if mag == msv / 2:
+                        ev.add("tie_half_minsub")
+                    if kind[0] == "num" and 0 < kind[2] < _pow2(1 - fmt.bias):
+                        ev.add("prod_sub_result")
+                s_val = _ieee_val(rnd(p), fmt)
+                av = _ieee_val(acc, fmt)
+                if av[0] == "inf" and s_val[0] == "inf" and av[1] != s_val[1]:
+                    ev.add("inf_minus_inf")
+                if av[0] == "num" and s_val[0] == "num":
+                    tot = (-av[2] if av[1] else av[2]) + \
+                          (-s_val[2] if s_val[1] else s_val[2])
+                    if av[2] == 0 and s_val[2] == 0:
+                        ev.add({(0, 0): "zz_pp", (1, 1): "zz_nn"}.get(
+                            (av[1], s_val[1]), "zz_pn"))
+                    elif tot == 0:
+                        ev.add("cancel_zero")
+                    elif abs(tot) > maxf:
+                        sb2 = rnd(("num", 1 if tot < 0 else 0, abs(tot)))
+                        ev.add("sum_ovf_inf" if _ieee_val(sb2, fmt)[0] == "inf"
+                               else "sum_ovf_max")
+                    elif abs(tot) >= _pow2(fmt.bias):
+                        ev.add("sum_near_ovf")
+                new = rnd(_ieee_add(av, s_val, frm))
+                if (av[0] == "num" and s_val[0] == "num" and av[2] != 0
+                        and s_val[2] != 0 and
+                        (-av[2] if av[1] else av[2]) +
+                        (-s_val[2] if s_val[1] else s_val[2]) == 0):
+                    ev.add("cancel_negzero" if new & sbit else "cancel_poszero")
+                acc = new
+            out[i][j] = acc
+    return out, ev
+
+
+#: Planted events per style, in priority order (a tile with few (row, col, k)
+#: slots plants a prefix).  Each is placed by r37_w1_case at a slot of its own
+#: (no two plants share a row or a column at the same k), so the trace of the
+#: reference always shows it -- no luck involved -- and the random fill
+#: around it supplies the rest.
+R37_PLANTS = {
+    "special": ("inf_minus_inf", "inf_x_zero", "ovf_pos", "ovf_neg",
+                "subsub_pos", "subsub_neg", "cancel", "zz_pp", "zz_nn",
+                "zz_pn", "snan", "qnan", "tie_half", "sub_result"),
+    "arith": ("ovf_pos", "ovf_neg", "subsub_pos", "subsub_neg", "cancel",
+              "tie_half", "sub_result", "zz_pn"),
+    "sub": ("subsub_pos", "subsub_neg", "tie_half", "sub_result", "cancel"),
+    "hi": ("sumovf_pos", "sumovf_neg", "near_ovf", "ovf_pos", "ovf_neg",
+           "cancel"),
+}
+
+
+R37_ACC_PLANTS = ("cancel", "zz_pp", "zz_nn", "zz_pn", "sumovf_pos",
+                  "sumovf_neg", "near_ovf")
+
+
+def r37_plant_events(plant: str, frm: int):
+    """Trace events a planted construct guarantees at *frm*."""
+    ovf_pos_inf = frm in (0, 3, 4)
+    ovf_neg_inf = frm in (0, 2, 4)
+    return {
+        "inf_minus_inf": {"inf_minus_inf", "inf_in", "prod_inf"},
+        "inf_x_zero": {"inf_x_zero", "inf_in"},
+        "ovf_pos": {"prod_ovf_inf" if ovf_pos_inf else "prod_ovf_max"},
+        "ovf_neg": {"prod_ovf_inf" if ovf_neg_inf else "prod_ovf_max"},
+        "subsub_pos": {"sub_x_sub", "uf_minsub" if frm == 3 else "uf_zero"},
+        "subsub_neg": {"sub_x_sub", "uf_minsub" if frm == 2 else "uf_zero"},
+        "cancel": {"cancel_zero",
+                   "cancel_negzero" if frm == 2 else "cancel_poszero"},
+        "zz_pp": {"zz_pp"}, "zz_nn": {"zz_nn"}, "zz_pn": {"zz_pn"},
+        "snan": {"snan_in"}, "qnan": {"qnan_in"},
+        "tie_half": {"tie_half_minsub"},
+        "sub_result": {"prod_sub_result"},
+        "sumovf_pos": {"sum_ovf_inf" if ovf_pos_inf else "sum_ovf_max"},
+        "sumovf_neg": {"sum_ovf_inf" if ovf_neg_inf else "sum_ovf_max"},
+        "near_ovf": {"sum_near_ovf"},
+    }[plant]
+
+
+def _r37_slots(geom):
+    """Plant slots (k, i, j): distinct rows and columns within one k."""
+    m, n, kk = geom.m, geom.n, geom.k_eff
+    out = []
+    for k in range(kk):
+        for t in range(min(m, n)):
+            out.append((k, t % m, (t + k) % n))
+    return out
+
+
+def r37_plant_list(style: str, geom):
+    """The plants a geometry has capacity for (prefix of the priority list)."""
+    slots = len(_r37_slots(geom))
+    plants = [p for p in R37_PLANTS[style]
+              if not (p == "inf_minus_inf" and geom.k_eff < 2)]
+    # inf_minus_inf occupies a row, a column and two k; cap the rest
+    plants = plants[:max(1, slots - 1)]
+    # acc-state plants (they need the accumulator to still hold C) all sit at
+    # k = 0 in distinct rows / columns: at most min(M, N) of them
+    out, acc = [], 0
+    for p in plants:
+        if p in R37_ACC_PLANTS:
+            if acc >= min(geom.m, geom.n):
+                continue
+            acc += 1
+        out.append(p)
+    return out
+
+
+def r37_required(style: str, frm: int, geom):
+    req = set()
+    for p in r37_plant_list(style, geom):
+        req |= r37_plant_events(p, frm)
+    return req
+
+
+class _R37Retry(Exception):
+    pass
+
+
+def _r37_exps_for(total, fx, fy):
+    """(ex, ey) with ex + ey = total inside both formats' normal exponent
+    ranges where possible (clamped otherwise)."""
+    lo_x, hi_x = 1 - fx.bias, fx.bias
+    lo_y, hi_y = 1 - fy.bias, fy.bias
+    ex = max(lo_x, min(hi_x, total // 2))
+    ey = max(lo_y, min(hi_y, total - ex))
+    ex = max(lo_x, min(hi_x, total - ey))
+    return ex, ey
+
+
+def _r37_plant_one(plant, a, b, c, i, j, k, row, frm, rng):
+    fa, fb, fc = row
+    sgn = lambda f: 1 << (f.width - 1)
+    rn = lambda v: _ieee_round(v, fc, rounder=_frm_rounder(frm))
+    msub_c = 1 - fc.bias - (fc.prec - 1)
+    fr = lambda f: rng.randrange(1 << (f.prec - 1))
+    if plant == "inf_x_zero":
+        if rng.random() < 0.5:
+            a[i][k], b[j][k] = (r37_inf(fa, rng.randrange(2)),
+                                r37_sub(fb, 0, rng.randrange(2)))
+        else:
+            a[i][k], b[j][k] = (r37_sub(fa, 0, rng.randrange(2)),
+                                r37_inf(fb, rng.randrange(2)))
+    elif plant in ("ovf_pos", "ovf_neg", "sumovf_pos", "sumovf_neg"):
+        neg = 1 if plant.endswith("neg") else 0
+        tot = (fc.bias + 1 + rng.randrange(0, 2) if plant.startswith("ovf")
+               else fc.bias - 1)
+        ex, ey = _r37_exps_for(tot, fa, fb)
+        a[i][k] = r37_normal(fa, ex, fr(fa), neg)
+        b[j][k] = r37_normal(fb, ey, fr(fb), 0)
+        if plant.startswith("sumovf"):
+            c[i][j] = fpf_max_finite(fc) | (sgn(fc) if neg else 0)
+    elif plant in ("subsub_pos", "subsub_neg"):
+        neg = 1 if plant.endswith("neg") else 0
+        a[i][k] = r37_sub(fa, rng.randrange(1, 1 << (fa.prec - 1)), neg)
+        b[j][k] = r37_sub(fb, rng.randrange(1, 1 << (fb.prec - 1)), 0)
+    elif plant == "tie_half":
+        ex, ey = _r37_exps_for(msub_c - 1, fa, fb)
+        a[i][k] = r37_pow2_elem(fa, ex, 0)
+        b[j][k] = r37_pow2_elem(fb, ey, rng.randrange(2))
+    elif plant == "sub_result":
+        ex, ey = _r37_exps_for(1 - fc.bias - 3, fa, fb)
+        a[i][k] = r37_normal(fa, ex, rng.randrange(1, 1 << (fa.prec - 1)), 0)
+        b[j][k] = r37_normal(fb, ey, rng.randrange(1, 1 << (fb.prec - 1)),
+                             rng.randrange(2))
+    elif plant == "cancel":
+        a[i][k] = r37_normal(fa, rng.randrange(-3, 4), fr(fa), rng.randrange(2))
+        b[j][k] = r37_normal(fb, rng.randrange(-3, 4), fr(fb), rng.randrange(2))
+        c[i][j] = rn(_ieee_mul(a[i][k], fa, b[j][k], fb)) ^ sgn(fc)
+    elif plant in ("zz_pp", "zz_nn", "zz_pn"):
+        a[i][k] = r37_sub(fa, 0, 0 if plant == "zz_pp" else 1)
+        b[j][k] = r37_normal(fb, rng.randrange(-3, 4), 0, 0)
+        c[i][j] = sgn(fc) if plant == "zz_nn" else 0
+    elif plant == "snan":
+        a[i][k] = r37_nan(fa, rng.choice(("s0", "s1")), rng.randrange(2))
+    elif plant == "qnan":
+        b[j][k] = r37_nan(fb, rng.choice(("q0", "q1")), rng.randrange(2))
+    elif plant == "near_ovf":
+        ex, ey = _r37_exps_for(0, fa, fb)
+        a[i][k] = r37_normal(fa, ex, 0, 0)
+        b[j][k] = r37_normal(fb, ey, 0, 0)
+        c[i][j] = r37_normal(fc, fc.bias, 0, 0)
+    else:
+        raise ValueError(plant)
+
+
+def _r37_w1_attempt(geom, row, frm, style, rng, classes):
+    fa, fb, fc = row
+    ca, cb, cc = classes
+    kk = geom.k_eff
+    a = [[r37_draw(fa, style, rng, ca) for _k in range(kk)]
+         for _i in range(geom.m)]
+    b = [[r37_draw(fb, style, rng, cb) for _k in range(kk)]
+         for _j in range(geom.n)]
+    c = [[r37_c_draw(fc, style, rng, cc) for _j in range(geom.n_max)]
+         for _i in range(geom.m)]
+    plants = sorted(r37_plant_list(style, geom),
+                    key=lambda p: 0 if p in R37_ACC_PLANTS else 1)
+    used_rows, used_cols = set(), set()          # (k, idx)
+    claimed = set()                              # cells whose C is planted
+    for plant in plants:
+        if plant == "inf_minus_inf":
+            # one (i, j) cell, last two k: +Inf, +Inf against +x, -x
+            k1 = kk - 2
+            fr_ = [x for x in range(geom.m) if (k1, x) not in used_rows]
+            fc_ = [x for x in range(geom.n) if (k1, x) not in used_cols]
+            pick = [(x, y) for x in fr_ for y in fc_ if (x, y) not in claimed]
+            if not pick:
+                continue
+            i, j = pick[0]
+            claimed.add((i, j))
+            a[i][k1] = a[i][k1 + 1] = r37_inf(fa, 0)
+            b[j][k1] = r37_normal(fb, 0, 0, 0)
+            b[j][k1 + 1] = r37_normal(fb, 0, 0, 1)
+            c[i][j] = rng.choice((0, 1 << (fc.width - 1)))
+            used_rows |= {(k1, i), (k1 + 1, i)}
+            used_cols |= {(k1, j), (k1 + 1, j)}
+            continue
+        want = 0 if plant in R37_ACC_PLANTS else (
+            kk - 1 if plant in ("snan", "qnan", "inf_x_zero") else None)
+        ks = sorted(range(kk), key=lambda x: (0 if x == want else 1, x))
+        if plant in R37_ACC_PLANTS:
+            ks = [0]
+        found = None
+        for k in ks:
+            fr_ = [x for x in range(geom.m) if (k, x) not in used_rows]
+            fc_ = [x for x in range(geom.n) if (k, x) not in used_cols]
+            if fr_ and fc_:
+                rot = len(used_rows) + len(used_cols)
+                found = (k, fr_[rot % len(fr_)], fc_[(rot // 2) % len(fc_)])
+                break
+        if found is None:
+            continue
+        k, i, j = found
+        used_rows.add((k, i))
+        used_cols.add((k, j))
+        if plant in R37_ACC_PLANTS:
+            claimed.add((i, j))
+        _r37_plant_one(plant, a, b, c, i, j, k, row, frm, rng)
+    tile, ev = r37_w1_trace(geom, a, b, c, fa, fb, fc, frm)
+    need = r37_required(style, frm, geom)
+    if not need <= ev:
+        raise _R37Retry(f"r37_w1_case({style}, frm={frm}, {fc.name}, "
+                        f"{geom.m}x{geom.n}x{kk}): missing "
+                        f"{sorted(need - ev)}")
+    return a, b, c
+
+
+def r37_w1_case(geom, row, frm: int, style: str, rng: random.Random):
+    """``(a, b, c)`` (bit patterns) for a W = 1 cell program at *frm*: random
+    fill from the style's class weights, then the style's planted constructs
+    (R37_PLANTS), each in a slot of its own (distinct rows / columns per k;
+    constructs that need the accumulator to still hold C sit at k = 0), and
+    the reference trace is asserted to show every event r37_required lists.
+    The expected tile is NOT derived here (r37_w1_golden = Sail)."""
+    fa, fb, fc = row
+    classes = tuple(r37_classes(f, rng) for f in (fa, fb, fc))
+    err = None
+    for _attempt in range(30):
+        try:
+            return _r37_w1_attempt(geom, row, frm, style, rng, classes)
+        except _R37Retry as exc:
+            err = exc
+    raise AssertionError(str(err))
+
+
+def r37_w1_golden(geom, a, b, c, row, frm: int):
+    fa, fb, fc = row
+    return mxf_reference_gemm(geom, a, b, c, fa, fb, fc, frm=frm)
+
+
+def check_r37_trace_matches_reference() -> None:
+    """The trace loop equals mxf_reference_gemm on random data and shows the
+    events it claims (both directions of the Inf x 0 / Inf - Inf tests)."""
+    from dataclasses import replace as _replace
+    rng = random.Random(3737)
+    geoms = []
+    for sew in (16, 32, 64):
+        gs = (list(fpn_legal_configs(256, full_vl_only=True)) if sew == 16
+              else list(ime_legal_configs(256, sews=[sew], lmuls=(1, 2, 4, 8),
+                                          full_vl_only=True, ws=(1,),
+                                          tloads=("op",), kinds=("fp",),
+                                          checks=("pair",))))
+        geoms.append(max((g for g in gs if g.sew == sew),
+                         key=lambda g: g.m * g.k_eff))
+    for geom in geoms:
+        if geom.sew == 16:
+            row = fpw_rows(1, 16)[(0, 0, 0)]
+        else:
+            f = fp_format("binary%d" % geom.sew)
+            row = (f, f, f)
+        for style in ("special", "arith", "sub", "hi"):
+            for frm in R37_MODES:
+                a, b, c = r37_w1_case(geom, row, frm, style, rng)
+                tile, ev = r37_w1_trace(geom, a, b, c, *row, frm)
+                assert tile == r37_w1_golden(geom, a, b, c, row, frm), \
+                    (geom.describe(), style, frm)
+                assert r37_required(style, frm, geom) <= ev
+    # Inf x 0 is NaN, Inf - Inf across k is NaN, a canonical default NaN:
+    f32 = fp_format("binary32")
+    g = geoms[1]
+    z = [[0] * g.k_eff for _ in range(g.m)]
+    a = [[0x7F800000] + [0] * (g.k_eff - 1) for _ in range(g.m)]       # +Inf
+    b = [[0] + [0] * (g.k_eff - 1) for _ in range(g.n)]                # +0
+    c = [[0x3F800000] * g.n_max for _ in range(g.m)]
+    out = mxf_reference_gemm(g, a, b, c, f32, f32, f32, frm=3)
+    assert out[0][0] == 0x7FC00000
+    a = [[0x7F800000, 0x7F800000] + [0] * (g.k_eff - 2) for _ in range(g.m)]
+    b = [[0x3F800000, 0xBF800000] + [0] * (g.k_eff - 2) for _ in range(g.n)]
+    out = mxf_reference_gemm(g, a, b, c, f32, f32, f32, frm=1)
+    assert out[0][0] == 0x7FC00000
+    # exact cancellation: sign of the zero (RDN: -0, others +0)
+    a = [[0x40000000] + [0] * (g.k_eff - 1) for _ in range(g.m)]       # 2
+    b = [[0x3F800000] + [0] * (g.k_eff - 1) for _ in range(g.n)]       # 1
+    c = [[0xC0000000] * g.n_max for _ in range(g.m)]                   # -2
+    for frm in R37_MODES:
+        out = mxf_reference_gemm(g, a, b, c, f32, f32, f32, frm=frm)
+        # later k are +0 x +0 = +0 products: -0 + +0 -> -0 only under RDN
+        assert out[0][0] & 0x80000000 == (0x80000000 if frm == 2 else 0)
+    # overflow: 2^100 * 2^100 = Inf (RNE/RUP/RMM), maxFinite (RTZ/RDN)
+    a = [[0x71000000] + [0] * (g.k_eff - 1) for _ in range(g.m)]       # 2^98
+    b = [[0x71000000] + [0] * (g.k_eff - 1) for _ in range(g.n)]
+    c = [[0] * g.n_max for _ in range(g.m)]
+    want = {0: 0x7F800000, 1: 0x7F7FFFFF, 2: 0x7F7FFFFF, 3: 0x7F800000,
+            4: 0x7F800000}
+    for frm in R37_MODES:
+        out = mxf_reference_gemm(g, a, b, c, f32, f32, f32, frm=frm)
+        assert out[0][0] == want[frm], (frm, hex(out[0][0]))
+
+
+# ---- item 3: widening-FP group sums with the leading one in every 64-bit
+# block, sticky bits below the window, round-to-even ties ----------------------
+#
+# The r37 widening-FP FU adds the W exact products of a group into a 560-bit
+# two's-complement accumulator whose LSB weighs 2^-298 (FPW_OFF), then
+# normalises |S| in 64-bit blocks: X2 = |S| * 2^80 is ten blocks, the leading
+# block b = (pos(X2))//64 (1..9), the window is the 128 bits Cat(block b,
+# block b-1), the top 64 bits after the shift by f = LZC(block b) feed the
+# rounder and the sticky is  stkF = OR(window bits below the top 64) |
+# stkC = OR(every block below the window).  This is only a model of the FU's
+# *structure*, used to steer the operands to where that structure has to be
+# right; the expected values never come from it (they come from
+# mxf_reference_gemm, the Sail).
+
+FPW_OFF_MODEL = 298
+
+
+def r37_pow2_elem(fmt: FpFormat, e: int, neg: int = 0) -> int:
+    """+-2^e as an element of *fmt* (clamped to its smallest subnormal /
+    largest binade)."""
+    emin = 1 - fmt.bias
+    msub = emin - (fmt.prec - 1)
+    e = max(msub, min(fmt.bias, e))
+    if e >= emin:
+        return r37_normal(fmt, e, 0, neg)
+    return r37_sub(fmt, 1 << (e - msub), neg)
+
+
+def r37_rand_elem(fmt: FpFormat, e: int, rng: random.Random, neg=None) -> int:
+    """A random-mantissa element with leading exponent about *e*."""
+    emin = 1 - fmt.bias
+    msub = emin - (fmt.prec - 1)
+    e = max(msub, min(fmt.bias, e))
+    neg = rng.randrange(2) if neg is None else neg
+    if e >= emin:
+        return r37_normal(fmt, e, rng.randrange(1 << (fmt.prec - 1)), neg)
+    # subnormal with its leading one at e
+    t = e - msub
+    return r37_sub(fmt, (1 << t) | (rng.randrange(1 << t) if t else 0), neg)
+
+
+def r37_fpw_group_stats(prods):
+    """(block, f, stkF, stkC, tie) of one group's exact sum, or None for 0.
+    ``prods`` = exact products as ("num", sign, Fraction); ``tie`` is filled
+    in by the caller (needs fmt_C)."""
+    tot = Fraction(0)
+    for _n, s, m in prods:
+        tot += -m if s else m
+    scaled = tot * _pow2(FPW_OFF_MODEL)
+    assert scaled.denominator == 1, "product below the accumulator LSB"
+    s_int = abs(int(scaled))
+    if s_int == 0:
+        return None
+    x = s_int << 80
+    pos = x.bit_length() - 1
+    blk, f = pos // 64, 63 - pos % 64
+    stk_f = ((x >> (64 * (blk - 1))) & ((1 << (64 - f)) - 1)) != 0
+    stk_c = (x & ((1 << (64 * (blk - 1))) - 1)) != 0
+    return blk, f, bool(stk_f), bool(stk_c), s_int
+
+
+def _r37_tie_kind(s_int: int, fmt_c: FpFormat):
+    """None, or "even"/"odd" (exact tie, q parity) / "stk" (the 64-bit window
+    alone is an exact tie of fmt_C but bits below it are set: above the tie)."""
+    def tie(v: int):
+        val = Fraction(v, 1 << FPW_OFF_MODEL)
+        e = max(_floor_log2(val), 1 - fmt_c.bias)
+        sc = val / _pow2(e - (fmt_c.prec - 1))
+        q, r = divmod(sc.numerator, sc.denominator)
+        if 2 * r == sc.denominator:
+            return "odd" if q & 1 else "even"
+        return None
+    shift = max(0, s_int.bit_length() - 64)
+    win = (s_int >> shift) << shift
+    t_full = tie(s_int)
+    if t_full:
+        return t_full
+    if win != s_int and tie(win):
+        return "stk"
+    return None
+
+
+def r37_fpw_coverage(geom, row, a, b):
+    """The set of structure items the program's group sums reach:
+    ("lead", blk), ("f", blk), ("c", blk), ("tie", kind), ("cancel", blk)
+    (cancel: some product of the group was >= 2^64 above the sum)."""
+    fa, fb, fc = row
+    items = set()
+    w = geom.w
+    for i in range(geom.m):
+        for j in range(geom.n):
+            for g in range(geom.k_eff // w):
+                prods = [_ieee_mul(a[i][k], fa, b[j][k], fb)
+                         for k in range(g * w, (g + 1) * w)]
+                if any(p[0] != "num" for p in prods):
+                    continue
+                st = r37_fpw_group_stats(prods)
+                if st is None:
+                    nz = any(p[2] != 0 for p in prods)
+                    signs = {p[1] for p in prods}
+                    items.add(("zero", "cancel" if nz else
+                               "pp" if signs == {0} else
+                               "nn" if signs == {1} else "mixed"))
+                    continue
+                blk, _f, sf, sc, s_int = st
+                items.add(("lead", blk))
+                if sf:
+                    items.add(("f", blk))
+                if sc:
+                    items.add(("c", blk))
+                tk = _r37_tie_kind(s_int, fc)
+                if tk:
+                    items.add(("tie", tk))
+                big = max(int(m * _pow2(FPW_OFF_MODEL)) for _n, _s, m in prods)
+                if big.bit_length() > s_int.bit_length() + 64:
+                    items.add(("cancel", blk))
+    return items
+
+
+def r37_fpw_reachable_blocks(row):
+    """Lead blocks a group sum of this row can reach (product exponents)."""
+    fa, fb, _fc = row
+    lo = (1 - fa.bias - (fa.prec - 1)) + (1 - fb.bias - (fb.prec - 1))
+    hi = fa.bias + fb.bias + 1
+    return {(p + 80) // 64
+            for p in range(lo + FPW_OFF_MODEL, hi + FPW_OFF_MODEL + 1)}
+
+
+def _r37_cls_exp(fmt: FpFormat, cls: int, rng: random.Random) -> int:
+    emin = 1 - fmt.bias
+    mn, mx = emin - (fmt.prec - 1), fmt.bias
+    span = mx - mn
+    if cls == 0:
+        return rng.randint(mn, mn + span // 5)
+    if cls == 1:
+        mid = (mn + mx) // 2
+        return rng.randint(mid - 10, mid + 10)
+    return rng.randint(mx - span // 5, mx)
+
+
+def _r37_fpw_build(geom, row, rng, variant: str):
+    fa, fb, fc = row
+    w, groups = geom.w, geom.k_eff // geom.w
+    flip = 1 << (fb.width - 1)
+    a = [[0] * geom.k_eff for _ in range(geom.m)]
+    b = [[0] * geom.k_eff for _ in range(geom.n_max)]
+    pc = fc.prec
+    ua = (0, 25, 45, 60)
+    vb = (30, 40, 70, 100)
+    for g in range(groups):
+        k0 = g * w
+        if variant == "zero":
+            # exactly-zero group sums: A row class i % 4 = alternating +-x
+            # (x*y - x*y: mixed-sign exact cancellation) / all +0 / all -0 /
+            # alternating +0 -0; B column j: +y (even j) or -y (odd j) for
+            # every k, so the products' zero signs cover both patterns.
+            for i in range(geom.m):
+                x = r37_rand_elem(fa, rng.randint(-8, 8), rng, 0)
+                for t in range(w):
+                    cls = i % 4
+                    a[i][k0 + t] = (x ^ ((t & 1) << (fa.width - 1)) if cls == 0
+                                    else r37_sub(fa, 0, 0) if cls == 1
+                                    else r37_sub(fa, 0, 1) if cls == 2
+                                    else r37_sub(fa, 0, t & 1))
+            for j in range(geom.n):
+                y = r37_rand_elem(fb, rng.randint(-8, 8), rng, j & 1)
+                for t in range(w):
+                    b[j][k0 + t] = y
+            continue
+        rho = [_r37_cls_exp(fa, (i + g) % 3, rng) for i in range(geom.m)]
+        sig = [_r37_cls_exp(fb, (2 * j + g) % 3, rng) for j in range(geom.n)]
+        for i in range(geom.m):
+            for j in range(geom.n):
+                pass
+        for i in range(geom.m):
+            if variant == "cancel":
+                ex = min(fa.bias, rho[i] + rng.randint(10, 60))
+                if w == 4:
+                    a[i][k0:k0 + 4] = [
+                        r37_rand_elem(fa, ex, rng, 0), 0, 0, 0]
+                    a[i][k0 + 1] = a[i][k0]
+                    a[i][k0 + 2] = r37_rand_elem(fa, rho[i], rng)
+                    a[i][k0 + 3] = r37_rand_elem(fa, rho[i] - ua[(i + g) % 4]
+                                                 - 20, rng)
+                else:                                        # w == 2
+                    if g % 2 == 0:
+                        x = r37_rand_elem(fa, ex, rng, 0)
+                        a[i][k0:k0 + 2] = [x, x]
+                    else:
+                        a[i][k0:k0 + 2] = [
+                            r37_rand_elem(fa, rho[i], rng),
+                            r37_rand_elem(fa, rho[i] - ua[(i + g) % 4] - 30,
+                                          rng)]
+            else:                                            # tie
+                q0s = (1, 0, 1, 0)[i % 4]
+                tau = (0, 0, 1, 1)[i % 4]
+                if w == 4:
+                    a[i][k0:k0 + 4] = [
+                        r37_pow2_elem(fa, rho[i]),
+                        r37_pow2_elem(fa, rho[i], 0) if q0s else
+                        r37_sub(fa, 0),
+                        r37_pow2_elem(fa, rho[i]),
+                        r37_pow2_elem(fa, rho[i], tau)]
+                else:
+                    a[i][k0:k0 + 2] = [
+                        r37_pow2_elem(fa, rho[i]),
+                        r37_pow2_elem(fa, rho[i], tau)]
+        for j in range(geom.n):
+            if variant == "cancel":
+                ey = min(fb.bias, sig[j] + rng.randint(10, 60))
+                if w == 4:
+                    y = r37_rand_elem(fb, ey, rng, 0)
+                    b[j][k0:k0 + 4] = [
+                        y, y ^ flip,
+                        r37_rand_elem(fb, sig[j], rng),
+                        r37_rand_elem(fb, sig[j] - vb[(2 * j + g) % 4] - 20,
+                                      rng)]
+                else:
+                    if g % 2 == 0:
+                        y = r37_rand_elem(fb, ey, rng, 0)
+                        y2 = y ^ 1                 # one ulp apart: residual
+                        b[j][k0:k0 + 2] = [y, y2 ^ flip]
+                    else:
+                        b[j][k0:k0 + 2] = [
+                            r37_rand_elem(fb, sig[j], rng),
+                            r37_rand_elem(fb, sig[j] - vb[(2 * j + g) % 4]
+                                          - 30, rng)]
+            else:
+                if w == 4:
+                    d = (64, 70, 140, 200)[(j + g) % 4]
+                    b[j][k0:k0 + 4] = [
+                        r37_pow2_elem(fb, sig[j]),
+                        r37_pow2_elem(fb, sig[j] - (pc - 1)),
+                        r37_pow2_elem(fb, sig[j] - pc),
+                        r37_sub(fb, 0) if (j + g) % 4 == 3 and j > 0 else
+                        r37_pow2_elem(fb, sig[j] - d)]
+                else:
+                    if g % 2 == 0:
+                        b[j][k0:k0 + 2] = [r37_pow2_elem(fb, sig[j]),
+                                           r37_pow2_elem(fb, sig[j] - pc)]
+                    else:
+                        d = (64, 70, 140, 200)[(j + g) % 4]
+                        b[j][k0:k0 + 2] = [r37_pow2_elem(fb, sig[j]),
+                                           r37_pow2_elem(fb, sig[j] - d)]
+    c = [[rng.choice((0, 1 << (fc.width - 1))) for _ in range(geom.n_max)]
+         for _ in range(geom.m)]
+    if variant == "zero":
+        c = [[(i + j) % 2 * (1 << (fc.width - 1)) for j in range(geom.n_max)]
+             for i in range(geom.m)]
+    return a, b[:geom.n_max], c
+
+
+def r37_fpw_case(geom, row, variant: str, rng: random.Random, tries: int = 40):
+    """Best-of-*tries* operands for a W >= 2 IEEE-input row: ``cancel`` (an
+    exactly cancelling pair of large products plus a residual and a far
+    smaller sticky term, W = 4; W = 2 alternates a one-ulp difference with a
+    widely separated sum) or ``tie`` (a power-of-two leading term plus exact
+    half-ulp-of-fmt_C and sticky terms at depths 64 / 70 / 140 / 200 (one column class has none: an exact tie) bits
+    below it, optional odd LSB term, both sticky signs)."""
+    best, best_score = None, -1
+    for _ in range(tries):
+        a, b, c = _r37_fpw_build(geom, row, rng, variant)
+        items = r37_fpw_coverage(geom, row, a, b)
+        score = (len({i for i in items if i[0] == "lead"}) * 10
+                 + len({i for i in items if i[0] in ("f", "c")}) * 3
+                 + len({i for i in items if i[0] in ("tie", "cancel")}))
+        if score > best_score:
+            best, best_score = (a, b, c), score
+    return best
+
+
+# ---- item 4: MX scale bytes at the binary16 edges ------------------------------
+
+#: 0 = 2^-127 (a binary16 underflow), 1 = 2^-126, 142 = 2^15 (binary16 max
+#: binade, exact), 143 = 2^16 (rounds to Inf / maxFinite in binary16), 254 =
+#: 2^127, 126 / 127 / 128 around unity.  255 is the E8M0 NaN, planted sparsely.
+R37_EDGE_BYTES = (0, 1, 142, 143, 254, 126, 127, 128, 142, 143, 1, 0)
+
+
+def r37_edge_scale_pick(rng: random.Random, off: int, keep_unit=False):
+    def pick(side, m, s):
+        if keep_unit and ((side == "a" and m % 4 == 1) or
+                          (side == "b" and m % 4 == 2)):
+            return MX_E8M0_BIAS
+        if side == "a" and (m + 3 * s + off) % 7 == 6:
+            return MX_E8M0_NAN
+        if side == "b" and (m + s + off) % 11 == 10:
+            return MX_E8M0_NAN
+        return rng.choice(R37_EDGE_BYTES)
+    return pick
+
+
+def r37_mxf_edge_case(geom, row, bs: int, rng: random.Random, off: int = 0):
+    a, b, c = fpw_case(geom, row, rng)
+    pc = fpw_operand_pool(row[2], rng, 12)
+    pc += [fpf_max_finite(row[2]), fpf_max_finite(row[2]) |
+           (1 << (row[2].width - 1)), fpf_min_subnormal(row[2])]
+    c = [[rng.choice(pc) for _j in range(geom.n_max)] for _i in range(geom.m)]
+    sa, sb = mxf_scale_arrays(geom, bs, r37_edge_scale_pick(rng, off))
+    return a, b, c, sa, sb
+
+
+def r37_mxi_edge_case(geom, altfmt: int, bs: int, rng: random.Random,
+                      off: int = 0):
+    a, b, c, _sa, _sb = mxi_frm_case(geom, altfmt, bs, rng)
+    sa, sb = mxf_scale_arrays(geom, bs, r37_edge_scale_pick(rng, off, True))
+    return a, b, c, sa, sb
+
+
+# ---- item 5: integer pools -------------------------------------------------------
+
+def r37_int_pool(eew: int, unsigned: int):
+    if unsigned:
+        hi = (1 << eew) - 1
+        h = 1 << (eew - 1)
+        return [0, 1, 2, hi, hi - 1, h, h - 1, h + 1]
+    lo, hi = -(1 << (eew - 1)), (1 << (eew - 1)) - 1
+    return [0, 1, -1, 2, -2, lo, hi, lo + 1, hi - 1]
+
+
+def r37_int_case(geom: TileGeometry, rng: random.Random):
+    """(A, B, C) *values* for an integer geometry (signedness per
+    geom.altfmt_ab): ~85% draws from the extreme pool (all of them for the
+    first row / column), the rest random.  C is signed SEW with its own
+    extremes (including bit 63 set at SEW 64)."""
+    ua, ub = geom.altfmt_ab
+    eew, sew = geom.eew_ab, geom.sew
+
+    def mat(rows, cols, unsigned):
+        pool = r37_int_pool(eew, unsigned)
+        out = []
+        for r in range(rows):
+            row = []
+            for _c in range(cols):
+                if r == 0 or rng.random() < 0.85:
+                    row.append(rng.choice(pool))
+                else:
+                    row.append(int_operand(rng.getrandbits(eew), eew, unsigned))
+            out.append(row)
+        return out
+    a = mat(geom.m, geom.k_eff, ua)
+    b = mat(geom.n_max, geom.k_eff, ub)
+    lo, hi = -(1 << (sew - 1)), (1 << (sew - 1)) - 1
+    cpool = [0, 1, -1, lo, hi, lo + 1, hi - 1, lo // 2]
+    c = [[rng.choice(cpool) if rng.random() < 0.7 else rng.randint(lo, hi)
+          for _ in range(geom.n_max)] for _ in range(geom.m)]
+    return a, b, c
+
+
+def r37_fpw_mutant_gemm(geom, a, b, c, row, frm: int, which: str):
+    """mxf_reference_gemm for an unscaled W >= 2 program with a *model of the
+    "sticky forced to 0" mutants*: the group sum S is replaced by S with the
+    stkF bits (``f``), the stkC bits (``c``) or both cleared before its one
+    rounding.  Used only to prove that a program is sensitive to the mutant
+    (the expected tile of a test never comes from here)."""
+    fa, fb, fc = row
+    rnd = lambda v: _ieee_round(v, fc, rounder=_frm_rounder(frm))
+    w = geom.w
+    out = [[c[i][j] for j in range(geom.n_max)] for i in range(geom.m)]
+    for j in range(geom.n):
+        for i in range(geom.m):
+            acc = c[i][j]
+            for g in range(geom.k_eff // w):
+                s_int = None
+                for k in range(g * w, (g + 1) * w):
+                    p = _ieee_mul(a[i][k], fa, b[j][k], fb)
+                    s_int = p if s_int is None else _ieee_add(s_int, p, frm)
+                if s_int[0] == "num" and s_int[2] != 0:
+                    mag = int(s_int[2] * _pow2(FPW_OFF_MODEL))
+                    x = mag << 80
+                    pos = x.bit_length() - 1
+                    blk, f = pos // 64, 63 - pos % 64
+                    clear = 0
+                    if which in ("f", "both"):
+                        clear |= ((1 << (64 - f)) - 1) << (64 * (blk - 1))
+                    if which in ("c", "both"):
+                        clear |= (1 << (64 * (blk - 1))) - 1
+                    mag2 = (x & ~clear) >> 80
+                    s_int = ("num", s_int[1], Fraction(mag2, 1 << FPW_OFF_MODEL))
+                s_val = _ieee_val(rnd(s_int), fc)
+                acc = rnd(_ieee_add(_ieee_val(acc, fc), s_val, frm))
+            out[i][j] = acc
+    return out
+
+
+def check_r37_fpw_model() -> None:
+    """Hand-worked group-sum structure items (the steering model), and the
+    cleared-sticky model against hand values."""
+    f32 = fp_format("binary32")
+    P = lambda s, e: ("num", s, _pow2(e))
+    st = r37_fpw_group_stats([P(0, 100), P(0, 36)])
+    # leading one at X2 bit 100 + 298 + 80 = 478 -> block 7, f = 63 - 30 = 33
+    assert st[:4] == (7, 33, True, False), st
+    st = r37_fpw_group_stats([P(0, 100), P(0, -20)])
+    assert st[:4] == (7, 33, False, True), st            # 120 bits below: stkC
+    st = r37_fpw_group_stats([P(0, 100), P(0, 60)])
+    assert st[:4] == (7, 33, False, False), st           # inside the window
+    # exact cancellation leaves the residual's block
+    st = r37_fpw_group_stats([P(0, 200), P(1, 200), P(0, -250)])
+    assert st[0] == (-250 + 298 + 80) // 64 == 2 and st[2:4] == (False, False)
+    assert r37_fpw_group_stats([P(0, 5), P(1, 5)]) is None
+    # tie kinds (binary32: 24 bits)
+    one = 1 << FPW_OFF_MODEL
+    assert _r37_tie_kind(one + (one >> 24), f32) == "even"
+    assert _r37_tie_kind(one + (one >> 23) + (one >> 24), f32) == "odd"
+    assert _r37_tie_kind(one + (one >> 24) + (one >> 100), f32) == "stk"
+    assert _r37_tie_kind(one + (one >> 25), f32) is None
+    # the "sticky cleared" model: 1 + 2^-24 + 2^-100 rounds up (RNE) when the
+    # sticky is seen, down (tie to even) when it is cleared
+    fa = fb = fc = f32
+    # build a W=1-shaped fake geometry only for the model call
+    from types import SimpleNamespace
+    g = SimpleNamespace(m=1, n=1, n_max=1, k_eff=4, w=4)
+    aa = [[r37_pow2_elem(f32, 0), r37_pow2_elem(f32, 0), r37_pow2_elem(f32, 0),
+           r37_pow2_elem(f32, 0)]]
+    bb = [[r37_pow2_elem(f32, 0), r37_pow2_elem(f32, -24),
+           r37_pow2_elem(f32, -100), r37_sub(f32, 0)]]
+    cc = [[0]]
+    # W = 4 products of binary32 inputs are summed exactly by the model
+    bad_f = r37_fpw_mutant_gemm(g, aa, bb, cc, (f32, f32, f32), 0, "f")
+    bad_c = r37_fpw_mutant_gemm(g, aa, bb, cc, (f32, f32, f32), 0, "c")
+    assert bad_f[0][0] == 0x3F800000, hex(bad_f[0][0])   # stkF cleared: tie -> even
+    # 2^-100 sits 100 bits below the leading one (f = 5): inside the stkF
+    # range 64 .. 127 - f = 122, so clearing stkC alone keeps it
+    assert bad_c[0][0] == 0x3F800001, hex(bad_c[0][0])
+    both = r37_fpw_mutant_gemm(g, aa, bb, cc, (f32, f32, f32), 0, "both")
+    assert both[0][0] == 0x3F800000
+
+
+def r37_fpw_zero_swap_gemm(geom, a, b, c, row, frm: int):
+    """mxf_reference_gemm for an unscaled W >= 2 program in which the
+    exact-zero group-sum sign rule of RDN and RUP are exchanged (a model of
+    the R6 mutant, for the sensitivity check only)."""
+    fa, fb, fc = row
+    rnd = lambda v: _ieee_round(v, fc, rounder=_frm_rounder(frm))
+    zfrm = {2: 3, 3: 2}.get(frm, frm)
+    w = geom.w
+    out = [[c[i][j] for j in range(geom.n_max)] for i in range(geom.m)]
+    for j in range(geom.n):
+        for i in range(geom.m):
+            acc = c[i][j]
+            for g in range(geom.k_eff // w):
+                s_int = None
+                for k in range(g * w, (g + 1) * w):
+                    p = _ieee_mul(a[i][k], fa, b[j][k], fb)
+                    s_int = p if s_int is None else _ieee_add(s_int, p, zfrm)
+                s_val = _ieee_val(rnd(s_int), fc)
+                acc = rnd(_ieee_add(_ieee_val(acc, fc), s_val, frm))
+            out[i][j] = acc
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--vlen", type=int, default=256,
@@ -8310,7 +9280,9 @@ def main() -> int:
                   check_round_ten_blind_spots,
                   check_round_ten_negative_controls,
                   fpf_round_frm_selftest,
-                  check_round_twelve_frm_j2b):
+                  check_round_twelve_frm_j2b,
+                  check_r37_trace_matches_reference,
+                  check_r37_fpw_model):
         check()
         print(f"  ok  {check.__name__}")
 

@@ -271,7 +271,7 @@ def _configure(geom: TileGeometry, *, lmul: int, vl: int,
 
 
 def _ime_path(geom: TileGeometry, alloc: VectorAlloc, *,
-              emit_store: bool = True) -> List[str]:
+              emit_store: bool = True, tail: List[str] = None) -> List[str]:
     """vsetvl -> load C -> load A, B -> multiply-accumulate -> store C.
 
     The widening (W=4) case reuses this sequence unchanged apart from the
@@ -351,6 +351,8 @@ def _ime_path(geom: TileGeometry, alloc: VectorAlloc, *,
         f"    {ime.insn(geom.mnemonic, vd=alloc.c, vs1=alloc.a, vs2=alloc.b)}"
         f"    # {geom.mnemonic} v{alloc.c}, v{alloc.a}, v{alloc.b}",
     ]
+    if tail:
+        out += tail          # r37: independent work behind the IME op
 
     if not emit_store:
         return out
@@ -837,7 +839,8 @@ def _epilogue(geom: TileGeometry) -> List[str]:
 
 
 def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
-              name: str = "ime_directed", frm: int = 0) -> str:
+              name: str = "ime_directed", frm: int = 0, golden=None,
+              tail: str = None, note: str = None) -> str:
     """Assemble one self-checking paired program for *geom* and *case*.
 
     The harness links htif_nano.specs, which supplies _start and tohost and
@@ -875,6 +878,11 @@ def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
         head.append(f"# vtype.altfmt_A={geom.altfmt_ab[0]} altfmt_B="
                     f"{geom.altfmt_ab[1]} (0 = signed, 1 = unsigned; spec "
                     f"1145-1154)")
+    if note:
+        head += [f"# {note}: operands steered by rvv_ref.r37_*; expected values "
+                 + ("from rvv_ref (Sail), embedded as the literal C tile."
+                    if golden is not None else
+                    "from the RVV reference path on the DUT.")]
     head += [
         "",
         "    .text",
@@ -903,13 +911,21 @@ def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
             f"    li    t0, {MSTATUS_FS_INITIAL}",
             "    csrs  mstatus, t0        # enable floating-point state",
         ]
-        if frm:
+        if frm or golden is not None:
             # round twelve (J2): the directed rounding mode governs the IME
             # path (which runs first) as well as the scalar reference.
             head += [f"    fsrmi {frm}                  # frm = "
                      f"{rvv_ref.FRM_NAMES[frm].upper()}, both paths"]
 
-    body = _ime_path(geom, alloc) + _rvv_path(geom, frm) + _compare(geom)
+    tail_lines, tail_data = (r37_bp_tail(geom, alloc, tail) if tail
+                             else (None, []))
+    if golden is not None:
+        # r37 review tiers: the expected C tile is a literal from rvv_ref
+        # (Sail), not a scalar-FPU recomputation.
+        body = _ime_path(geom, alloc, tail=tail_lines) + _compare(geom)
+    else:
+        body = (_ime_path(geom, alloc, tail=tail_lines)
+                + _rvv_path(geom, frm) + _compare(geom))
 
     data = [
         "", "    .data", "    .balign 8",
@@ -980,8 +996,12 @@ def emit_test(geom: TileGeometry, case: Tuple[Matrix, Matrix, Matrix],
         data += ["    .balign 8"] + _matrix_data(label, chunked, geom.eew_ab)
     data += ["    .balign 8", "c_ime:",
              f"    .zero {geom.m * geom.m * geom.sew // 8}",
-             "    .balign 8", "c_rvv:",
-             f"    .zero {geom.m * geom.m * geom.sew // 8}"]
+             "    .balign 8", "c_rvv:"]
+    if golden is not None:
+        data += _matrix_data("", golden, geom.sew)[1:]
+    else:
+        data += [f"    .zero {geom.m * geom.m * geom.sew // 8}"]
+    data += tail_data
 
     return "\n".join(head + body + data) + "\n"
 
@@ -3193,6 +3213,8 @@ class FpwPlan:
     c: Matrix
     tag: str = ""
     frm: int = 0                # rounding mode (round twelve J2b: 0 RNE .. 4 RMM)
+    ref: str = ""               # "sail": expected image from mxf_reference_gemm
+                                # at any frm incl. RNE (r37 tiers)
 
     @property
     def row(self):
@@ -3515,6 +3537,13 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
             "# IEEE 754 4.3); an OFP8 accumulator is RNE-only and not here.",
             "#",
         ]
+    if plan.ref == "sail":
+        head += [
+            "# Round twelve (r37 review): expected image = rvv_ref.mxf_reference_gemm",
+            "# (Sail fp_gemm, G=1 psm=0 rnd=frm, IEEE 754); the operands are steered by",
+            "# rvv_ref.r37_* (structure of the group sum), the answer never is.",
+            "#",
+        ]
     if plan.tier == "special" and \
             (geom.w, geom.sew) in rvv_ref.FPW_ROUND_TEN_CELLS:
         head += [
@@ -3611,7 +3640,7 @@ def emit_fpw_test(plan: "FpwPlan", name: str = "ime_fpw") -> str:
                 else rvv_ref.mxf_reference_gemm
                 if (geom.w, geom.sew) in rvv_ref.FPW_ROUND_TEN_CELLS
                 else rvv_ref.fpw_reference_gemm)
-        if plan.frm:
+        if plan.frm or plan.ref == "sail":
             # Round twelve (J2b): Sail fp_gemm at rnd = frm, IEEE C only.
             tile = rvv_ref.mxf_reference_gemm(geom, plan.a, plan.b, plan.c,
                                               fmt_a, fmt_b, fmt_c,
@@ -4665,6 +4694,605 @@ def fpn_frm_directed_tiers(vlen: int, seed: int = 0,
     return out
 
 
+# ---------------------------------------------------------------------------
+# round twelve, r37 review: the directed tiers the independent review of run
+# r37 recommended (titan_runs/r37_1006_2141/REVIEW.md section 4, items 1-5).
+# Appended after every earlier tier (byte-identity of all earlier programs is
+# checked against the .bak-r37t copy).  Every expected value comes from
+# rvv_ref (Sail fp_gemm / fp_scaled_gemm / int_gemm at rnd = frm, IEEE 754),
+# never from the RTL and never from the scalar FPU; the disclosures
+# (OFP8_DISCLOSURE: OFP8 C is RNE-only; MXF_DISCLOSURE; OFP4_DISCLOSURE) bound
+# what is tested: no OFP8 accumulator under a directed mode, nothing
+# E2M1 beyond what its disclosure defines.
+#
+# Names: ime_x1_ .. ime_x5_ (one prefix per review item).  Each tier function
+# takes full_vl_only like the J2b ones: True = S1 (per-iteration), False =
+# the Gate tier, a strict superset whose extra programs are listed after the
+# S1 ones inside each tier.
+# ---------------------------------------------------------------------------
+
+def _r37_rng(seed: int, name: str) -> random.Random:
+    """Per-program rng, so a program is identical in S1 and in the Gate tier."""
+    return random.Random(f"r37-{seed}-{name}")
+
+
+def _r37_w1_geoms(vlen: int, sew: int):
+    geoms = [g for g in rvv_ref.ime_legal_configs(
+                 vlen, sews=[sew], lmuls=(1, 2, 4, 8), full_vl_only=True,
+                 ws=(1,), tloads=("op",), kinds=("fp",), checks=("pair",))
+             if g.emul_c != 16 and _allocatable_here(g)]
+    return geoms
+
+
+def r37_t1_programs(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    """Item 1: vfmmacc.vv SEW 32 / 64 special and extreme values at all five
+    rounding modes.  ``special`` (qNaN / sNaN / Inf / zero heavy: NaN
+    propagation, Inf x 0, Inf - Inf across k, signs of zero) and ``arith``
+    (product overflow, subnormal x subnormal, total underflow, exact
+    cancellation).  Yields (name, geom, (a, b, c), frm, style)."""
+    out = []
+    for sew in (32, 64):
+        if sew not in rvv_ref.FP_FORMATS:
+            continue
+        geoms = sorted(_r37_w1_geoms(vlen, sew),
+                       key=lambda g: (-g.m * g.n * g.k_eff, g.lam))
+        if not geoms:
+            continue
+        fmt = rvv_ref.fp_format("binary%d" % sew)
+        row = (fmt, fmt, fmt)
+        s1 = [(geoms[0], tuple((m, "special") for m in rvv_ref.R37_MODES)
+               + tuple((m, "arith") for m in (2, 3, 4)))]
+        gate = []
+        if not full_vl_only:
+            lam2 = [g for g in geoms if g.lam == 2]
+            k1 = [g for g in geoms if g.k_eff == 1]
+            extra = (tuple((m, "arith") for m in (0, 1)))
+            gate.append((geoms[0], extra))
+            if lam2:
+                gate.append((lam2[0], tuple((m, s) for s in ("special", "arith")
+                                            for m in rvv_ref.R37_MODES)))
+            if k1:
+                gate.append((k1[0], tuple((m, s) for s in ("special", "arith")
+                                          for m in rvv_ref.R37_MODES)))
+        for geom, combos in s1 + gate:
+            for frm, style in combos:
+                name = (f"ime_x1_{style}_frm{frm}_sew{sew}_l{geom.lam}_"
+                        f"m{geom.lmul}_k{geom.k_eff}")
+                case = rvv_ref.r37_w1_case(geom, row, frm, style,
+                                           _r37_rng(seed, name))
+                out.append((name, geom, case, frm, style, row))
+    return out
+
+
+def r37_t1_tiers(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    out = []
+    for name, geom, case, frm, style, row in r37_t1_programs(vlen, seed,
+                                                             full_vl_only):
+        golden = rvv_ref.r37_w1_golden(geom, *case, row, frm)
+        out.append((name, emit_test(geom, case, name, frm=frm, golden=golden,
+                                    note=f"r37 item 1 ({style})"), geom))
+    return out
+
+
+#: (W=1, SEW=16) rows by accumulator format
+def _r37_t2_rows():
+    rows = rvv_ref.fpw_rows(1, 16)
+    return rows
+
+
+def r37_t2_programs(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    """Item 2: SEW 16 (binary16 / bfloat16) vfmmacc.vv: subnormal x subnormal
+    (and total-underflow) products under RDN / RUP / RMM, bf16 sums near 2^128
+    (the S-intermediate of the r37 adder) at all five modes, plus the special
+    values at a directed mode.  Yields (name, geom, key, row, case, frm, style)."""
+    geoms = [g for g in rvv_ref.fpn_legal_configs(vlen, full_vl_only=True)
+             if (g.w, g.sew) == (1, 16) and g.emul_c != 16
+             and _allocatable_here(g)]
+    if not geoms:
+        return []
+    sg = rvv_ref.fpn_special_geometry(geoms)
+    rows = _r37_t2_rows()
+    s1_sub = [(0, 0, 0), (0, 1, 1), (1, 1, 1)]
+    s1_hi = [(1, 1, 1)]
+    bf_rows = [k for k, r in rows.items() if r[2].name == "bfloat16"]
+    plan = []
+    for k in s1_sub:
+        for m in (2, 3, 4):
+            plan.append((k, m, "sub"))
+    for k in s1_hi:
+        for m in rvv_ref.R37_MODES:
+            plan.append((k, m, "hi"))
+    plan += [((0, 0, 0), 2, "special"), ((1, 1, 1), 3, "special")]
+    if not full_vl_only:
+        for k in rows:
+            if k not in s1_sub:
+                for m in (2, 3, 4):
+                    plan.append((k, m, "sub"))
+        for k in bf_rows:
+            if k not in s1_hi:
+                for m in rvv_ref.R37_MODES:
+                    plan.append((k, m, "hi"))
+        for k in ((0, 1, 1), (1, 0, 0)):
+            plan.append((k, 4, "special"))
+    out = []
+    for key, frm, style in plan:
+        row = rows[key]
+        name = (f"ime_x2_{style}_frm{frm}_l{sg.lam}_m{sg.lmul}_"
+                f"{key[0]}{key[1]}{key[2]}")
+        case = rvv_ref.r37_w1_case(sg, row, frm, style, _r37_rng(seed, name))
+        out.append((name, sg, key, row, case, frm, style))
+    return out
+
+
+def r37_t2_tiers(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    out = []
+    for name, geom, key, row, case, frm, style in r37_t2_programs(
+            vlen, seed, full_vl_only):
+        plan = FpwPlan(geom, key, "golden", *case,
+                       tag=f"r37 item 2 ({style}), narrow W=1", frm=frm,
+                       ref="sail")
+        out.append((name, emit_fpw_test(plan, name), geom))
+    return out
+
+
+def r37_t3_programs(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    """Item 3: widening-FP group sums with the leading one in every 64-bit
+    block (exactly cancelling large products), sticky bits below the 64-bit
+    window (stkF: 64..127 bits below the leading one, stkC: further), and
+    round-to-even / sticky-broken ties.  Cells (W=2, SEW=32) fp16 / bf16 ->
+    binary32, (2, 64) binary32 -> binary64, (4, 64) fp16 / bf16 -> binary64.
+    S1: the bf16 / binary32 row of each cell (its product exponents reach
+    every block); the Gate tier adds the fp16 / mixed rows and the remaining
+    modes.  Yields (name, geom, key, row, case, frm, variant)."""
+    cells = ((2, 32), (2, 64), (4, 64))
+    out = []
+    s1_keys = {(2, 32): (1, 1, 0), (2, 64): (None, None, 0), (4, 64): (1, 1, 0)}
+    # W=2 groups have two terms, so a sticky term is seen by the modes that
+    # move on a sticky alone (RUP / RDN); W=4 groups add the tie + sticky
+    # combinations (RNE, RMM)
+    # "zero": exactly-zero group sums (sign of zero: RDN rule vs the others)
+    base_plan = {2: [("cancel", 3), ("tie", 0), ("tie", 2), ("tie", 3),
+                     ("zero", 2), ("zero", 3)],
+                 4: [("cancel", 3), ("tie", 0), ("tie", 2), ("tie", 4),
+                     ("zero", 2), ("zero", 3)]}
+    extra_plan = {2: [("cancel", 0), ("cancel", 2), ("cancel", 4), ("tie", 4),
+                      ("zero", 0), ("zero", 4)],
+                  4: [("cancel", 0), ("cancel", 2), ("cancel", 4), ("tie", 3),
+                      ("zero", 0), ("zero", 4)]}
+    for (w, sew) in cells:
+        geoms = [g for g in rvv_ref.fpw_legal_configs(vlen, full_vl_only=True)
+                 if (g.w, g.sew) == (w, sew) and g.emul_c != 16
+                 and _allocatable_here(g)]
+        if not geoms:
+            continue
+        sg = fpw_special_geometry(geoms)
+        rows = {k: r for k, r in rvv_ref.fpw_rows(w, sew).items()
+                if r[2].name in rvv_ref.FP_FORMATS_BY_NAME}
+        plans = [(s1_keys[(w, sew)], v, m) for v, m in base_plan[w]]
+        if not full_vl_only:
+            plans += [(s1_keys[(w, sew)], v, m) for v, m in extra_plan[w]]
+            for k in rows:
+                if k != s1_keys[(w, sew)]:
+                    plans += [(k, v, m) for v, m in base_plan[w]]
+        for key, variant, frm in plans:
+            row = rows[key]
+            name = (f"ime_x3_{variant}_frm{frm}_w{w}_sew{sew}_l{sg.lam}_"
+                    f"m{sg.lmul}_{key[0]}{key[1]}{key[2]}").replace("None", "n")
+            case = rvv_ref.r37_fpw_case(sg, row, variant, _r37_rng(seed, name))
+            out.append((name, sg, key, row, case, frm, variant))
+    return out
+
+
+def r37_t3_tiers(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    out = []
+    for name, geom, key, row, case, frm, variant in r37_t3_programs(
+            vlen, seed, full_vl_only):
+        plan = FpwPlan(geom, key, "golden", *case,
+                       tag=f"r37 item 3 ({variant}: group-sum leading one in "
+                           f"each 64-bit block, sticky below the window)",
+                       frm=frm, ref="sail")
+        out.append((name, emit_fpw_test(plan, name), geom))
+    return out
+
+
+def r37_t4_tiers(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    """Item 4: MXFP / MXINT with a binary16 accumulator, E8M0 scale bytes 0, 1,
+    142 / 143 (binary16 max binade / overflow), 254 and (sparsely) 255 at the
+    directed modes; and bs = 1 (block size 16) at RDN / RMM, which J2 left
+    out.  An OFP8 accumulator is RNE-only (OFP8_DISCLOSURE) and excluded."""
+    out = []
+    # --- MXFP, binary16 C, scale edges, bs=0
+    mxf_rows = {}
+    for (w, sew) in rvv_ref.MXF_CELLS:
+        rows = [(k, r) for k, r in rvv_ref.fpw_rows(w, sew).items()
+                if r[2].name == "binary16"]
+        if rows:
+            mxf_rows[(w, sew)] = rows
+    s1_rows = {(2, 16): [(0, 0, 0)], (4, 16): [(0, 0, 0)]}
+    for cell, rows in sorted(mxf_rows.items()):
+        geoms = [g for g in rvv_ref.mxf_legal_configs(vlen, full_vl_only=True)
+                 if (g.w, g.sew) == cell and _mxf_allocatable(g)
+                 and 0 in rvv_ref.mxf_legal_bs(g)]
+        if not geoms:
+            continue
+        sg = rvv_ref.mxf_special_geometry(geoms)
+        picked = [(k, r) for k, r in rows if k in s1_rows.get(cell, [])]
+        rest = [(k, r) for k, r in rows if k not in s1_rows.get(cell, [])]
+        for key, row in picked + ([] if full_vl_only else rest):
+            for frm in (1, 2, 3, 4):
+                name = (f"ime_x4_mxf_edge_frm{frm}_w{cell[0]}_sew{cell[1]}_"
+                        f"bs0_l{sg.lam}_m{sg.lmul}_{key[0]}{key[1]}{key[2]}")
+                rng = _r37_rng(seed, name)
+                case = rvv_ref.r37_mxf_edge_case(sg, row, 0, rng, off=frm)
+                plan = MxfPlan(sg, key, 0, "special", *case,
+                               tag="r37 item 4: E8M0 scale bytes 0/1/142/143/"
+                                   "254/255 with a binary16 accumulator, "
+                                   f"{rvv_ref.FRM_NAMES[frm]}", frm=frm)
+                out.append((name, emit_mxf_test(plan, name), sg))
+    # --- MXINT, binary16 C, scale edges
+    by_cell = {}
+    for geom, bs in _mx_geometries(vlen, "many"):
+        if _mx_emittable(geom):
+            by_cell.setdefault((geom.w, geom.sew), []).append((geom, bs))
+    for cell in ((2, 16), (4, 16)):
+        if cell not in by_cell:
+            continue
+        if cell != (2, 16) and full_vl_only:
+            continue
+        cands = sorted(by_cell[cell],
+                       key=lambda gb: (-gb[0].m * gb[0].n, gb[1], gb[0].lam))
+        geom, bs = cands[0]
+        afs = (0,) if full_vl_only else (0, 1)
+        for altfmt in afs:
+            for frm in (1, 2, 3, 4):
+                name = (f"ime_x4_mxi_edge_frm{frm}_w{geom.w}_sew{geom.sew}_"
+                        f"af{altfmt}_bs{bs}_l{geom.lam}_m{geom.lmul}_n{geom.n}")
+                rng = _r37_rng(seed, name)
+                a, b, c, sa, sb = rvv_ref.r37_mxi_edge_case(geom, altfmt, bs,
+                                                            rng, off=frm)
+                plan = MxPlan(geom, altfmt, bs, a, b, c, sa, sb, "mxi",
+                              "r37 item 4: E8M0 scale bytes 0/1/142/143/254/"
+                              f"255, {rvv_ref.FRM_NAMES[frm]}", frm=frm)
+                out.append((name, emit_mx_test(plan, name), geom))
+    # --- MXFP bs=1 at RDN / RMM (J2 had RTZ / RUP only), IEEE C rows
+    for idx, cell in enumerate(rvv_ref.MXF_CELLS):
+        rows = [(k, r) for k, r in rvv_ref.fpw_rows(*cell).items()
+                if r[2].name in rvv_ref.FP_FORMATS_BY_NAME]
+        geoms = [g for g in rvv_ref.mxf_legal_configs(vlen, full_vl_only=True)
+                 if (g.w, g.sew) == cell and _mxf_allocatable(g)
+                 and 1 in rvv_ref.mxf_legal_bs(g)]
+        if not rows or not geoms:
+            continue
+        sg = rvv_ref.mxf_special_geometry(geoms)
+        for ri, (key, row) in enumerate(rows):
+            if ri and full_vl_only:
+                continue
+            for mi, frm in enumerate((2, 4)):
+                if full_vl_only and (idx + mi) % 2:
+                    continue
+                name = (f"ime_x4_mxf_bs1_frm{frm}_w{cell[0]}_sew{cell[1]}_"
+                        f"l{sg.lam}_m{sg.lmul}_n{sg.n}_{key[0]}{key[1]}{key[2]}")
+                rng = _r37_rng(seed, name)
+                case = rvv_ref.mxf_frm_case(sg, row, 1, rng)
+                plan = MxfPlan(sg, key, 1, "special", *case,
+                               tag="r37 item 4: bs=1 at "
+                                   f"{rvv_ref.FRM_NAMES[frm].upper()}, scales "
+                                   "at the range edges", frm=frm)
+                out.append((name, emit_mxf_test(plan, name), sg))
+    return out
+
+
+def _r37_free_group(geom: TileGeometry, alloc: VectorAlloc, skip=()):
+    """(base, lmul) of the largest aligned register group (v0 excluded) that
+    overlaps neither A, B, C nor *skip*."""
+    used = set(range(alloc.a, alloc.a + geom.lmul))
+    used |= set(range(alloc.b, alloc.b + geom.lmul))
+    used |= set(range(alloc.c, alloc.c + geom.emul_c))
+    used |= set(skip)
+    for size in (8, 4, 2, 1):
+        for base in range(size, 32, size):
+            r = set(range(base, base + size))
+            if not (r & used):
+                return base, size
+    return None
+
+
+def r37_bp_tail(geom: TileGeometry, alloc: VectorAlloc, variant: str):
+    """(text lines, data lines): independent vector work issued right behind
+    the multiply-accumulate.  The IME op occupies the iterative unit for
+    M*N*K uops; the loads / ALU ops below use registers disjoint from A, B, C
+    and so are free to issue and complete while its last uops are still
+    writing -- contending for the VRF write ports (a load's returning beats,
+    the pipelined ALU's write) and so dropping io.write.ready while the last-k
+    uop is valid.  Which variant actually collides depends on the pipeline;
+    the suite carries several."""
+    g1 = _r37_free_group(geom, alloc)
+    if g1 is None:
+        raise ValueError(f"{geom.describe()}: no free register group")
+    base, size = g1
+    g2 = _r37_free_group(geom, alloc, skip=range(base, base + size))
+    base2 = g2[0] if g2 and g2[1] == size else base
+    nbytes = geom.vlen // 8 * size
+    lines = ["    # ---- r37 write-backpressure probe: independent vector work "
+             "behind the IME op ----",
+             "    li    t0, 2048",
+             f"    vsetvli x0, t0, e8, m{size}, ta, ma"]
+    ld = lambda r: ["    la    a0, tail_buf", f"    vle8.v v{r}, (a0)"]
+    if variant == "ld1":
+        lines += ld(base)
+    elif variant == "ld2":
+        lines += ld(base) + ld(base2)
+    elif variant == "ldalu":
+        lines += ld(base) + [f"    vadd.vv v{base2}, v{base}, v{base}"]
+    elif variant == "mul":
+        lines += ld(base) + [f"    vmul.vv v{base2}, v{base}, v{base}",
+                             f"    vmul.vv v{base}, v{base2}, v{base2}"]
+    elif variant == "alu":
+        lines += [f"    vadd.vv v{base2}, v{base}, v{base}",
+                  f"    vadd.vv v{base}, v{base2}, v{base2}"]
+    elif variant == "st":
+        lines += ld(base) + ["    la    a0, tail_out",
+                             f"    vse8.v v{base}, (a0)"] + ld(base2)
+    else:
+        raise ValueError(variant)
+    data = ["    .balign 8", "tail_buf:"]
+    data += [f"    .byte " + ", ".join(str((i * 37 + 11) & 0xFF)
+                                       for i in range(r, min(r + 32, nbytes)))
+             for r in range(0, nbytes, 32)]
+    data += ["    .balign 8", "tail_out:", f"    .zero {nbytes}"]
+    return lines, data
+
+
+def r37_t5_programs(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    """Item 5: integer corner cases.  Yields (name, geom, case, tail_variant).
+
+    * K_eff = 1 (first_k and last_k in one uop): W=1, LAMBDA=1, LMUL=1 at every
+      SEW; extreme operands and C.
+    * SEW 64 with all four (altfmt_A, altfmt_B) rows and bit 63 / bit EEW-1
+      set: W=1 (Zvvi64mm: the low 64 bits of the product do not depend on the
+      signedness, but the accumulate wrap does), W=2 (Zvvi32i64mm) and, in the
+      Gate tier, W=4 (Zvvi16i64mm).
+    * Int4 / UInt4 (W=2 SEW 8, W=4 SEW 16, W=8 SEW 32): the unsigned rows
+      (the signed row is round nine's), both nibbles.
+    * Write backpressure: independent loads / ALU work issued behind the
+      multiply-accumulate (r37_bp_tail)."""
+    out = []
+
+    def best(cell, ab, k1=False):
+        gs = [g for g in rvv_ref.int_cell_geometries(
+                  vlen, cell, full_vl_only=True, altfmt_ab=ab)
+              if _int9_ok(g) and (not k1 or g.k_eff == 1)]
+        if k1:
+            return gs[0] if gs else None
+        return max(gs, key=lambda g: (g.m * g.n * g.k_eff, -g.lam)) \
+            if gs else None
+
+    def add(name, geom, tail=None):
+        rng = _r37_rng(seed, name)
+        out.append((name, geom, rvv_ref.r37_int_case(geom, rng), tail))
+
+    for sew in (8, 16, 32, 64):
+        g = best((1, sew), (0, 0), k1=True)
+        if g:
+            add(f"ime_x5_k1_sew{sew}_lam{g.lam}_lmul{g.lmul}_n{g.n}", g)
+    cells64 = [(1, 64), (2, 64)] + ([] if full_vl_only else [(4, 64)])
+    for cell in cells64:
+        for ab in rvv_ref.INT_SIGNS:
+            g = best(cell, ab)
+            if g:
+                add(f"ime_x5_sg{''.join('su'[v] for v in ab)}_w{cell[0]}_"
+                    f"sew{cell[1]}_lam{g.lam}_lmul{g.lmul}_n{g.n}", g)
+    int4 = ((2, 8), (4, 16), (8, 32))
+    for ci, cell in enumerate(int4):
+        for ri, ab in enumerate(INT9_SIGN_ROWS):
+            if full_vl_only and ri == (ci % 3):
+                continue                   # S1: two of the three rows per cell
+            g = best(cell, ab)
+            if g:
+                add(f"ime_x5_i4{''.join('su'[v] for v in ab)}_w{cell[0]}_"
+                    f"sew{cell[1]}_lam{g.lam}_lmul{g.lmul}_n{g.n}", g)
+    bp = [((1, 32), True, "ld1"), ((1, 32), True, "ldalu"),
+          ((1, 64), False, "ld2"), ((1, 16), True, "mul")]
+    if not full_vl_only:
+        bp += [((1, 32), True, "alu"), ((1, 32), True, "st"),
+               ((1, 32), True, "mul"), ((1, 8), True, "ld1"),
+               ((1, 32), False, "ld1"), ((1, 32), False, "ldalu"),
+               ((1, 64), True, "ld1"), ((1, 64), True, "mul"),
+               ((1, 16), False, "ld2"), ((2, 32), False, "ldalu"),
+               ((1, 16), True, "ld1"), ((1, 16), True, "st")]
+    for cell, k1, variant in bp:
+        g = best(cell, (0, 0), k1=k1)
+        if g:
+            add(f"ime_x5_bp_{variant}_w{cell[0]}_sew{cell[1]}_lam{g.lam}_"
+                f"lmul{g.lmul}_n{g.n}", g, tail=variant)
+    return out
+
+
+def r37_t5_tiers(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    out = []
+    for name, geom, case, tail in r37_t5_programs(vlen, seed, full_vl_only):
+        out.append((name, emit_test(geom, case, name, tail=tail,
+                                    note="r37 item 5"), geom))
+    return out
+
+
+def r37_directed_tiers(vlen: int, seed: int = 0, full_vl_only: bool = True):
+    """All five r37-review tiers, in item order (appended last)."""
+    out = []
+    for tier in (r37_t1_tiers, r37_t2_tiers, r37_t3_tiers, r37_t4_tiers,
+                 r37_t5_tiers):
+        out += tier(vlen, seed, full_vl_only)
+    return out
+
+
+def _r37_tally(tiers):
+    """name -> (tier-prefix) counts."""
+    cnt = {}
+    for name, _a, _g in tiers:
+        key = name[:7]
+        cnt[key] = cnt.get(key, 0) + 1
+    return cnt
+
+
+def check_round_twelve_r37_emission() -> None:
+    """r37-review tiers: unique names, Gate a strict superset of S1 with
+    identical program text, modest S1 size, every IEEE-C program carries its
+    frm word, nothing OFP8 / E2M1-C under a directed mode, golden present,
+    the generators' coverage requirements hold (trace events for items 1-2;
+    block / sticky / tie coverage for item 3; scale bytes for item 4;
+    signedness rows / K=1 / tail variants for item 5)."""
+    import re
+    s1 = r37_directed_tiers(256, 0, True)
+    gate = r37_directed_tiers(256, 0, False)
+    names1 = [n for n, _a, _g in s1]
+    names2 = [n for n, _a, _g in gate]
+    assert len(set(names1)) == len(names1), "duplicate S1 names"
+    assert len(set(names2)) == len(names2), "duplicate Gate names"
+    assert set(names1) <= set(names2) and len(names2) > len(names1)
+    asm2 = {n: a for n, a, _g in gate}
+    for n, a, _g in s1:
+        assert asm2[n] == a, f"{n}: differs between S1 and Gate"
+    assert 60 <= len(s1) <= 105, len(s1)
+    tally = {}
+    for n in names1:
+        tally[n[:7]] = tally.get(n[:7], 0) + 1
+    assert set(tally) == {"ime_x1_", "ime_x2_", "ime_x3_", "ime_x4_",
+                          "ime_x5_"}, tally
+    # --- item 1/2: coverage events (per program) and the trace == Sail
+    for tier, fn in ((1, r37_t1_programs), (2, r37_t2_programs)):
+        progs = fn(256, 0, False)
+        assert progs
+        seen = {}
+        for rec in progs:
+            if tier == 1:
+                name, geom, case, frm, style, row = rec
+            else:
+                name, geom, key, row, case, frm, style = rec
+            tile, ev = rvv_ref.r37_w1_trace(geom, *case, *row, frm)
+            assert tile == rvv_ref.r37_w1_golden(geom, *case, row, frm), name
+            need = rvv_ref.r37_required(style, frm, geom)
+            assert need <= ev, (name, sorted(need - ev))
+            assert (frm in (1, 2, 3, 4)) or style in ("special", "arith",
+                                                      "hi"), name
+            seen.setdefault(row[2].name, set()).add(frm)
+            asm = asm2[name]
+            assert f"fsrmi {frm}" in asm, name
+            assert not re.search(r"->e[45]m[23]\b", asm.split("\n")[0]), name
+        if tier == 1:
+            assert seen["binary32"] == set(rvv_ref.R37_MODES) == \
+                seen["binary64"], seen
+        else:
+            assert seen["bfloat16"] >= set(rvv_ref.R37_MODES), seen
+            assert seen["binary16"] >= {2, 3, 4}, seen
+    # --- item 3: block / sticky / tie coverage, sensitivity to the mutants
+    by_row = {}
+    for name, geom, key, row, case, frm, variant in r37_t3_programs(256, 0,
+                                                                    True):
+        items = rvv_ref.r37_fpw_coverage(geom, row, case[0], case[1])
+        by_row.setdefault((geom.w, geom.sew, key), {})[
+            (variant, frm)] = (geom, row, case, items)
+    assert len(by_row) == 3, sorted(by_row)
+    for (w, sew, key), progs in by_row.items():
+        union = set()
+        for _v, (_g, _r, _c, items) in progs.items():
+            union |= items
+        reach = rvv_ref.r37_fpw_reachable_blocks(next(iter(progs.values()))[1])
+        leads = {i[1] for i in union if i[0] == "lead"}
+        assert len(leads) >= 8 and leads <= reach, (w, sew, key, leads)
+        assert {i[1] for i in union if i[0] == "f"} >= {4, 5, 6, 7}, \
+            (w, sew, key, "stkF blocks")
+        assert {i[1] for i in union if i[0] == "c"} >= {5, 6, 7, 8}, \
+            (w, sew, key, "stkC blocks")
+        if w == 4:        # >64 bits of cancellation needs >= 4 products
+            assert {i for i in union if i[0] == "cancel"}, (w, sew, key,
+                                                            "cancel")
+        ties = {i[1] for i in union if i[0] == "tie"}
+        # W=2 groups have two terms: an exact tie, or a sticky-only sum; the
+        # tie that a sticky term breaks needs three terms (W=4)
+        assert ties >= ({"even", "odd", "stk"} if w == 4 else {"even"}), \
+            (w, sew, key, ties)
+        # sensitivity: a model of "sticky forced to 0" changes some expected
+        # result of the tie / cancel programs (or the mutant would survive)
+        # the zero-sum programs see the RDN / RUP zero-sign swap (R6 model)
+        zhit = {2: False, 3: False}
+        for (v, frm), (geom, row, case, items) in progs.items():
+            if v == "zero" and frm in zhit:
+                assert {i[1] for i in items if i[0] == "zero"} >= \
+                    {"cancel", "pp", "nn", "mixed"}, (w, sew, key, items)
+                good = rvv_ref.mxf_reference_gemm(geom, *case[:3], *row,
+                                                  frm=frm)
+                zhit[frm] = good != rvv_ref.r37_fpw_zero_swap_gemm(
+                    geom, *case[:3], row, frm)
+        assert all(zhit.values()), (w, sew, key, zhit)
+        for which in ("f", "c", "both"):
+            hit = False
+            for (_v, frm), (geom, row, case, _items) in progs.items():
+                if _v == "zero":
+                    continue
+                good = rvv_ref.mxf_reference_gemm(geom, *case[:3], *row,
+                                                  frm=frm)
+                bad = rvv_ref.r37_fpw_mutant_gemm(geom, *case[:3], row, frm,
+                                                  which)
+                if good != bad:
+                    hit = True
+                    break
+            assert hit, (w, sew, key, which, "no program sees the mutant")
+    # --- item 4: scale bytes
+    for n, a, _g in gate:
+        if "_x4_" in n or n.startswith("ime_x4_"):
+            assert "frm=" in a or "fsrmi" in a, n
+    edge = [n for n in names2 if n.startswith("ime_x4_m") and "edge" in n]
+    assert any("mxf_edge" in n for n in edge) and \
+        any("mxi_edge" in n for n in edge)
+    assert {int(re.search(r"frm(\d)", n).group(1))
+            for n in names1 if "mxf_bs1_frm" in n} == {2, 4}, \
+        "bs=1 at both RDN and RMM"
+    for n, a, _g in gate:
+        if n.startswith("ime_x4_mx"):
+            assert not re.search(r"->e[45]m[23]\b", a.split("\n")[0]), n
+    # the edge scale bytes really are in the scale images the generator makes
+    geoms = [g for g in rvv_ref.mxf_legal_configs(256, full_vl_only=True)
+             if (g.w, g.sew) == (2, 16) and _mxf_allocatable(g)
+             and 0 in rvv_ref.mxf_legal_bs(g)]
+    sg = rvv_ref.mxf_special_geometry(geoms)
+    row = rvv_ref.fpw_rows(2, 16)[(0, 0, 0)]
+    for frm in (1, 2, 3, 4):
+        *_ab, sa, sb = rvv_ref.r37_mxf_edge_case(
+            sg, row, 0, _r37_rng(0, f"ime_x4_mxf_edge_frm{frm}_w2_sew16_bs0_"
+                                    f"l{sg.lam}_m{sg.lmul}_000"), off=frm)
+        seen = {v for rows in (sa, sb) for r in rows for v in r}
+        assert seen >= {0, 1, 142, 143, 254, 255}, (frm, sorted(seen))
+    # --- item 5
+    for sew in (32, 64):           # K_eff = 1 exists only at LAMBDA = 1
+        assert any(n.startswith(f"ime_x5_k1_sew{sew}_") for n in names1), sew
+    for cell in ("w1_sew64", "w2_sew64"):
+        rows = {re.search(r"ime_x5_sg(\w\w)_", n).group(1)
+                for n in names1 if f"_{cell}_" in n and "_sg" in n}
+        assert rows == {"ss", "su", "us", "uu"}, (cell, rows)
+    assert sum(1 for n in names1 if n.startswith("ime_x5_i4")) == 6
+    assert sum(1 for n in names1 if n.startswith("ime_x5_bp_")) == 3
+    for n, a, g in gate:
+        if n.startswith("ime_x5_bp_"):
+            assert "tail_buf" in a and a.index("vsetvli x0, t0, e8") > \
+                a.index("# ---- IME path ----"), n
+    # K=1 programs really have K_eff == 1
+    for name, geom, case, tail in r37_t5_programs(256, 0, True):
+        if "_k1_" in name:
+            assert geom.k_eff == 1 and geom.w == 1, name
+        if name.startswith("ime_x5_sg"):
+            ab = name[len("ime_x5_sg"):][:2]
+            assert geom.altfmt_ab == tuple(int(c == "u") for c in ab), name
+            a_vals = [v for r in case[0] for v in r]
+            top = 1 << (geom.eew_ab - 1)
+            assert any((v & top) for v in a_vals) or any(v < 0 for v in a_vals)
+            assert any(v in (-top, top, 2 * top - 1, top - 1) for v in a_vals)
+    # the whole thing appended last, after the J2b tiers
+    full = directed_suite(256, 0, full_vl_only=True)
+    assert [n for n, _a, _g in full[-len(s1):]] == names1
+    full_gate = directed_suite(256, 0, full_vl_only=False)
+    assert [n for n, _a, _g in full_gate[-len(gate):]] == names2
+
+
 def check_round_twelve_j2b_emission() -> None:
     """Round twelve J2b tiers: counts, names, the frm word in every program,
     all four directed modes per cell, no OFP8 accumulator, MXINT programs
@@ -4704,8 +5332,9 @@ def check_round_twelve_j2b_emission() -> None:
     # the first J2b program is the first appended one: byte-identity of
     # everything earlier is checked against the .bak-j2b copy by J2b's driver.
     names_all = [n for n, _a, _g in directed_suite(256, 0)]
-    assert names_all[-88:] == [n for k in ("mxi", "fw", "fn")
-                               for n, _a, _g in s1[k]]
+    n_r37 = len(r37_directed_tiers(256, 0, True))     # appended after J2b
+    assert names_all[-88 - n_r37:-n_r37] == [n for k in ("mxi", "fw", "fn")
+                                            for n, _a, _g in s1[k]]
 
 
 def check_round_ten_emission() -> None:
@@ -4995,6 +5624,9 @@ def directed_suite(vlen: int, seed: int = 0,
             out += fpw_frm_directed_tiers(vlen, seed, full_vl_only)
         if FPN_TOKEN in insns:
             out += fpn_frm_directed_tiers(vlen, seed, full_vl_only)
+        # Round twelve (r37 review): the tiers an independent review of run
+        # r37 asked for (appended after the J2b tiers).
+        out += r37_directed_tiers(vlen, seed, full_vl_only)
     return out
 
 
@@ -6561,6 +7193,7 @@ def main() -> int:
                   check_mxl_emission,
                   check_mx_verdict_contract,
                   check_round_twelve_j2b_emission,
+                  check_round_twelve_r37_emission,
                   check_round_seven_emission,
                   check_round_seven_golden_matches_model,
                   check_round_seven_declared_scope,
