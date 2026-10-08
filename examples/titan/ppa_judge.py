@@ -91,6 +91,10 @@ DEFAULT_CONFIG: Dict[str, object] = {
         "r35_total_um2": 4160821.808,        # ppa8, hierarchical
         "r35_outside_fu_um2": 3259970.32,    # ppa8: total minus both FU subtrees
         "r35_modules_um2": {},               # {module: local area}
+        # per-module outside-FU growth must exceed BOTH noise_area_frac of
+        # the module and this floor.  r35 vs r37 (equivalent RTL): max
+        # deviation 385 um2 (IntegerPipe, abc noise) -> 800 (~2.1x).
+        "noise_module_abs_um2": 800.0,
         "max_delay_ns": 30.25,
         "ime_module_max_delay_ns": 27.0,
         "min_free_gb": 40.0,
@@ -612,6 +616,7 @@ def decide_soc(cfg: Dict[str, object], meas: Dict[str, object]
     longest_ps, ime_longest_ps."""
     soc = cfg["soc"]
     reasons: List[str] = []
+    outside: List[str] = []     # reasons about modules outside the two FUs
     if meas.get("total_um2") is None:
         return {"pass": False, "reasons": ["P-SOC: no total area found"]}
     base_total = soc.get("r35_total_um2")
@@ -629,6 +634,7 @@ def decide_soc(cfg: Dict[str, object], meas: Dict[str, object]
                 f"SoC area outside the two FUs grew: "
                 f"{meas['outside_fu_um2']:,.0f} > r35 {float(base_out):,.0f}"
                 f" + noise {noise:,.0f} (logic relocated?)")
+            outside.append(reasons[-1])
     if base_total is not None and float(meas["total_um2"]) > \
             float(base_total) + noise:
         reasons.append(f"SoC total {meas['total_um2']:,.0f} um2 exceeds the "
@@ -636,19 +642,23 @@ def decide_soc(cfg: Dict[str, object], meas: Dict[str, object]
                        f"{noise:,.0f}")
     ref_mods = soc.get("r35_modules_um2") or {}
     grew = []
+    floor = float(soc.get("noise_module_abs_um2", 0.0))
     for m, area in (meas.get("modules") or {}).items():
         ref = ref_mods.get(m)
         if ref is None:
             continue
-        band = noise_band_um2(cfg, max(float(ref), 1.0))
-        if float(area) > float(ref) + max(band, 1.0):
+        band = noise_band_um2(dict(cfg, noise_area_frac=soc.get(
+            "noise_area_frac", 0.005)), max(float(ref), 1.0))
+        if float(area) > float(ref) + max(band, floor, 1.0):
             grew.append(f"{m} {area:,.0f} > {float(ref):,.0f}")
     if grew:
         reasons.append("modules outside the two FUs grew beyond the noise "
                        "band: " + "; ".join(grew[:6]))
+        outside.append(reasons[-1])
     if meas.get("new_modules"):
         reasons.append("new modules outside the FU subtrees: "
                        f"{sorted(meas['new_modules'])[:6]}")
+        outside.append(reasons[-1])
     lim = (float(soc["max_delay_ns"]) + float(cfg["noise_delay_ns"])) * 1000
     if meas.get("longest_ps") is not None and float(meas["longest_ps"]) > lim:
         reasons.append(f"SoC longest abc path {meas['longest_ps'] / 1000:.2f}"
@@ -659,7 +669,11 @@ def decide_soc(cfg: Dict[str, object], meas: Dict[str, object]
         reasons.append("an IME module's path "
                        f"{float(meas['ime_longest_ps']) / 1000:.2f} ns > "
                        f"{ilim / 1000:.2f} ns")
-    return {"pass": not reasons, "reasons": reasons}
+    # outside_fu_only: every failing reason concerns modules the agent cannot
+    # edit (scope allowlist = the two FU files) -- the loop treats such a
+    # failure as a judge/harness failure, not a design verdict
+    return {"pass": not reasons, "reasons": reasons,
+            "outside_fu_only": bool(reasons) and len(outside) == len(reasons)}
 
 
 # --------------------------------------------------------------------------

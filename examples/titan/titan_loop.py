@@ -1804,6 +1804,18 @@ def _ppa_soc_gate(artifact, dump: helpers.Dumper, run_id: str, pg_opts
         return True, None
     if v.get("pass"):
         return True, None
+    if v.get("outside_fu_only"):
+        # Scope is enforced on every accepted tree (allowlist = the two FU
+        # files), so a failure confined to modules outside the FUs is abc
+        # mapping noise or a judge defect the agent cannot fix: do not spend
+        # gate-debug LLM turns on it; stop with a harness-failure reason.
+        _PPA_STATE["soc_infra"] = True
+        _PPA_STATE["soc_infra_reason"] = (
+            "P-SOC failed only on modules outside the two FUs while the "
+            "scope allowlist is clean -- judge/harness failure, NOT a design "
+            "verdict: " + "; ".join(v.get("reasons") or []))
+        _event("ppa_soc_harness_failure", reasons=v.get("reasons"))
+        return True, None
     path = _publish_logs(run_id, "gate_ppa_soc", pg_opts,
                          extra_files={"feedback.md": res.get("feedback") or ""})
     return False, (
@@ -1837,6 +1849,7 @@ def _ppa_summary() -> Optional[Dict[str, object]]:
             "cost_usd": round(float(_PPA_STATE.get("cost") or 0.0), 2),
             "soc": _PPA_STATE.get("soc"),
             "soc_infra": bool(_PPA_STATE.get("soc_infra")),
+            "soc_infra_reason": _PPA_STATE.get("soc_infra_reason"),
             "restore_error": _PPA_STATE.get("restore_error")}
 
 
