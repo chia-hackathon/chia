@@ -1308,5 +1308,54 @@
    "gate": "directed 2247/2247; RVV 837/837 (0 single-run failures)",
    "S3": "1024/1024 lockstep"
   }
+ },
+ {
+  "round": 12,
+  "id": "r37_1006_2141",
+  "kind": "CHIA loop run: PPA optimization (stage P), seed r35 + frm fix",
+  "llm_model": "claude-opus-5-5 --effort max",
+  "started": "2026-10-06T21:41+08:00",
+  "ended": "2026-10-08T01:13+08:00",
+  "wall_minutes": 1652,
+  "llm_cost_usd": 45.92,
+  "submission_id": "titan-r37_1006_2141",
+  "code": "branch titan-r12, commit 0ded30d",
+  "settings": "--ppa-config r12_ppa_config.json (A_FP<=450k, stretch 400k; FP/INT delay<=30.25 ns, INT stretch 27; cycles<=r35; 1% noise), TITAN_MAX_ITERS=8, TITAN_REGRESSION_SAMPLE=150, TITAN_LLM_TIMEOUT_SECONDS=5400",
+  "model_diff": "r31_0927_0146/20260927_031301_impl_diff_attempt1.diff",
+  "rtl_diff": "r12_seed_r35_frmfix.diff (r35 + PipelinedFaultCheck frm fix for vf*immacc)",
+  "result": "STOPPED by operator during 3rd gate-debug cycle: design met stretch target in 1 agent iteration and passed every functional judge, but the Gate P-SOC check failed 3x on a judge defect (per-module noise band on modules the agent cannot edit)",
+  "stages": {
+   "attempt0": "r35+fix: S1 1336/1336, S2 sample pass, P fail (area)",
+   "iter1": "A_FP 286,940 um2 flat (-48.9% vs r35 561,908; stretch 400k met), A_INT 88,556 (-13.4%), FP delay 20.53 ns, INT delay 12.74 ns (r35 31.37), flops 2,616 (r35 4,997), cycles identical to r35 on all 9 benches",
+   "gate": "directed 2567/2567 x3; RVV 837/837 x3 (0 single-run failures)",
+   "P-SOC": "total 3,655,423 um2 (-12.1% vs r35 4,160,822; IME overhead 959k -> 454k), outside-FU 3,260,321 (+350 um2, +0.01%), SoC longest Compactor_4 30.25 ns, IME longest 21.36 ns, flops 36,942; FAIL x3 only on per-module band: ShiftBlock 5,976 > 5,904, IntegerPipe 31,360 > 30,975 (unchanged RTL, abc mapping noise)",
+   "gate_debug": "3 agent turns could not fix (modules outside allowlist); no RTL change",
+   "S3": "not run"
+  },
+  "best_rtl": "r37_1006_2141/best_rtl.diff (md5 0881aa25)"
+ },
+ {
+  "round": 12,
+  "id": "r38_1008_2318",
+  "kind": "verification-only rerun of the round-12 design (r37 best) with fixed P-SOC judge, review-driven test tiers and enlarged S3",
+  "llm_model": "claude-opus-5-5 (not invoked; fast path)",
+  "started": "2026-10-08T23:18+08:00",
+  "ended": "2026-10-09T07:28+08:00",
+  "wall_minutes": 490,
+  "llm_cost_usd": 0.0,
+  "submission_id": "titan-r38_1008_2318",
+  "code": "branch titan-r12, commit fe4b567 (P-SOC per-module floor 800 um2 + outside-FU-only = harness failure; ime_x1..x5 tiers)",
+  "settings": "--ppa-config r12_ppa_config.json, TITAN_STRESS_CASES_PER_GEOM=1024, TITAN_STRESS_TEST_HOURS=4, TITAN_REGRESSION_SAMPLE=150",
+  "model_diff": "r31_0927_0146/20260927_031301_impl_diff_attempt1.diff",
+  "rtl_diff": "r37_1006_2141/best_rtl.diff",
+  "result": "CONVERGED (verification rerun, no agent turn)",
+  "stages": {
+   "S1": "1422/1422",
+   "P": "A_FP 286,940 um2 (stretch 400k met), A_INT 88,556, FP 20.53 ns, INT 12.74 ns, flops 2,616, cycles = r35 on 9 benches",
+   "gate": "directed 2845/2845; RVV 837/837 (0 single-run failures)",
+   "P-SOC": "PASS: total 3,655,423 um2 (-12.1% vs r35), outside-FU 3,260,321, SoC longest Compactor_4 30.25 ns, IME longest 21.36 ns, flops 36,942",
+   "S3": "1024/1024 lockstep"
+  },
+  "notes": "Pre-run checks: independent opus review (r37_1006_2141/REVIEW.md: accept-after-tests, no functional bug); flat VectorBackend timing r35 vs r37 (cross-boundary paths into IME FU regs 9.2 -> 12.6 ns, IME internal paths shorter; out/work/r37tim/)"
  }
 ]

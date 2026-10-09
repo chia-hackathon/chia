@@ -156,11 +156,18 @@ agent 生出成本與編輯都不在帳上的 sub-agent。見本分支的第一�
 | `r31_round10_final.diff` | 第十輪：IME v0.9.0 全部 61/61 cell（OFP4 E2M1、16 個 MXFP；模型 + RTL），r31 收斂、r33 以 1,024 支 S3 重驗 |
 | `r35_round11_final.diff` | **第十一輪，最終設計**：`MatrixFPMultiplyPipe` 切成 19 級多 cycle 管線（功能不變，61/61 cell）；FU 路徑 319.45 → 25.98 ns（stage T 目標 36 ns），r35 收斂、r36 以 1,024 支 S3 重驗 |
 | `ppa8_round11.md` | 第十一輪整顆 SoC 合成（sky130 hd、yosys/abc）：面積 +2.22% vs r31，FP FU 路徑 268.7 → 23.7 ns，SoC 最長路徑回到 Compactor_4 30.25 ns |
+| `r37_round12_final.diff` | **第十二輪，最終設計（PPA）**：兩個矩陣 FU 改寫（FP 共用 binary64 資料路徑、2 個輪替 80-bit 加法器、INT 在 issue 週期抽取運算元），功能與每格式 cycle 數不變；FP FU 面積 −48.9%、INT 路徑 31.4 → 12.7 ns；含 vf*immacc 的 `frm` 修正（見下）。r37 一輪收斂，r38 以 directed 2845、RVV 837、S3 1,024 重驗 |
+| `ppa_round12.md` | 第十二輪 PPA：整顆 SoC 面積 4,160,822 → 3,655,423 µm²（−12.1%；IME 開銷 +29.97% → +14.18%），SoC 最長路徑不變（Compactor_4 30.25 ns），跨邊界時序檢查 |
+| `r37_review.md` | 第十二輪設計的獨立審查（opus）：改了什麼、風險、規格抽查、建議測試（已補為 `ime_x1`..`ime_x5`） |
 | `round3_design.md` | 全 15 條指令調查、第三輪批次決策、依賴的 SAIL 行號、編碼與實作 |
 | `r15_full_verify.json` | 最終驗證結果（directed 80/80、S2 full 837/0、排除清單） |
 | `ledger.md` | 前 19 次 run（到 r15）的時間 / 成本 / 結果，含逐列敘述（累計 46h11m、$837.13） |
-| `run_ledger.md` | **全部 run**（r1–r36）的時間 / 成本 / 結果，由 `titan_runs/tools/ledger.py` 產生 |
+| `run_ledger.md` | **全部 run**（r1–r38）的時間 / 成本 / 結果，由 `titan_runs/tools/ledger.py` 產生 |
 | `rounds.json` | 第六至十輪逐 run 的結構化紀錄（階段結果、成本、發現、更正） |
 | `report_data.md` | 全語料庫的逐項證據與根因分析 |
 | `ppa_method.md` / `ppa_results.json` | 結構性 RTL proxy 比較的方法與結果（非真實 PPA） |
 | `report.html` | 已發布的完整報告 |
+
+### 已知缺陷（第十二輪修正）：微縮放整數指令的捨入模式
+
+第十、十一輪的最終設計（`r31_round10_final.diff`、`r35_round11_final.diff`）把 `vfwimmacc`/`vfqimmacc`/`vf8wimmacc`（OPIVV funct6 0x39–0x3b）的捨入模式接成 `vxrm` 而非規格要求的 `frm`（spec 1287–1293 行，Sail `int_scaled_gemm` 的 `rm = get_fp_rounding_mode()`）。當時所有 IME 測試都只用 RNE（`vxrm=0` 恰好解碼為 RNE），所以沒被抓到。第十二輪驗證裁判時以非 RNE 測試（`ime_mxi_frm*`）發現，於 `frontend/PipelinedFaultCheck.scala` 修正（2 行），修正已含在 `r37_round12_final.diff`。
